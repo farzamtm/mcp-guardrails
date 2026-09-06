@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/McpGuardrails.Cli/McpGuardrails.Cli.csproj" />
+    <Project Path="src/McpGuardrails.Core/McpGuardrails.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/McpGuardrails.Core.Tests/McpGuardrails.Core.Tests.csproj" />
+  </Folder>
+</Solution>

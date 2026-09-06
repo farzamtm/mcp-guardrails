@@ -1,0 +1,160 @@
+using Microsoft.Extensions.Logging;
+using ModelContextProtocol.Client;
+
+namespace McpGuardrails.Core.Upstream;
+
+/// <summary>
+/// One live connection to a downstream MCP server, plus the tools it advertised.
+/// </summary>
+public sealed record UpstreamConnection(
+    string Name,
+    McpClient Client,
+    IReadOnlyList<McpClientTool> Tools);
+
+/// <summary>
+/// Owns the connections to every downstream server and answers "which server
+/// handles this tool?".
+/// </summary>
+/// <remarks>
+/// This is the proxy's client half. The server half lives in the CLI's Program.cs.
+///
+/// C# notes:
+///
+/// - IAsyncDisposable is the async form of IDisposable, which is C#'s
+///   deterministic cleanup contract (Java's try-with-resources / AutoCloseable).
+///   Closing an MCP client means shutting down a child process and awaiting it,
+///   which is I/O, hence the async variant.
+///
+/// - The connections are stored in a Dictionary built once at startup and never
+///   mutated, so no locking is needed despite concurrent reads. Immutability is
+///   the cheapest concurrency strategy available; reach for it before locks.
+/// </remarks>
+public sealed class UpstreamRegistry : IAsyncDisposable
+{
+    private readonly Dictionary<string, UpstreamConnection> _byServerName;
+
+    // Maps the client-visible qualified name ("fs__read_file") straight to the
+    // owning connection and the downstream name, so routing a call is one
+    // dictionary lookup rather than a string split plus a second lookup.
+    private readonly Dictionary<string, (UpstreamConnection Connection, string ToolName)> _byQualifiedName;
+
+    private UpstreamRegistry(IReadOnlyList<UpstreamConnection> connections)
+    {
+        _byServerName = connections.ToDictionary(c => c.Name, StringComparer.Ordinal);
+
+        _byQualifiedName = new Dictionary<string, (UpstreamConnection, string)>(StringComparer.Ordinal);
+        foreach (var connection in connections)
+        {
+            foreach (var tool in connection.Tools)
+            {
+                _byQualifiedName[ToolNamespacer.Qualify(connection.Name, tool.Name)] =
+                    (connection, tool.Name);
+            }
+        }
+    }
+
+    /// <summary>All downstream connections, in configuration order.</summary>
+    public IReadOnlyCollection<UpstreamConnection> Connections => _byServerName.Values;
+
+    /// <summary>
+    /// Spawns and connects to every configured server, then caches its tool list.
+    /// </summary>
+    /// <remarks>
+    /// Connections are established in parallel. Each one spawns a child process
+    /// and waits for it to boot; doing that sequentially would make startup the
+    /// sum of every server's boot time instead of the slowest one. Task.WhenAll
+    /// is the idiomatic way to await a set of concurrent operations.
+    /// </remarks>
+    public static async Task<UpstreamRegistry> ConnectAsync(
+        IReadOnlyList<UpstreamServerConfig> configs,
+        ILoggerFactory loggerFactory,
+        CancellationToken cancellationToken = default)
+    {
+        foreach (var config in configs)
+        {
+            config.Validate();
+        }
+
+        var duplicate = configs
+            .GroupBy(c => c.Name, StringComparer.Ordinal)
+            .FirstOrDefault(g => g.Count() > 1);
+
+        if (duplicate is not null)
+        {
+            throw new ArgumentException(
+                $"Duplicate upstream server name '{duplicate.Key}'. Names must be unique.",
+                nameof(configs));
+        }
+
+        var connections = await Task.WhenAll(
+            configs.Select(c => ConnectOneAsync(c, loggerFactory, cancellationToken)));
+
+        return new UpstreamRegistry(connections);
+    }
+
+    private static async Task<UpstreamConnection> ConnectOneAsync(
+        UpstreamServerConfig config,
+        ILoggerFactory loggerFactory,
+        CancellationToken cancellationToken)
+    {
+        var transport = new StdioClientTransport(
+            new StdioClientTransportOptions
+            {
+                Name = config.Name,
+                Command = config.Command,
+                Arguments = [.. config.Arguments],
+                EnvironmentVariables = config.EnvironmentVariables?.ToDictionary(
+                    kv => kv.Key, kv => kv.Value, StringComparer.Ordinal),
+            },
+            loggerFactory);
+
+        var client = await McpClient.CreateAsync(
+            transport,
+            clientOptions: null,
+            loggerFactory: loggerFactory,
+            cancellationToken: cancellationToken);
+
+        var tools = await client.ListToolsAsync(cancellationToken: cancellationToken);
+
+        return new UpstreamConnection(config.Name, client, [.. tools]);
+    }
+
+    /// <summary>
+    /// Resolves a client-visible tool name to the connection that serves it.
+    /// </summary>
+    /// <returns>False when no downstream server advertises that tool.</returns>
+    public bool TryResolve(
+        string qualifiedToolName,
+        out UpstreamConnection connection,
+        out string downstreamToolName)
+    {
+        if (_byQualifiedName.TryGetValue(qualifiedToolName, out var entry))
+        {
+            connection = entry.Connection;
+            downstreamToolName = entry.ToolName;
+            return true;
+        }
+
+        connection = null!;
+        downstreamToolName = string.Empty;
+        return false;
+    }
+
+    /// <summary>Shuts down every child process.</summary>
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var connection in _byServerName.Values)
+        {
+            // One misbehaving server must not prevent the others from closing,
+            // so failures during shutdown are swallowed deliberately.
+            try
+            {
+                await connection.Client.DisposeAsync();
+            }
+            catch (Exception)
+            {
+                // Intentionally ignored: we are already tearing down.
+            }
+        }
+    }
+}

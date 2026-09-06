@@ -1,0 +1,13 @@
+{
+  "//": "Copy into ~/Library/Application Support/Claude/claude_desktop_config.json (macOS).",
+  "//command": "Use an ABSOLUTE path - Claude Desktop does not run in your shell and has no PATH or cwd you can rely on.",
+  "mcpServers": {
+    "guardrails": {
+      "command": "/Volumes/Workspace/dotnet/guardrails/src/McpGuardrails.Cli/bin/Debug/net10.0/McpGuardrails.Cli",
+      "args": [],
+      "env": {
+        "GUARDRAILS_SANDBOX": "/tmp/guardrails-sandbox"
+      }
+    }
+  }
+}

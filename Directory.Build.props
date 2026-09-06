@@ -1,0 +1,32 @@
+<Project>
+
+  <!--
+    Directory.Build.props is picked up automatically by MSBuild for EVERY project
+    at or below this folder. It's the .NET equivalent of a shared tsconfig base /
+    parent pom: put settings here once instead of repeating them in every .csproj.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+
+    <!-- Nullable reference types. The compiler tracks which references can be null
+         and warns when you dereference one unsafely. Coming from Java/TS: this is
+         strictNullChecks, but retrofitted onto the type system. Keep it on. -->
+    <Nullable>enable</Nullable>
+
+    <!-- Auto-adds `using System;`, `using System.Linq;` etc. to every file so you
+         don't repeat the same 8 imports everywhere. -->
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Warnings become build errors. Harsh, but it's how you learn the idioms
+         instead of accumulating 200 ignored warnings. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <!-- Pre-emptive AOT hygiene: the compiler warns NOW about reflection/trimming
+         patterns that would break Native AOT later, instead of at publish time in
+         week 10 when the whole codebase depends on them. -->
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+</Project>
