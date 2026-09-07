@@ -20,8 +20,11 @@ import sys
 import tempfile
 import threading
 
-BIN = sys.argv[1] if len(sys.argv) > 1 else \
-    "src/McpGuardrails.Cli/bin/Debug/net10.0/McpGuardrails.Cli"
+BIN = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else "src/McpGuardrails.Cli/bin/Debug/net10.0/McpGuardrails.Cli"
+)
 
 # tempfile.gettempdir() honours TMPDIR/TEMP and falls back sanely per platform,
 # rather than hardcoding a world-writable "/tmp".
@@ -31,6 +34,7 @@ SANDBOX = os.environ.get(
 ).rstrip("/")
 
 PROBE = f"{SANDBOX}/smoke-probe.txt"
+AUDIT = f"{SANDBOX}/audit.jsonl"
 CONTENT = "written through the guardrails proxy"
 
 
@@ -87,6 +91,14 @@ def main() -> int:
         print(f"cannot clear probe file {PROBE}: {exc}", file=sys.stderr)
         return 1
 
+    try:
+        os.remove(AUDIT)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"cannot clear audit log {AUDIT}: {exc}", file=sys.stderr)
+        return 1
+
     proc = subprocess.Popen(
         [BIN],
         stdin=subprocess.PIPE,
@@ -94,6 +106,7 @@ def main() -> int:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env={**os.environ, "GUARDRAILS_AUDIT": AUDIT, "GUARDRAILS_SANDBOX": SANDBOX},
     )
 
     # Popen's pipe attributes are Optional[IO] to the type checker; we passed
@@ -141,12 +154,68 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
 
+    failures += check_audit_log()
+
     if failures:
         print("\n--- server stderr (last 30) ---", file=sys.stderr)
         sys.stderr.writelines(stderr_lines[-30:])
 
     print("\nFAILED" if failures else "\nALL OK")
     return 1 if failures else 0
+
+
+def check_audit_log() -> int:
+    """Verify the audit filter recorded every call, including the rejected one."""
+    try:
+        with open(AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  audit log unreadable: {exc}")
+        return 1
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    by_tool = {entry.get("tool"): entry for entry in lines}
+
+    expect(len(lines) == 3, f"audit log has one line per tools/call (got {len(lines)})")
+
+    write = by_tool.get("fs__write_file")
+    expect(write is not None, "audit records the forwarded write_file call")
+    if write:
+        expect(write.get("server") == "fs", "audit resolves the downstream server")
+        expect(
+            write.get("downstream_tool") == "write_file",
+            "audit records the un-namespaced tool",
+        )
+        expect(not write.get("is_error"), "successful call is not flagged as an error")
+        expect(
+            isinstance(write.get("duration_ms"), (int, float)),
+            "audit records a duration",
+        )
+        expect(
+            write.get("arguments", {}).get("path") == PROBE,
+            "audit captures call arguments",
+        )
+
+    # The whole point of putting audit outermost: it must see rejected calls too.
+    unknown = by_tool.get("fs__does_not_exist")
+    expect(unknown is not None, "audit records the REJECTED call, not just successes")
+    if unknown:
+        expect(bool(unknown.get("is_error")), "rejected call is flagged as an error")
+        expect(
+            unknown.get("server") is None, "unresolved call has no downstream server"
+        )
+
+    return failures
 
 
 if __name__ == "__main__":

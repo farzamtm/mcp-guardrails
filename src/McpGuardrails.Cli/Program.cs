@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Upstream;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -23,6 +25,15 @@ var listOnly = args.Contains("list-upstream", StringComparer.Ordinal);
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
               ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
 Directory.CreateDirectory(sandbox);
+
+// Where the audit log lands. A stable, discoverable default matters: launched
+// from Claude Desktop the process has no cwd you can predict, so a relative
+// path would scatter logs wherever the client happened to start us.
+var auditPath = Environment.GetEnvironmentVariable("GUARDRAILS_AUDIT")
+                ?? Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".mcp-guardrails",
+                    "audit.jsonl");
 
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -54,6 +65,11 @@ using var loggerFactory = LoggerFactory.Create(logging =>
 await using var upstream = await UpstreamRegistry.ConnectAsync(
     DefaultUpstreams.Create(sandbox),
     loggerFactory);
+
+// Declared after the registry so it is disposed BEFORE it: `await using` unwinds
+// in reverse order, so the sink drains its queue while the tool calls that feed
+// it are already finished.
+await using var audit = new JsonlAuditSink(auditPath);
 
 // ---------------------------------------------------------------------------
 // STEP 2 demo: print what we discovered downstream, then exit.
@@ -88,6 +104,71 @@ builder.Services
     .AddMcpServer(options =>
     {
         options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = "0.1.0" };
+
+        // -------------------------------------------------------------------
+        // THE INTERCEPTOR PIPELINE.
+        //
+        // A filter takes the next handler and returns a replacement wrapping it.
+        // That is the whole middleware pattern - ASP.NET, Express and servlet
+        // filters are all this shape:
+        //
+        //     next => async (request, ct) => { before; await next(...); after; }
+        //
+        // Filters nest like onion layers, so the FIRST one added is the
+        // outermost. Audit goes on first deliberately: it must observe calls
+        // that inner layers (policy, budget, approval) reject, otherwise the
+        // log would only show what was permitted.
+        // -------------------------------------------------------------------
+        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
+        {
+            var toolName = request.Params?.Name ?? "(missing)";
+
+            // Resolve purely to enrich the log. The call handler resolves again
+            // to actually route; duplicating a dictionary lookup is cheaper than
+            // coupling the two concerns together.
+            var resolved = upstream.TryResolve(toolName, out var connection, out var downstreamName);
+
+            // Stopwatch timestamps rather than DateTime subtraction: this reads a
+            // monotonic clock, so an NTP correction mid-call cannot produce a
+            // negative duration.
+            var startedAt = Stopwatch.GetTimestamp();
+
+            CallToolResult? result = null;
+            string? failure = null;
+
+            try
+            {
+                result = await next(request, cancellationToken);
+                return result;
+            }
+            catch (Exception ex)
+            {
+                // Record the failure, then rethrow. The audit sink observes; it
+                // must never change the outcome of a call.
+                failure = $"{ex.GetType().Name}: {ex.Message}";
+                throw;
+            }
+            finally
+            {
+                var record = new AuditRecord
+                {
+                    Timestamp = DateTimeOffset.UtcNow,
+                    Event = "tool_call",
+                    Tool = toolName,
+                    Server = resolved ? connection.Name : null,
+                    DownstreamTool = resolved ? downstreamName : null,
+                    Arguments = request.Params?.Arguments?.AsReadOnly(),
+                    DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    IsError = failure is not null || result?.IsError is true,
+                    Error = failure,
+                };
+
+                // CancellationToken.None on purpose: if the caller cancelled, we
+                // still want the record. Losing the evidence of an aborted call
+                // is exactly the case an audit log exists for.
+                await audit.WriteAsync(record, CancellationToken.None);
+            }
+        });
     })
     .WithStdioServerTransport()
     .WithListToolsHandler((_, _) =>

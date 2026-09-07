@@ -4,10 +4,10 @@ A policy-enforcing proxy that sits between an MCP client (Claude Desktop, an
 agent framework) and the MCP servers it calls, so you can see and control what
 your agent actually does.
 
-> **Status: early.** Steps 0-3 of the build plan are done: the proxy connects to
-> downstream servers, aggregates their tools under a namespace, and forwards
-> calls. The guardrails themselves (policy, budgets, approval, redaction) are
-> next. See [the spec](mcp-guardrails-dotnet-spec.md).
+> **Status: early.** Steps 0-4 of the build plan are done: the proxy connects to
+> downstream servers, aggregates their tools under a namespace, forwards calls,
+> and audits every one of them. Policy, budgets, approval and redaction are next.
+> See [the spec](mcp-guardrails-dotnet-spec.md).
 
 ## What works today
 
@@ -15,6 +15,30 @@ your agent actually does.
 - Aggregates `tools/list` across servers, namespaced as `<server>__<tool>`
 - Routes `tools/call` to the owning server and forwards the result
 - Unknown tools return a *tool error*, not a protocol error, so the model can react
+- **Audits every call** to a JSONL log, including calls the proxy rejects
+
+## The audit log
+
+With no policy configured the proxy is a pure passthrough that tells you what your
+agent is doing. That is the whole point of transparent-by-default: useful before
+you write a single rule.
+
+Default location `~/.mcp-guardrails/audit.jsonl`, overridable with `GUARDRAILS_AUDIT`.
+
+```json
+{"ts":"2026-09-07T07:19:30.894358+00:00","event":"tool_call","tool":"fs__write_file",
+ "server":"fs","downstream_tool":"write_file",
+ "arguments":{"path":"/tmp/guardrails-sandbox/probe.txt","content":"..."},
+ "duration_ms":5.87,"is_error":false}
+```
+
+```bash
+# What did my agent touch, and how long did it take?
+jq -r '[.ts, .tool, (.duration_ms|tostring)] | @tsv' ~/.mcp-guardrails/audit.jsonl
+
+# Only the failures
+jq 'select(.is_error)' ~/.mcp-guardrails/audit.jsonl
+```
 
 ## Quickstart
 
@@ -65,6 +89,8 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | Path | Purpose |
 | --- | --- |
 | `src/McpGuardrails.Core/Upstream/` | Downstream connections, tool namespacing |
+| `src/McpGuardrails.Core/Audit/` | Audit record + channel-backed JSONL sink |
+| `src/McpGuardrails.Core/Serialization/` | Source-generated JSON (AOT-safe) |
 | `src/McpGuardrails.Cli/Program.cs` | Host wiring; the server half of the proxy |
 | `tests/McpGuardrails.Core.Tests/` | xUnit tests for the pure logic |
 | `scripts/smoke.py` | Dependency-free MCP driver for end-to-end checks |
@@ -84,6 +110,16 @@ implement the 2026-07-28 discovery flow; you'll see a benign
 wrapper but not the underlying `ProtocolTool`, so `tools/list` advertises the old
 name while `tools/call` expects the new one. `ToolNamespacer.Qualify(string, Tool)`
 copies the DTO properly; there's a regression test pinning it.
+
+**Audit backpressure is deliberate.** The sink hands records to a bounded channel
+so tool calls never wait on disk, but when that buffer fills producers *wait*
+rather than drop. For a security tool, "no record exists" and "nothing happened"
+must not be indistinguishable. Dropping would keep the agent fast at the cost of
+losing evidence; that is the wrong trade here.
+
+**Audit is the outermost filter.** Filters nest like onion layers and the first
+registered is the outermost, so audit wraps everything. That ordering is what lets
+it record calls that policy, budget or approval later reject.
 
 ## Requirements
 
