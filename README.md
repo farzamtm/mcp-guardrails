@@ -1,5 +1,9 @@
 # MCP Guardrails Proxy
 
+[![CI](https://github.com/farzamtm/mcp-guardrails/actions/workflows/ci.yml/badge.svg)](https://github.com/farzamtm/mcp-guardrails/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4.svg)](global.json)
+
 A policy-enforcing proxy that sits between an MCP client (Claude Desktop, an
 agent framework) and the MCP servers it calls, so you can see and control what
 your agent actually does.
@@ -126,3 +130,17 @@ it record calls that policy, budget or approval later reject.
 - .NET 10 SDK
 - Node.js (only to run the downstream filesystem server via `npx`)
 - Python 3 (only for `scripts/smoke.py`)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching and commit conventions.
+
+## Security
+
+The [threat model](SECURITY.md) documents what this defends against and, just as
+importantly, what it does not. Please report vulnerabilities privately rather
+than in a public issue.
+
+## Licence
+
+[Apache-2.0](LICENSE).
