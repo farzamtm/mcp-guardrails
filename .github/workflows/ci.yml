@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch instead of burning minutes on
+# commits nobody is waiting for any more.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Third-party actions are pinned to commit SHAs, not tags. A tag like @v5 is
+# mutable: whoever controls the repo can repoint it at new code, which would
+# execute in this workflow. A security tool whose own CI is trivially
+# supply-chain attackable is not a good look. Comments record the human tag.
+#
+# persist-credentials: false stops checkout leaving a usable GITHUB_TOKEN in
+# .git/config, where any later step (or dependency) could read it.
+
+jobs:
+  build:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't kill the other platforms when one fails - a failure specific to a
+      # single OS is exactly the information we want.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          # Honour global.json rather than pinning the version twice.
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        # Directory.Build.props sets TreatWarningsAsErrors, so any new warning
+        # (including the AOT-compatibility analyzers) fails the build here.
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release --verbosity normal
+
+  # The unit tests never touch a real MCP server. This job proves the whole
+  # chain works: driver -> proxy -> spawned Node filesystem server -> disk.
+  end-to-end:
+    name: end-to-end smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+
+      - name: Set up Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - name: Build
+        run: dotnet build --configuration Release
+
+      - name: Smoke test through a real downstream server
+        run: |
+          python3 scripts/smoke.py \
+            src/McpGuardrails.Cli/bin/Release/net10.0/McpGuardrails.Cli
