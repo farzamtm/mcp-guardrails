@@ -49,6 +49,12 @@ jobs:
       - name: Restore
         run: dotnet restore
 
+      - name: Verify formatting
+        # Only once - formatting is platform independent, so running it on all
+        # three would just be slower.
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet format --verify-no-changes
+
       - name: Build
         # Directory.Build.props sets TreatWarningsAsErrors, so any new warning
         # (including the AOT-compatibility analyzers) fails the build here.
