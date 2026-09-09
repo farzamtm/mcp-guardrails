@@ -8,10 +8,10 @@ A policy-enforcing proxy that sits between an MCP client (Claude Desktop, an
 agent framework) and the MCP servers it calls, so you can see and control what
 your agent actually does.
 
-> **Status: early.** Steps 0-4 of the build plan are done: the proxy connects to
+> **Status: early.** Steps 0-5 of the build plan are done: the proxy connects to
 > downstream servers, aggregates their tools under a namespace, forwards calls,
-> and audits every one of them. Policy, budgets, approval and redaction are next.
-> See [the spec](mcp-guardrails-dotnet-spec.md).
+> audits every one of them, and can now **refuse** them by policy. Budgets,
+> approval and result scanning are next. See [the spec](mcp-guardrails-dotnet-spec.md).
 
 ## What works today
 
@@ -20,6 +20,42 @@ your agent actually does.
 - Routes `tools/call` to the owning server and forwards the result
 - Unknown tools return a *tool error*, not a protocol error, so the model can react
 - **Audits every call** to a JSONL log, including calls the proxy rejects
+- **Enforces a YAML policy** — allow or deny per tool, first match wins
+
+## Policy
+
+Point `GUARDRAILS_POLICY` at a YAML file. No file means pure passthrough.
+
+```yaml
+rules:
+  - name: allow-reads
+    match:
+      tool: fs__read_text_file
+    decision: allow
+
+  - name: no-writes
+    match:
+      tool: fs__write_file
+    decision: deny
+    message: >-
+      Writing files is disabled in this sandbox. Show the user the change you
+      would make instead of applying it.
+```
+
+The agent sees:
+
+```text
+Blocked by guardrails policy rule 'no-writes': Writing files is disabled in
+this sandbox. Show the user the change you would make instead of applying it.
+```
+
+That `message` is a **prompt, not a log line**. An agent told "try limit=100"
+changes approach; an agent told "denied" retries forever. Run with `--explain`
+to append the full decision trail to each refusal.
+
+Rules are first-match-wins, like firewall rules — predictable by reading top to
+bottom, rather than by guessing at specificity scores. See
+[`examples/filesystem-sandbox.yaml`](examples/filesystem-sandbox.yaml).
 
 ## The audit log
 
@@ -96,6 +132,8 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | Path | Purpose |
 | --- | --- |
 | `src/McpGuardrails.Core/Upstream/` | Downstream connections, tool namespacing |
+| `src/McpGuardrails.Core/Policy/` | Decisions, rules, evaluator, YAML loader |
+| `src/McpGuardrails.Core/Pipeline/` | Per-call scope shared between filters |
 | `src/McpGuardrails.Core/Audit/` | Audit record + channel-backed JSONL sink |
 | `src/McpGuardrails.Core/Serialization/` | Source-generated JSON (AOT-safe) |
 | `src/McpGuardrails.Cli/Program.cs` | Host wiring; the server half of the proxy |
@@ -144,6 +182,24 @@ losing evidence; that is the wrong trade here.
 **Audit is the outermost filter.** Filters nest like onion layers and the first
 registered is the outermost, so audit wraps everything. That ordering is what lets
 it record calls that policy, budget or approval later reject.
+
+**AsyncLocal flows down, never up.** The audit filter is outermost but the
+decision it logs is made by the policy filter inside it. An inner filter
+reassigning an `AsyncLocal` would be invisible to the outer one, so
+`GuardrailsCallScope` publishes a mutable holder that inner filters *mutate*
+instead.
+
+**Policy loading avoids reflection on purpose.** YamlDotNet's `Deserializer`
+binds via reflection, which Native AOT trims — it would yield a policy with no
+rules, silently allowing everything. So YAML is parsed to a `JsonNode` tree and
+bound by the source-generated deserializer instead.
+
+**Two fail-open bugs, both caught by tests.** Property initializers are ignored
+by source-generated deserialization, so an omitted `decision:` arrived as
+`Verdict.Allow` (the enum's zero value) — a blocking rule would have permitted.
+And `File.Exists()` returns false for a *directory*, so a policy path pointing at
+one fell through to "no policy". A security component has to fail closed; both
+now do, with regression tests.
 
 ## Requirements
 
