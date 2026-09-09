@@ -9,10 +9,8 @@
   </ItemGroup>
 
   <PropertyGroup>
+    <!-- TargetFramework / Nullable / ImplicitUsings come from Directory.Build.props. -->
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
   </PropertyGroup>
 
 </Project>

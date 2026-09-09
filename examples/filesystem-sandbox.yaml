@@ -1,0 +1,40 @@
+# Example policy: a read-mostly filesystem agent.
+#
+# Rules are evaluated top to bottom and the FIRST match wins, like firewall
+# rules. Anything no rule matches is allowed - an empty policy file is a pure
+# passthrough, so you can install the proxy and watch the audit log before
+# writing a single rule.
+#
+# Use it with:
+#   GUARDRAILS_POLICY=examples/filesystem-sandbox.yaml McpGuardrails
+
+rules:
+  # Reads are fine, and saying so explicitly stops the catch-all below from
+  # catching them.
+  - name: allow-reads
+    match:
+      tool: fs__read_text_file
+    decision: allow
+
+  - name: allow-listing
+    match:
+      tool: fs__list_directory
+    decision: allow
+
+  # The message is a prompt, not a log line. An agent that reads this can pick a
+  # different approach; an agent that reads "denied" just retries.
+  - name: no-writes
+    match:
+      tool: fs__write_file
+    decision: deny
+    message: >-
+      Writing files is disabled in this sandbox. Read the file and show the user
+      the change you would make instead of applying it.
+
+  - name: no-deletes
+    match:
+      tool: fs__move_file
+    decision: deny
+    message: >-
+      Moving or renaming files is disabled. Ask the user to do it manually if it
+      is genuinely required.
