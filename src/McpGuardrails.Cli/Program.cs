@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using McpGuardrails.Core.Audit;
+using McpGuardrails.Core.Pipeline;
+using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Upstream;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -20,6 +22,11 @@ using ModelContextProtocol.Protocol;
 // A crude command switch. Step 11 replaces this with System.CommandLine; right
 // now an extra dependency would only obscure the MCP concepts.
 var listOnly = args.Contains("list-upstream", StringComparer.Ordinal);
+
+// --explain appends the policy decision trail to every denial, so "why was this
+// blocked?" is answerable without reading the rules. Off by default: building
+// the trail allocates on a path that runs for every single tool call.
+var explain = args.Contains("--explain", StringComparer.Ordinal);
 
 // Where the sandboxed filesystem server is allowed to operate.
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
@@ -72,6 +79,31 @@ await using var upstream = await UpstreamRegistry.ConnectAsync(
 await using var audit = new JsonlAuditSink(auditPath);
 
 // ---------------------------------------------------------------------------
+// Load the policy.
+//
+// A missing file is not an error: no policy means pure passthrough with audit
+// logging, which is the adoption story. A MALFORMED file is fatal - failing
+// open on a broken security policy is exactly the wrong default.
+// ---------------------------------------------------------------------------
+var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
+                 ?? Path.Combine(
+                     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                     ".mcp-guardrails",
+                     "policy.yaml");
+
+PolicyEvaluator policy;
+try
+{
+    policy = new PolicyEvaluator(PolicyLoader.LoadFromFileOrEmpty(policyPath));
+}
+catch (PolicyException ex)
+{
+    // Console.Error, not stdout: stdout is the JSON-RPC wire.
+    await Console.Error.WriteLineAsync($"Invalid policy file '{policyPath}': {ex.Message}");
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
 // STEP 2 demo: print what we discovered downstream, then exit.
 // ---------------------------------------------------------------------------
 if (listOnly)
@@ -85,7 +117,7 @@ if (listOnly)
         }
     }
 
-    return;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +153,11 @@ builder.Services
         // -------------------------------------------------------------------
         options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
         {
+            // Opens the per-call scope that lets the policy filter below report
+            // its decision back up to this one. See GuardrailsCallScope for why
+            // a mutable holder is required rather than a plain AsyncLocal value.
+            using var scope = GuardrailsCallScope.Begin();
+
             var toolName = request.Params?.Name ?? "(missing)";
 
             // Resolve purely to enrich the log. The call handler resolves again
@@ -150,6 +187,8 @@ builder.Services
             }
             finally
             {
+                var decision = scope.Decision;
+
                 var record = new AuditRecord
                 {
                     Timestamp = DateTimeOffset.UtcNow,
@@ -158,6 +197,9 @@ builder.Services
                     Server = resolved ? connection.Name : null,
                     DownstreamTool = resolved ? downstreamName : null,
                     Arguments = request.Params?.Arguments?.AsReadOnly(),
+                    Decision = decision?.Verdict.ToString().ToLowerInvariant(),
+                    Rule = decision?.RuleName,
+                    DecisionReason = decision?.Reason,
                     DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
@@ -168,6 +210,47 @@ builder.Services
                 // is exactly the case an audit log exists for.
                 await audit.WriteAsync(record, CancellationToken.None);
             }
+        });
+
+        // -------------------------------------------------------------------
+        // POLICY FILTER - registered second, so it sits INSIDE audit.
+        //
+        // That ordering is the point: when this filter refuses a call it returns
+        // without invoking `next`, so nothing downstream runs - but the audit
+        // filter wrapping it still records the attempt.
+        // -------------------------------------------------------------------
+        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
+        {
+            var facts = new ToolCallFacts(
+                request.Params?.Name ?? string.Empty,
+                request.Params?.Arguments?.AsReadOnly());
+
+            var decision = policy.Evaluate(facts, explain);
+
+            // Report upward so the audit record carries the verdict.
+            GuardrailsCallScope.RecordDecision(decision);
+
+            if (!decision.IsBlocked)
+            {
+                return await next(request, cancellationToken);
+            }
+
+            // A refusal is returned as a tool ERROR, not a JSON-RPC protocol
+            // error. Protocol errors are for malformed traffic; this is a result
+            // the model should read and adapt to. That is why the message is
+            // written for the model rather than for a log file.
+            var text = decision.ToModelMessage();
+
+            if (explain && decision.Trail is { Count: > 0 })
+            {
+                text += "\n\nDecision trail:\n  " + string.Join("\n  ", decision.Trail);
+            }
+
+            return new CallToolResult
+            {
+                IsError = true,
+                Content = [new TextContentBlock { Text = text }],
+            };
         });
     })
     .WithStdioServerTransport()
@@ -218,3 +301,5 @@ builder.Services
     });
 
 await builder.Build().RunAsync();
+
+return 0;

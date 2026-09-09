@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using McpGuardrails.Core.Audit;
+using McpGuardrails.Core.Policy;
 
 namespace McpGuardrails.Core.Serialization;
 
@@ -35,4 +36,12 @@ namespace McpGuardrails.Core.Serialization;
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(AuditRecord))]
 [JsonSerializable(typeof(IReadOnlyDictionary<string, JsonElement>))]
+// Policy types are deserialized from the YAML-derived JsonNode tree. Registering
+// them here is what keeps policy loading working under Native AOT; without it,
+// trimming would leave the binder unable to see these properties and every rule
+// would silently load as empty.
+[JsonSerializable(typeof(PolicyDocument))]
+[JsonSerializable(typeof(PolicyRule))]
+[JsonSerializable(typeof(PolicyMatch))]
+[JsonSerializable(typeof(Verdict))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

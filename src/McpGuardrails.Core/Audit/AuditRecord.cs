@@ -51,6 +51,22 @@ public sealed record AuditRecord
     [JsonPropertyName("arguments")]
     public IReadOnlyDictionary<string, JsonElement>? Arguments { get; init; }
 
+    /// <summary>Policy verdict for this call: allow, deny or require_approval.</summary>
+    /// <remarks>
+    /// Recorded as a string rather than the enum's numeric value so the log stays
+    /// readable and greppable without a lookup table.
+    /// </remarks>
+    [JsonPropertyName("decision")]
+    public string? Decision { get; init; }
+
+    /// <summary>Name of the policy rule that decided, if any matched.</summary>
+    [JsonPropertyName("rule")]
+    public string? Rule { get; init; }
+
+    /// <summary>Why the policy decided as it did.</summary>
+    [JsonPropertyName("decision_reason")]
+    public string? DecisionReason { get; init; }
+
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }
 
