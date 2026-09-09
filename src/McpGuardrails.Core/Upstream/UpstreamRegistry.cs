@@ -4,6 +4,19 @@ using ModelContextProtocol.Client;
 namespace McpGuardrails.Core.Upstream;
 
 /// <summary>
+/// Creates the transport used to reach one downstream server.
+/// </summary>
+/// <remarks>
+/// A seam for testing. Production always spawns a child process over stdio, but
+/// a test can substitute an in-memory stream pair and talk to a real MCP server
+/// running in the same process - no npx, no network, no spawned binaries, and
+/// tests that still exercise the genuine protocol rather than a mock.
+/// </remarks>
+public delegate IClientTransport UpstreamTransportFactory(
+    UpstreamServerConfig config,
+    ILoggerFactory loggerFactory);
+
+/// <summary>
 /// One live connection to a downstream MCP server, plus the tools it advertised.
 /// </summary>
 public sealed record UpstreamConnection(
@@ -68,8 +81,14 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     public static async Task<UpstreamRegistry> ConnectAsync(
         IReadOnlyList<UpstreamServerConfig> configs,
         ILoggerFactory loggerFactory,
+        UpstreamTransportFactory? transportFactory = null,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(configs);
+        ArgumentNullException.ThrowIfNull(loggerFactory);
+
+        transportFactory ??= CreateStdioTransport;
+
         foreach (var config in configs)
         {
             config.Validate();
@@ -87,17 +106,21 @@ public sealed class UpstreamRegistry : IAsyncDisposable
         }
 
         var connections = await Task.WhenAll(
-            configs.Select(c => ConnectOneAsync(c, loggerFactory, cancellationToken)));
+            configs.Select(c => ConnectOneAsync(c, loggerFactory, transportFactory, cancellationToken)));
 
         return new UpstreamRegistry(connections);
     }
 
-    private static async Task<UpstreamConnection> ConnectOneAsync(
+    /// <summary>Production transport: spawn the server as a child process.</summary>
+    /// <remarks>
+    /// internal rather than private so tests can verify the config-to-transport
+    /// mapping without spawning a process. Silently dropping EnvironmentVariables
+    /// here would break real deployments in a way no other test would catch.
+    /// </remarks>
+    internal static IClientTransport CreateStdioTransport(
         UpstreamServerConfig config,
-        ILoggerFactory loggerFactory,
-        CancellationToken cancellationToken)
-    {
-        var transport = new StdioClientTransport(
+        ILoggerFactory loggerFactory) =>
+        new StdioClientTransport(
             new StdioClientTransportOptions
             {
                 Name = config.Name,
@@ -107,6 +130,14 @@ public sealed class UpstreamRegistry : IAsyncDisposable
                     kv => kv.Key, kv => kv.Value, StringComparer.Ordinal),
             },
             loggerFactory);
+
+    private static async Task<UpstreamConnection> ConnectOneAsync(
+        UpstreamServerConfig config,
+        ILoggerFactory loggerFactory,
+        UpstreamTransportFactory transportFactory,
+        CancellationToken cancellationToken)
+    {
+        var transport = transportFactory(config, loggerFactory);
 
         var client = await McpClient.CreateAsync(
             transport,
