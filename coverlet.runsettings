@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Coverage settings, shared by local runs and CI.
+
+  Used by the `coverage` steps in CI and by scripts/coverage.sh locally.
+  (XML comments cannot contain a double hyphen, so the exact command line lives
+  in scripts/coverage.sh rather than here.)
+
+  The exclusions matter for the number to mean anything. Source generators emit
+  thousands of lines (regex matchers, JSON serializers) that we neither wrote nor
+  can meaningfully test. Counting them turns the coverage figure into a measure of
+  how much generated code happens to be exercised, which tells you nothing about
+  whether the code you wrote is tested.
+-->
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat code coverage">
+        <Configuration>
+          <Format>cobertura,opencover</Format>
+
+          <!-- Skip anything the compiler or a source generator produced:
+               [GeneratedCode] covers the regex and JSON generators,
+               [ExcludeFromCodeCoverage] is the manual opt-out,
+               [CompilerGenerated] covers async state machines and closures. -->
+          <ExcludeByAttribute>GeneratedCodeAttribute,ExcludeFromCodeCoverageAttribute,CompilerGeneratedAttribute,DebuggerNonUserCodeAttribute</ExcludeByAttribute>
+
+          <!-- The CLI is thin host wiring (top-level statements, DI registration).
+               It is covered by scripts/smoke.py end to end, which is the right
+               tool for it; unit-testing a composition root produces brittle tests
+               that assert the wiring rather than the behaviour. -->
+          <Exclude>[McpGuardrails.Cli]*</Exclude>
+
+          <ExcludeByFile>**/*.g.cs,**/*.Designer.cs</ExcludeByFile>
+
+          <SingleHit>false</SingleHit>
+          <UseSourceLink>true</UseSourceLink>
+          <IncludeTestAssembly>false</IncludeTestAssembly>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

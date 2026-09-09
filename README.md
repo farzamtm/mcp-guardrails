@@ -50,6 +50,9 @@ jq 'select(.is_error)' ~/.mcp-guardrails/audit.jsonl
 dotnet build
 dotnet test
 
+# Tests with coverage, enforcing the 100% gate
+./scripts/coverage.sh
+
 # See what the proxy discovered downstream
 ./src/McpGuardrails.Cli/bin/Debug/net10.0/McpGuardrails.Cli list-upstream
 
@@ -96,8 +99,25 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | `src/McpGuardrails.Core/Audit/` | Audit record + channel-backed JSONL sink |
 | `src/McpGuardrails.Core/Serialization/` | Source-generated JSON (AOT-safe) |
 | `src/McpGuardrails.Cli/Program.cs` | Host wiring; the server half of the proxy |
-| `tests/McpGuardrails.Core.Tests/` | xUnit tests for the pure logic |
+| `tests/McpGuardrails.Core.Tests/` | xUnit tests, 100% line and branch on Core |
 | `scripts/smoke.py` | Dependency-free MCP driver for end-to-end checks |
+| `scripts/coverage.sh` | Coverage run + threshold gate, same in CI and locally |
+
+## Testing
+
+Three layers, each covering what the one below cannot:
+
+| Layer | What it proves |
+| --- | --- |
+| Unit tests | Pure logic — namespacing, config validation, the audit sink |
+| In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log |
+
+Core sits at **100% line and branch coverage**, enforced as a ratchet by
+`scripts/coverage.sh` in CI. Generated code (regex and JSON source generators)
+and the CLI host wiring are excluded — counting generated lines would measure
+the generators rather than the tests, and a composition root is better covered
+end to end than by asserting on its wiring.
 
 ## Notes for the curious
 

@@ -6,4 +6,10 @@
     <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Lets tests reach internal members (e.g. the stdio transport factory)
+         without widening the public API surface just to make it testable. -->
+    <InternalsVisibleTo Include="McpGuardrails.Core.Tests" />
+  </ItemGroup>
+
 </Project>

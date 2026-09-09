@@ -63,6 +63,34 @@ jobs:
       - name: Test
         run: dotnet test --no-build --configuration Release --verbosity normal
 
+  coverage:
+    name: coverage gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+
+      # Same script developers run locally, so a green local run means a green
+      # pipeline. Fails the build if coverage drops below the ratchet.
+      - name: Test with coverage
+        run: ./scripts/coverage.sh
+
+      - name: Upload coverage report
+        if: always()
+        # actions/upload-artifact v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: coverage
+          path: artifacts/coverage/**/coverage.cobertura.xml
+          if-no-files-found: error
+
   # The unit tests never touch a real MCP server. This job proves the whole
   # chain works: driver -> proxy -> spawned Node filesystem server -> disk.
   end-to-end:
