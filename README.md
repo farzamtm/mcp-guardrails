@@ -8,10 +8,12 @@ A policy-enforcing proxy that sits between an MCP client (Claude Desktop, an
 agent framework) and the MCP servers it calls, so you can see and control what
 your agent actually does.
 
-> **Status: early.** Steps 0-5 of the build plan are done: the proxy connects to
+> **Status: early.** Steps 0-6 of the build plan are done: the proxy connects to
 > downstream servers, aggregates their tools under a namespace, forwards calls,
-> audits every one of them, and can now **refuse** them by policy. Budgets,
-> approval and result scanning are next. See [the spec](mcp-guardrails-dotnet-spec.md).
+> audits every one of them, and can **refuse** them by policy - matching on tool
+> globs, the tool's own MCP annotations, and predicates over the arguments.
+> Budgets, approval and result scanning are next.
+> See [the spec](mcp-guardrails-dotnet-spec.md).
 
 ## What works today
 
@@ -20,7 +22,8 @@ your agent actually does.
 - Routes `tools/call` to the owning server and forwards the result
 - Unknown tools return a *tool error*, not a protocol error, so the model can react
 - **Audits every call** to a JSONL log, including calls the proxy rejects
-- **Enforces a YAML policy** — allow or deny per tool, first match wins
+- **Enforces a YAML policy** — allow or deny, first match wins, matching on tool
+  name globs, MCP annotations and the call's arguments
 
 ## Policy
 
@@ -30,7 +33,7 @@ Point `GUARDRAILS_POLICY` at a YAML file. No file means pure passthrough.
 rules:
   - name: allow-reads
     match:
-      tool: fs__read_text_file
+      tool: fs__read_*
     decision: allow
 
   - name: no-writes
@@ -51,11 +54,55 @@ this sandbox. Show the user the change you would make instead of applying it.
 
 That `message` is a **prompt, not a log line**. An agent told "try limit=100"
 changes approach; an agent told "denied" retries forever. Run with `--explain`
-to append the full decision trail to each refusal.
+to append the full decision trail to each refusal, naming the condition that
+failed on every rule considered.
 
 Rules are first-match-wins, like firewall rules — predictable by reading top to
 bottom, rather than by guessing at specificity scores. See
 [`examples/filesystem-sandbox.yaml`](examples/filesystem-sandbox.yaml).
+
+### What a rule can match on
+
+Three kinds of condition, combined with AND. An omitted condition is skipped, so
+a `match:` with nothing in it is a catch-all.
+
+```yaml
+rules:
+  - name: cap-bulk-exports
+    match:
+      tool: ct__export_*              # glob: * any run, ? one character
+      annotations:
+        readOnlyHint: false           # what the tool says it does
+      args:
+        - path: $.limit               # what this call is asking for
+          gt: 100
+    decision: deny
+    message: Exports over 100 rows need approval; try limit=100.
+```
+
+**Tool globs** cover a whole server (`fs__*`) or a verb across every server
+(`*__delete_*`). A pattern with no wildcard is still an exact, case-sensitive
+match, so older policy files mean exactly what they did before.
+
+**Annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+`openWorldHint` — match on what a tool advertises rather than what it is called,
+which is how you cover the server somebody adds next month. The MCP defaults
+apply, and they fail closed: a tool that declares nothing counts as destructive,
+so `destructiveHint: true` catches it. These are *hints from an upstream server*,
+though, so treat them as a safety net under your named rules, not as a guarantee
+— a hostile server can describe its delete tool as read-only.
+
+**Argument predicates** take a JSONPath and exactly one operator: `eq`, `gt`,
+`lt`, `matches`, `prefix`, `not_prefix`, `in`. One operator per entry, so
+`--explain` can name the condition that failed; two conditions on one value are
+two list entries. The supported path syntax is `$.a.b`, `$.a[0]` and
+`$['quoted key']` — anything else is rejected when the policy loads rather than
+silently never matching.
+
+An argument the model did not send satisfies no predicate, **including a negated
+one**: `not_prefix` asserts "there is a value and it does not start with this".
+A rule must not fire on evidence that was never supplied, so when a missing
+argument should also be refused, follow the rule with a catch-all.
 
 ## The audit log
 
@@ -140,6 +187,7 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | `tests/McpGuardrails.Core.Tests/` | xUnit tests, 100% line and branch on Core |
 | `scripts/smoke.py` | Dependency-free MCP driver for end-to-end checks |
 | `scripts/coverage.sh` | Coverage run + threshold gate, same in CI and locally |
+| `ruff.toml` | Lint settings for the Python tooling |
 
 ## Testing
 
@@ -149,7 +197,11 @@ Three layers, each covering what the one below cannot:
 | --- | --- |
 | Unit tests | Pure logic — namespacing, config validation, the audit sink |
 | In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
-| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in two phases: pure passthrough, then a policy that denies by glob, by argument and by annotation |
+
+CI runs all three on Linux, macOS and Windows, plus a `lint` job
+(`dotnet format`, `ruff`, `shellcheck`) and a check that every example policy in
+`examples/` still loads through the real loader.
 
 Core sits at **100% line and branch coverage**, enforced as a ratchet by
 `scripts/coverage.sh` in CI. Generated code (regex and JSON source generators)
@@ -188,6 +240,14 @@ decision it logs is made by the policy filter inside it. An inner filter
 reassigning an `AsyncLocal` would be invisible to the outer one, so
 `GuardrailsCallScope` publishes a mutable holder that inner filters *mutate*
 instead.
+
+**The glob and JSONPath evaluators are hand-rolled, and that is the point.** A
+policy file is configuration, and both a regex compiled from configuration and a
+reflection-based JSONPath library are liabilities here — the first can backtrack
+catastrophically and hang every tool call, the second breaks under Native AOT.
+The glob matcher is a two-pointer scan with one backtrack point, the path
+resolver walks spans without allocating, and the one place a real regex is
+exposed to policy input (`matches:`) runs under a 100 ms timeout.
 
 **Policy loading avoids reflection on purpose.** YamlDotNet's `Deserializer`
 binds via reflection, which Native AOT trims — it would yield a policy with no
