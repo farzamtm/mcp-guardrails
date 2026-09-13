@@ -487,3 +487,6 @@ $RECYCLE.BIN/
 # macOS
 .DS_Store
 artifacts/
+
+# Ruff (lints the Python tooling in scripts/)
+.ruff_cache/
