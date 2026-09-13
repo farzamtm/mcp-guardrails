@@ -43,5 +43,8 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(PolicyDocument))]
 [JsonSerializable(typeof(PolicyRule))]
 [JsonSerializable(typeof(PolicyMatch))]
+[JsonSerializable(typeof(AnnotationMatch))]
+[JsonSerializable(typeof(ArgumentPredicate))]
+[JsonSerializable(typeof(IReadOnlyList<ArgumentPredicate>))]
 [JsonSerializable(typeof(Verdict))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

@@ -1,0 +1,240 @@
+using System.Text.Json;
+using McpGuardrails.Core.Policy;
+
+namespace McpGuardrails.Core.Tests.Policy;
+
+public sealed class ArgumentPredicateTests
+{
+    private static readonly IReadOnlyDictionary<string, JsonElement> _arguments =
+        TestArguments.From("""
+            {
+              "limit": 500,
+              "path": "/etc/passwd",
+              "dry_run": false,
+              "nothing": null,
+              "mode": "force",
+              "options": { "recursive": true },
+              "tags": ["a", "b"]
+            }
+            """);
+
+    private static JsonElement Json(string json) => JsonDocument.Parse(json).RootElement.Clone();
+
+    private static bool Evaluate(ArgumentPredicate predicate) => predicate.Evaluate(_arguments);
+
+    // ------------------------------------------------------------------- eq
+
+    [Theory]
+    [InlineData("$.limit", "500", true)]
+    [InlineData("$.limit", "500.0", true)]
+    [InlineData("$.limit", "499", false)]
+    [InlineData("$.path", "\"/etc/passwd\"", true)]
+    [InlineData("$.path", "\"/etc/shadow\"", false)]
+    [InlineData("$.dry_run", "false", true)]
+    [InlineData("$.dry_run", "true", false)]
+    [InlineData("$.options.recursive", "true", true)]
+    [InlineData("$.nothing", "null", true)]
+    // Mismatched kinds are never equal: "500" the string is not 500 the number,
+    // which is why the YAML loader preserves quoting.
+    [InlineData("$.limit", "\"500\"", false)]
+    [InlineData("$.path", "500", false)]
+    [InlineData("$.nothing", "false", false)]
+    // Structures are compared by path, not deeply.
+    [InlineData("$.options", "{\"recursive\": true}", false)]
+    [InlineData("$.tags", "[\"a\", \"b\"]", false)]
+    public void Eq_ComparesByKindAndValue(string path, string expected, bool matches) =>
+        Assert.Equal(matches, Evaluate(new ArgumentPredicate { Path = path, Eq = Json(expected) }));
+
+    // ---------------------------------------------------------------- gt / lt
+
+    [Theory]
+    [InlineData(100, true)]
+    [InlineData(500, false)]
+    [InlineData(900, false)]
+    public void Gt_ComparesNumerically(double bound, bool matches) =>
+        Assert.Equal(matches, Evaluate(new ArgumentPredicate { Path = "$.limit", Gt = bound }));
+
+    [Theory]
+    [InlineData(900, true)]
+    [InlineData(500, false)]
+    [InlineData(100, false)]
+    public void Lt_ComparesNumerically(double bound, bool matches) =>
+        Assert.Equal(matches, Evaluate(new ArgumentPredicate { Path = "$.limit", Lt = bound }));
+
+    [Fact]
+    public void NumericOperators_DoNotMatchNonNumbers()
+    {
+        // A string that looks like a number is still a string. Coercing here
+        // would make "limit: '1000'" quietly bypass a gt rule.
+        Assert.False(Evaluate(new ArgumentPredicate { Path = "$.path", Gt = 1 }));
+        Assert.False(Evaluate(new ArgumentPredicate { Path = "$.path", Lt = 1 }));
+    }
+
+    // ---------------------------------------------------------------- strings
+
+    [Theory]
+    [InlineData("^/etc/", true)]
+    [InlineData("passwd$", true)]
+    [InlineData("^/home/", false)]
+    public void Matches_AppliesTheRegexToStringValues(string pattern, bool expected) =>
+        Assert.Equal(expected, Evaluate(new ArgumentPredicate { Path = "$.path", Matches = pattern }));
+
+    [Fact]
+    public void Matches_DoesNotMatchNonStrings() =>
+        Assert.False(Evaluate(new ArgumentPredicate { Path = "$.limit", Matches = "500" }));
+
+    [Theory]
+    [InlineData("/etc", true)]
+    [InlineData("/etc/passwd", true)]
+    [InlineData("/home", false)]
+    public void Prefix_IsAnOrdinalStartsWith(string prefix, bool expected) =>
+        Assert.Equal(expected, Evaluate(new ArgumentPredicate { Path = "$.path", Prefix = prefix }));
+
+    [Fact]
+    public void Prefix_DoesNotMatchNonStrings() =>
+        Assert.False(Evaluate(new ArgumentPredicate { Path = "$.limit", Prefix = "5" }));
+
+    [Theory]
+    [InlineData("/workspace/", true)]
+    [InlineData("/etc/", false)]
+    public void NotPrefix_MatchesAStringThatDoesNotStartWithIt(string prefix, bool expected) =>
+        Assert.Equal(expected, Evaluate(new ArgumentPredicate { Path = "$.path", NotPrefix = prefix }));
+
+    [Fact]
+    public void NotPrefix_DoesNotMatchNonStrings() =>
+        Assert.False(Evaluate(new ArgumentPredicate { Path = "$.limit", NotPrefix = "/workspace/" }));
+
+    // --------------------------------------------------------------------- in
+
+    [Fact]
+    public void In_MatchesAnyListedValue()
+    {
+        var predicate = new ArgumentPredicate
+        {
+            Path = "$.mode",
+            In = [Json("\"force\""), Json("\"purge\"")],
+        };
+
+        Assert.True(Evaluate(predicate));
+    }
+
+    [Fact]
+    public void In_DoesNotMatchWhenNothingLinesUp()
+    {
+        var predicate = new ArgumentPredicate
+        {
+            Path = "$.mode",
+            In = [Json("\"safe\""), Json("42")],
+        };
+
+        Assert.False(Evaluate(predicate));
+    }
+
+    // -------------------------------------------------------- absent arguments
+
+    [Theory]
+    [InlineData("$.missing")]
+    [InlineData("$.options.missing")]
+    public void AnAbsentArgument_SatisfiesNoPredicate(string path)
+    {
+        // The rule this pins down: not_prefix asserts "there is a value and it
+        // does not start with this", NOT "no value starts with this". A rule must
+        // not fire on evidence that was never supplied.
+        Assert.False(Evaluate(new ArgumentPredicate { Path = path, NotPrefix = "/workspace/" }));
+        Assert.False(Evaluate(new ArgumentPredicate { Path = path, Prefix = "/etc/" }));
+        Assert.False(Evaluate(new ArgumentPredicate { Path = path, Eq = Json("null") }));
+        Assert.False(Evaluate(new ArgumentPredicate { Path = path, Gt = 0 }));
+    }
+
+    [Fact]
+    public void NoArgumentsAtAll_SatisfiesNoPredicate() =>
+        Assert.False(new ArgumentPredicate { Path = "$.limit", Gt = 1 }.Evaluate(null));
+
+    // ------------------------------------------------------------------ ReDoS
+
+    [Fact]
+    public void ACatastrophicPatternTimesOutAndDoesNotMatch()
+    {
+        // Policy files are configuration and configuration must not be able to
+        // hang the proxy. On timeout the predicate reports "no match" and the
+        // remaining rules decide; the alternative - treating a timeout as a match
+        // - would let any sufficiently long argument trip a deny rule by accident.
+        var arguments = TestArguments.From($$"""{ "path": "{{new string('a', 40)}}!" }""");
+
+        var predicate = new ArgumentPredicate { Path = "$.path", Matches = "^(a+)+$" };
+
+        Assert.False(predicate.Evaluate(arguments));
+    }
+
+    // -------------------------------------------------------------- validation
+
+    [Theory]
+    [InlineData(null, "without a 'path'")]
+    [InlineData("   ", "without a 'path'")]
+    public void Validate_RequiresAPath(string? path, string expectedFragment)
+    {
+        var predicate = new ArgumentPredicate { Path = path, Gt = 1 };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
+        Assert.Contains(expectedFragment, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsAnUnsupportedPath()
+    {
+        var predicate = new ArgumentPredicate { Path = "$.items[*]", Gt = 1 };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
+        Assert.Contains("unsupported argument path", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsAPredicateWithNoOperator()
+    {
+        var exception = Assert.Throws<PolicyException>(
+            () => new ArgumentPredicate { Path = "$.limit" }.Validate("r"));
+
+        Assert.Contains("no operator", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsMoreThanOneOperator()
+    {
+        // Two conditions on one value is two list entries. Silently honouring the
+        // first would make the other one a comment.
+        var predicate = new ArgumentPredicate { Path = "$.limit", Gt = 1, Lt = 10 };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
+        Assert.Contains("more than one", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsAnEmptyInList()
+    {
+        var predicate = new ArgumentPredicate { Path = "$.mode", In = [] };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
+        Assert.Contains("empty 'in' list", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsAnInvalidRegex()
+    {
+        // Caught at load, not on the first tool call: a policy typo must not
+        // surface as a failed tool call hours into a session.
+        var predicate = new ArgumentPredicate { Path = "$.path", Matches = "([unclosed" };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
+        Assert.Contains("invalid regular expression", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("$.limit")]
+    [InlineData("$['content-type']")]
+    public void Validate_AcceptsAWellFormedPredicate(string path) =>
+        new ArgumentPredicate { Path = path, Eq = Json("1") }.Validate("r");
+
+    [Fact]
+    public void Validate_AcceptsAValidRegex() =>
+        new ArgumentPredicate { Path = "$.path", Matches = "^/etc/" }.Validate("r");
+}

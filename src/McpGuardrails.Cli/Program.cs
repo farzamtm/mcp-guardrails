@@ -221,9 +221,15 @@ builder.Services
         // -------------------------------------------------------------------
         options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
         {
-            var facts = new ToolCallFacts(
-                request.Params?.Name ?? string.Empty,
-                request.Params?.Arguments?.AsReadOnly());
+            var toolName = request.Params?.Name ?? string.Empty;
+
+            // The tool definition carries the annotations rules match on. An
+            // unknown name yields null, and policy still runs: a catch-all deny
+            // has to cover calls the proxy was going to reject anyway, or the
+            // audit log and the policy would tell different stories.
+            upstream.TryGetTool(toolName, out var tool);
+
+            var facts = PolicyFacts.ForCall(toolName, request.Params, tool);
 
             var decision = policy.Evaluate(facts, explain);
 

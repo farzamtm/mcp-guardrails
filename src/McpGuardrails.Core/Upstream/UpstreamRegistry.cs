@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Client;
+using ModelContextProtocol.Protocol;
 
 namespace McpGuardrails.Core.Upstream;
 
@@ -47,21 +48,23 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     private readonly Dictionary<string, UpstreamConnection> _byServerName;
 
     // Maps the client-visible qualified name ("fs__read_file") straight to the
-    // owning connection and the downstream name, so routing a call is one
-    // dictionary lookup rather than a string split plus a second lookup.
-    private readonly Dictionary<string, (UpstreamConnection Connection, string ToolName)> _byQualifiedName;
+    // owning connection, the downstream name and the tool definition, so routing
+    // a call is one dictionary lookup rather than a string split plus a second
+    // lookup. The definition rides along because policy matches on the tool's
+    // annotations, which only the downstream server knows.
+    private readonly Dictionary<string, (UpstreamConnection Connection, McpClientTool Tool)> _byQualifiedName;
 
     private UpstreamRegistry(IReadOnlyList<UpstreamConnection> connections)
     {
         _byServerName = connections.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
-        _byQualifiedName = new Dictionary<string, (UpstreamConnection, string)>(StringComparer.Ordinal);
+        _byQualifiedName = new Dictionary<string, (UpstreamConnection, McpClientTool)>(StringComparer.Ordinal);
         foreach (var connection in connections)
         {
             foreach (var tool in connection.Tools)
             {
                 _byQualifiedName[ToolNamespacer.Qualify(connection.Name, tool.Name)] =
-                    (connection, tool.Name);
+                    (connection, tool);
             }
         }
     }
@@ -162,12 +165,36 @@ public sealed class UpstreamRegistry : IAsyncDisposable
         if (_byQualifiedName.TryGetValue(qualifiedToolName, out var entry))
         {
             connection = entry.Connection;
-            downstreamToolName = entry.ToolName;
+            downstreamToolName = entry.Tool.Name;
             return true;
         }
 
         connection = null!;
         downstreamToolName = string.Empty;
+        return false;
+    }
+
+    /// <summary>
+    /// Looks up the downstream definition of a client-visible tool name.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="TryResolve"/> rather than a fourth out parameter:
+    /// routing and policy want different things from the same entry, and a method
+    /// with four outs reads worse than two with two. Both are one dictionary hit.
+    /// </remarks>
+    /// <returns>False when no downstream server advertises that tool.</returns>
+    public bool TryGetTool(string qualifiedToolName, out Tool tool)
+    {
+        if (_byQualifiedName.TryGetValue(qualifiedToolName, out var entry))
+        {
+            // ProtocolTool, not the McpClientTool wrapper: the wrapper's Name can
+            // disagree with the DTO's (see the note in ToolNamespacer), and policy
+            // must see exactly what the client was told about.
+            tool = entry.Tool.ProtocolTool;
+            return true;
+        }
+
+        tool = null!;
         return false;
     }
 

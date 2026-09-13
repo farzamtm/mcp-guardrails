@@ -35,7 +35,45 @@ SANDBOX = os.environ.get(
 
 PROBE = f"{SANDBOX}/smoke-probe.txt"
 AUDIT = f"{SANDBOX}/audit.jsonl"
+POLICY_AUDIT = f"{SANDBOX}/audit-policy.jsonl"
+POLICY_FILE = f"{SANDBOX}/smoke-policy.yaml"
 CONTENT = "written through the guardrails proxy"
+
+# A path the sandbox rules must refuse. Never actually written: the point is
+# that the proxy stops the call before the filesystem server ever sees it.
+ESCAPE = os.path.join(tempfile.gettempdir(), "guardrails-escape.txt")
+
+# Exercises all three matcher kinds against a real downstream server: a tool
+# glob, an argument predicate, and the annotations the server advertises.
+# First match wins, so the order is the policy.
+POLICY = f"""
+rules:
+  - name: allow-reads
+    match:
+      tool: fs__read_*
+    decision: allow
+
+  - name: allow-sandbox-writes
+    match:
+      tool: fs__write_*
+      args:
+        - path: $.path
+          prefix: {SANDBOX}/
+    decision: allow
+
+  - name: deny-sandbox-escape
+    match:
+      tool: fs__write_*
+    decision: deny
+    message: Write inside the sandbox instead.
+
+  - name: deny-destructive
+    match:
+      annotations:
+        destructiveHint: true
+    decision: deny
+    message: Destructive tools are disabled here.
+"""
 
 
 def request(rid: int, method: str, params: dict | None = None) -> dict:
@@ -74,6 +112,38 @@ CHECKS: list[tuple[dict, str, object]] = [
 ]
 
 
+def denied_with(result: dict, fragment: str) -> bool:
+    """A policy refusal is a tool error whose text the model is meant to read."""
+    return bool(result.get("isError")) and fragment in json.dumps(
+        result.get("content", [])
+    )
+
+
+# Each entry: (request, human label, predicate over the `result` object)
+POLICY_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": PROBE, "content": CONTENT}),
+        "glob + argument predicate allows a write inside the sandbox",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(2, "fs__write_file", {"path": ESCAPE, "content": CONTENT}),
+        "argument predicate denies the same tool outside the sandbox",
+        lambda r: denied_with(r, "Write inside the sandbox instead."),
+    ),
+    (
+        call(3, "fs__move_file", {"source": PROBE, "destination": ESCAPE}),
+        "annotation rule denies a destructive tool nobody named",
+        lambda r: denied_with(r, "Destructive tools are disabled here."),
+    ),
+    (
+        call(4, "fs__read_text_file", {"path": PROBE}),
+        "a read is still allowed by the glob rule above the denials",
+        lambda r: CONTENT in json.dumps(r.get("content", [])),
+    ),
+]
+
+
 def main() -> int:
     try:
         os.makedirs(SANDBOX, exist_ok=True)
@@ -91,14 +161,62 @@ def main() -> int:
         print(f"cannot clear probe file {PROBE}: {exc}", file=sys.stderr)
         return 1
 
+    for stale in (AUDIT, POLICY_AUDIT, ESCAPE):
+        try:
+            os.remove(stale)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"cannot clear {stale}: {exc}", file=sys.stderr)
+            return 1
+
     try:
-        os.remove(AUDIT)
-    except FileNotFoundError:
-        pass
+        with open(POLICY_FILE, "w", encoding="utf-8") as handle:
+            handle.write(POLICY)
     except OSError as exc:
-        print(f"cannot clear audit log {AUDIT}: {exc}", file=sys.stderr)
+        print(f"cannot write policy {POLICY_FILE}: {exc}", file=sys.stderr)
         return 1
 
+    # Phase 1: pure passthrough. GUARDRAILS_POLICY points at a file that does not
+    # exist on purpose - without it the proxy would pick up the developer's own
+    # ~/.mcp-guardrails/policy.yaml and this run would not be reproducible.
+    print("--- passthrough ---")
+    failures, stderr_lines = run_session(
+        CHECKS,
+        {
+            "GUARDRAILS_AUDIT": AUDIT,
+            "GUARDRAILS_POLICY": f"{SANDBOX}/no-such-policy.yaml",
+        },
+    )
+    failures += check_audit_log()
+
+    # Phase 2: the same server behind a policy that denies by glob, by argument
+    # and by annotation.
+    print("\n--- policy enforcement ---")
+    policy_failures, policy_stderr = run_session(
+        POLICY_CHECKS,
+        {"GUARDRAILS_AUDIT": POLICY_AUDIT, "GUARDRAILS_POLICY": POLICY_FILE},
+    )
+    failures += policy_failures
+    failures += check_policy_audit_log()
+
+    # A denied call must never reach the filesystem server.
+    escaped = os.path.exists(ESCAPE)
+    print(f"{'FAIL' if escaped else 'PASS'}  denied write never touched the disk")
+    failures += 1 if escaped else 0
+
+    if failures:
+        print("\n--- server stderr (last 30) ---", file=sys.stderr)
+        sys.stderr.writelines((stderr_lines + policy_stderr)[-30:])
+
+    print("\nFAILED" if failures else "\nALL OK")
+    return 1 if failures else 0
+
+
+def run_session(
+    checks: list[tuple[dict, str, object]], extra_env: dict[str, str]
+) -> tuple[int, list[str]]:
+    """Drive one proxy process through a list of checks."""
     proc = subprocess.Popen(
         [BIN],
         stdin=subprocess.PIPE,
@@ -106,7 +224,7 @@ def main() -> int:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env={**os.environ, "GUARDRAILS_AUDIT": AUDIT, "GUARDRAILS_SANDBOX": SANDBOX},
+        env={**os.environ, "GUARDRAILS_SANDBOX": SANDBOX, **extra_env},
     )
 
     # Popen's pipe attributes are Optional[IO] to the type checker; we passed
@@ -122,7 +240,7 @@ def main() -> int:
 
     failures = 0
     try:
-        for req, label, predicate in CHECKS:
+        for req, label, predicate in checks:
             stdin.write(json.dumps(req) + "\n")
             stdin.flush()
 
@@ -154,14 +272,43 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    failures += check_audit_log()
+    return failures, stderr_lines
 
-    if failures:
-        print("\n--- server stderr (last 30) ---", file=sys.stderr)
-        sys.stderr.writelines(stderr_lines[-30:])
 
-    print("\nFAILED" if failures else "\nALL OK")
-    return 1 if failures else 0
+def check_policy_audit_log() -> int:
+    """The audit log must name the rule that refused each call."""
+    try:
+        with open(POLICY_AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  policy audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  policy audit log unreadable: {exc}")
+        return 1
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    denials = [entry for entry in lines if entry.get("decision") == "deny"]
+    rules = {entry.get("rule") for entry in denials}
+
+    expect(len(denials) == 2, f"audit records both denials (got {len(denials)})")
+    expect(
+        rules == {"deny-sandbox-escape", "deny-destructive"},
+        f"audit names the rule that refused each call (got {sorted(rules)})",
+    )
+    expect(
+        all(entry.get("is_error") for entry in denials),
+        "denied calls are flagged as errors",
+    )
+
+    return failures
 
 
 def check_audit_log() -> int:

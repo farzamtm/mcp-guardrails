@@ -190,8 +190,9 @@ public sealed class PolicyLoaderTests : IDisposable
     [Fact]
     public void Parse_PreservesQuotedStringsAsStrings()
     {
-        // "true" quoted is the string true, not the boolean. Step 6 matches on
-        // real booleans, so the distinction has to survive the conversion.
+        // "true" quoted is the string true, not the boolean. Annotation matching
+        // compares real booleans, so the distinction has to survive the
+        // conversion or `destructiveHint: "true"` would bind to nothing.
         var policy = PolicyLoader.Parse("""
             rules:
               - name: "true"
@@ -202,6 +203,102 @@ public sealed class PolicyLoaderTests : IDisposable
         var rule = Assert.Single(policy.Rules);
         Assert.Equal("true", rule.Name);
         Assert.Equal("123", rule.EffectiveMatch.Tool);
+    }
+
+    // ------------------------------------------------------ the richer matchers
+
+    [Fact]
+    public void Parse_ReadsAnnotationMatches()
+    {
+        var policy = PolicyLoader.Parse("""
+            rules:
+              - name: approve-destructive
+                match:
+                  annotations:
+                    destructiveHint: true
+                    readOnlyHint: false
+                decision: require_approval
+            """);
+
+        var annotations = Assert.Single(policy.Rules).EffectiveMatch.Annotations;
+
+        Assert.NotNull(annotations);
+        Assert.True(annotations.DestructiveHint);
+        Assert.False(annotations.ReadOnlyHint);
+        Assert.Null(annotations.IdempotentHint);
+    }
+
+    [Fact]
+    public void Parse_ReadsArgumentPredicates()
+    {
+        var policy = PolicyLoader.Parse("""
+            rules:
+              - name: cap-exports
+                match:
+                  tool: ct__export_*
+                  args:
+                    - path: $.limit
+                      gt: 100
+                    - path: $.format
+                      in: [csv, json]
+                decision: deny
+            """);
+
+        var arguments = Assert.Single(policy.Rules).EffectiveMatch.Arguments;
+
+        Assert.NotNull(arguments);
+        Assert.Equal(2, arguments.Count);
+        Assert.Equal("$.limit", arguments[0].Path);
+        Assert.Equal(100, arguments[0].Gt);
+        Assert.Equal(2, arguments[1].In?.Count);
+    }
+
+    [Fact]
+    public void Parse_RejectsAnEmptyAnnotationsBlock()
+    {
+        var exception = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            rules:
+              - name: pointless
+                match:
+                  annotations: {}
+                decision: deny
+            """));
+
+        Assert.Contains("empty 'annotations'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parse_RejectsAnEmptyArgsList()
+    {
+        var exception = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            rules:
+              - name: pointless
+                match:
+                  args: []
+                decision: deny
+            """));
+
+        Assert.Contains("empty 'args' list", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parse_RejectsAPredicateTheEvaluatorCouldNotHonour()
+    {
+        // Load-time validation is the point: an unsupported path would otherwise
+        // produce a rule that never fires, and a guardrail that silently does
+        // nothing is worse than one that refuses to start.
+        var exception = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            rules:
+              - name: recursive-descent-is-not-supported
+                match:
+                  args:
+                    - path: $..limit
+                      gt: 100
+                decision: deny
+            """));
+
+        Assert.Contains("unsupported argument path", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("recursive-descent-is-not-supported", exception.Message, StringComparison.Ordinal);
     }
 
     // ------------------------------------------------------- end-to-end wiring
@@ -223,5 +320,45 @@ public sealed class PolicyLoaderTests : IDisposable
 
         Assert.Equal(Verdict.Deny, decision.Verdict);
         Assert.Contains("limit=100", decision.ToModelMessage(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ALoadedGlobAnnotationAndArgumentRule_DecidesARealCall()
+    {
+        // One test that proves the whole chain: YAML text to JsonNode to typed
+        // policy to a decision, with all three condition types in play.
+        var policy = PolicyLoader.Parse("""
+            rules:
+              - name: sandbox-escape
+                match:
+                  tool: fs__*
+                  annotations:
+                    readOnlyHint: false
+                  args:
+                    - path: $.path
+                      not_prefix: /workspace/
+                decision: deny
+                message: Write inside /workspace/ instead.
+            """);
+
+        var evaluator = new PolicyEvaluator(policy);
+
+        var escaping = new ToolCallFacts(
+            "fs__write_file",
+            TestArguments.From("""{ "path": "/etc/passwd" }"""),
+            new ToolAnnotationFacts(ReadOnlyHint: false));
+
+        var inSandbox = new ToolCallFacts(
+            "fs__write_file",
+            TestArguments.From("""{ "path": "/workspace/notes.txt" }"""),
+            new ToolAnnotationFacts(ReadOnlyHint: false));
+
+        Assert.Equal(Verdict.Deny, evaluator.Evaluate(escaping).Verdict);
+        Assert.Contains(
+            "Write inside /workspace/ instead.",
+            evaluator.Evaluate(escaping).ToModelMessage(),
+            StringComparison.Ordinal);
+
+        Assert.Equal(Verdict.Allow, evaluator.Evaluate(inSandbox).Verdict);
     }
 }
