@@ -100,10 +100,15 @@ jobs:
 
       # --logger trx leaves a machine-readable result file behind, so a failure
       # can be inspected from the artifact instead of by scrolling the log.
+      #
+      # One line on purpose: this matrix includes windows-latest, where `run`
+      # executes in PowerShell and a trailing backslash is not a line
+      # continuation - it parses as a unary operator and fails before dotnet is
+      # ever invoked.
       - name: Test
-        run: |
-          dotnet test --no-build --configuration Release --verbosity normal \
-            --logger "trx;LogFileName=test-results.trx"
+        run: >-
+          dotnet test --no-build --configuration Release --verbosity normal
+          --logger "trx;LogFileName=test-results.trx"
 
       - name: Upload test results
         # always(), because the results are most useful precisely when the step
@@ -114,7 +119,9 @@ jobs:
         with:
           name: test-results-${{ matrix.os }}
           path: "**/TestResults/*.trx"
-          if-no-files-found: error
+          # warn, not error: if the test step died before writing a trx, the
+          # test failure is the story and a second red step only hides it.
+          if-no-files-found: warn
 
   coverage:
     name: coverage gate
