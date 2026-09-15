@@ -139,7 +139,12 @@ public sealed class UpstreamRegistryTests
         await using var registry = await UpstreamRegistry.ConnectAsync(
             [Config("fs")], NullLoggerFactory.Instance, server.TransportFactory);
 
-        Assert.False(registry.TryGetTool(requested, out _));
+        Assert.False(registry.TryGetTool(requested, out var tool));
+
+        // Null, not a non-nullable reference the analyzer has been told to trust.
+        // The CLI passes this straight into PolicyFacts.ForCall, which accepts an
+        // absent tool; a lie here would only surface as a crash on the call path.
+        Assert.Null(tool);
     }
 
     [Fact]

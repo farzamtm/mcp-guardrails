@@ -120,6 +120,12 @@ if (listOnly)
     return 0;
 }
 
+// The name a call is known by when the client did not send one. Shared by the
+// audit filter and the policy filter on purpose: if they disagreed, the log and
+// the policy would describe different calls, in exactly the malformed-traffic
+// case where someone reading the log afterwards most needs to trust it.
+const string UnnamedTool = "(missing)";
+
 // ---------------------------------------------------------------------------
 // STEP 3: serve the aggregated tools.
 //
@@ -158,7 +164,7 @@ builder.Services
             // a mutable holder is required rather than a plain AsyncLocal value.
             using var scope = GuardrailsCallScope.Begin();
 
-            var toolName = request.Params?.Name ?? "(missing)";
+            var toolName = request.Params?.Name ?? UnnamedTool;
 
             // Resolve purely to enrich the log. The call handler resolves again
             // to actually route; duplicating a dictionary lookup is cheaper than
@@ -221,7 +227,7 @@ builder.Services
         // -------------------------------------------------------------------
         options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
         {
-            var toolName = request.Params?.Name ?? string.Empty;
+            var toolName = request.Params?.Name ?? UnnamedTool;
 
             // The tool definition carries the annotations rules match on. An
             // unknown name yields null, and policy still runs: a catch-all deny

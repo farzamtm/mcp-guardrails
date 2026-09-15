@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
@@ -183,7 +184,15 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     /// with four outs reads worse than two with two. Both are one dictionary hit.
     /// </remarks>
     /// <returns>False when no downstream server advertises that tool.</returns>
-    public bool TryGetTool(string qualifiedToolName, out Tool tool)
+    /// <remarks>
+    /// <c>out Tool?</c> with <see cref="NotNullWhenAttribute"/> rather than a
+    /// non-nullable out set to <c>null!</c>: the miss is real and the caller has
+    /// to see it. Declaring it non-nullable would tell the compiler the value is
+    /// always present, and with warnings-as-errors that silence is exactly what
+    /// would let a future <c>tool.Annotations</c> compile clean and fail on the
+    /// path every tool call takes.
+    /// </remarks>
+    public bool TryGetTool(string qualifiedToolName, [NotNullWhen(true)] out Tool? tool)
     {
         if (_byQualifiedName.TryGetValue(qualifiedToolName, out var entry))
         {
@@ -194,7 +203,7 @@ public sealed class UpstreamRegistry : IAsyncDisposable
             return true;
         }
 
-        tool = null!;
+        tool = null;
         return false;
     }
 
