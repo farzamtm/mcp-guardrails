@@ -361,4 +361,45 @@ public sealed class PolicyLoaderTests : IDisposable
 
         Assert.Equal(Verdict.Allow, evaluator.Evaluate(inSandbox).Verdict);
     }
+
+    [Fact]
+    public void Parse_ReadsAQuotedLeadingStarGlob()
+    {
+        // The cross-server form the README recommends. It only reaches the
+        // matcher when quoted: YAML reads a bare leading '*' as an alias
+        // indicator, so the unquoted spelling never becomes a glob at all.
+        var policy = PolicyLoader.Parse("""
+            rules:
+              - name: no-deletes-anywhere
+                match:
+                  tool: "*__delete_*"
+                decision: deny
+            """);
+
+        var evaluator = new PolicyEvaluator(policy);
+
+        Assert.Equal(
+            Verdict.Deny,
+            evaluator.Evaluate(new ToolCallFacts("git__delete_branch")).Verdict);
+
+        Assert.Equal(
+            Verdict.Allow,
+            evaluator.Evaluate(new ToolCallFacts("git__create_branch")).Verdict);
+    }
+
+    [Fact]
+    public void Parse_RejectsAnUnquotedLeadingStarGlobAsYamlSyntax()
+    {
+        // Pinned so the failure stays a named configuration error rather than
+        // something that silently changes meaning later.
+        var exception = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            rules:
+              - name: no-deletes-anywhere
+                match:
+                  tool: *__delete_*
+                decision: deny
+            """));
+
+        Assert.Contains("YAML syntax error", exception.Message, StringComparison.Ordinal);
+    }
 }

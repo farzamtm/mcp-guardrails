@@ -114,9 +114,13 @@ public sealed record PolicyMatch
     /// </summary>
     /// <remarks>
     /// A glob: <c>*</c> matches any run of characters and <c>?</c> exactly one,
-    /// so <c>fs__*</c> covers a whole server and <c>*__delete_*</c> covers a verb
-    /// across every server. A pattern with no wildcard is an exact, ordinal,
+    /// so <c>fs__*</c> covers a whole server and <c>"*__delete_*"</c> covers a
+    /// verb across every server. A pattern with no wildcard is an exact, ordinal,
     /// case-sensitive match, so existing policy files keep their meaning.
+    ///
+    /// Quote any pattern that starts with <c>*</c> in the policy file: a bare
+    /// leading <c>*</c> is YAML's alias indicator, so <c>tool: *__delete_*</c> is
+    /// a syntax error rather than a glob.
     /// </remarks>
     [JsonPropertyName("tool")]
     public string? Tool { get; init; }

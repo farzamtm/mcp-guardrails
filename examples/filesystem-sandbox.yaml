@@ -5,8 +5,16 @@
 # passthrough, so you can install the proxy and watch the audit log before
 # writing a single rule.
 #
+# The write rules below key on the literal path prefix /tmp/guardrails-sandbox/,
+# so point the proxy at that same directory or they will never match. Left to
+# itself the proxy uses the platform temp directory, which is only /tmp on
+# Linux - on macOS it is /var/folders/**/T/ and on Windows %LOCALAPPDATA%\Temp\,
+# and every write would fall through to the denial below.
+#
 # Use it with:
-#   GUARDRAILS_POLICY=examples/filesystem-sandbox.yaml McpGuardrails
+#   GUARDRAILS_POLICY=examples/filesystem-sandbox.yaml \
+#   GUARDRAILS_SANDBOX=/tmp/guardrails-sandbox \
+#   McpGuardrails
 
 rules:
   # A glob, so every read tool the server has (or gains later) is covered
@@ -22,7 +30,14 @@ rules:
     decision: allow
 
   # Argument predicates narrow a rule to particular calls. This one permits
-  # writes, but only inside the sandbox directory.
+  # writes whose requested path is SPELLED as being under the sandbox.
+  #
+  # Read that literally: 'prefix' is an ordinal string comparison on the value
+  # the model sent. Nothing is resolved or canonicalised, so a path such as
+  # /tmp/guardrails-sandbox/../../etc/passwd satisfies it. Real containment is
+  # the downstream server's job - server-filesystem is launched with the sandbox
+  # as its only allowed root and re-checks every path - and this rule is the
+  # layer above that, not a replacement for it.
   #
   # One operator per entry - eq, gt, lt, matches, prefix, not_prefix, in - so
   # that --explain can name the condition that failed. A path the model did not
@@ -44,8 +59,8 @@ rules:
       tool: fs__write_*
     decision: deny
     message: >-
-      Writes are confined to /tmp/guardrails-sandbox/. Write your file there, or
-      show the user the change instead of applying it.
+      Writes must target a path under /tmp/guardrails-sandbox/. Write your file
+      there, or show the user the change instead of applying it.
 
   # The safety net underneath the named rules: anything the downstream server
   # flags as destructive, including every tool that declares no annotations at

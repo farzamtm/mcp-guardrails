@@ -81,8 +81,10 @@ rules:
 ```
 
 **Tool globs** cover a whole server (`fs__*`) or a verb across every server
-(`*__delete_*`). A pattern with no wildcard is still an exact, case-sensitive
-match, so older policy files mean exactly what they did before.
+(`"*__delete_*"`). A pattern with no wildcard is still an exact, case-sensitive
+match, so older policy files mean exactly what they did before. Quote any
+pattern that *starts* with `*` — in YAML a bare leading `*` is an alias
+reference, so `tool: *__delete_*` is a parse error rather than a glob.
 
 **Annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
 `openWorldHint` — match on what a tool advertises rather than what it is called,
@@ -103,6 +105,21 @@ An argument the model did not send satisfies no predicate, **including a negated
 one**: `not_prefix` asserts "there is a value and it does not start with this".
 A rule must not fire on evidence that was never supplied, so when a missing
 argument should also be refused, follow the rule with a catch-all.
+
+`prefix` and `not_prefix` compare the **literal argument string**. Nothing is
+resolved, canonicalised or normalised, so `/workspace/../etc/passwd` starts with
+`/workspace/` as far as a policy is concerned. They are good at classifying what
+the model *asked for*; they cannot tell you where a path actually points.
+Directory containment stays the downstream server's job — configure its allowed
+roots and treat the prefix rule as the layer above it, not as a substitute.
+
+A `matches` pattern runs under a 100 ms budget. If it is still running when the
+budget expires, the rule is reported as **undecidable and the call is denied** —
+whatever that rule's own decision was. Fail-open here would be a bypass anyone
+could trigger: the model chooses the argument, so it could pad a value until the
+rule gave up and the call fell through to default-allow. A denial of this kind
+names the rule in both the refusal and the audit log, so it is visible rather
+than silent.
 
 ## The audit log
 
@@ -197,7 +214,7 @@ Three layers, each covering what the one below cannot:
 | --- | --- |
 | Unit tests | Pure logic — namespacing, config validation, the audit sink |
 | In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
-| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in two phases: pure passthrough, then a policy that denies by glob, by argument and by annotation |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in two phases: pure passthrough, then a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking |
 
 CI runs all three on Linux, macOS and Windows, plus a `lint` job
 (`dotnet format`, `ruff`, `shellcheck`) and a check that every example policy in
