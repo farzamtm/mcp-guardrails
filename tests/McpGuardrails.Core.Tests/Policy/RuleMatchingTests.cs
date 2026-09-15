@@ -211,4 +211,89 @@ public sealed class RuleMatchingTests
             line => Assert.Contains("'by-argument': no match (argument $.limit)", line, StringComparison.Ordinal),
             line => Assert.Contains("default allow", line, StringComparison.Ordinal));
     }
+
+    // --------------------------------------------------------- undecidable rules
+
+    /// <summary>
+    /// A pattern the caller can stall, and an argument long enough to stall it.
+    /// </summary>
+    private static PolicyEvaluator RegexEvaluator(params PolicyRule[] rules) => Evaluator(rules);
+
+    private static readonly IReadOnlyDictionary<string, JsonElement> _stalling =
+        TestArguments.From($$"""{ "path": "{{new string('a', 40)}}!" }""");
+
+    [Fact]
+    public void AnUndecidableRule_DeniesRatherThanFallingThroughToDefaultAllow()
+    {
+        // The bypass this closes: the model picks the argument, so if a timeout
+        // read as "no match" it could pad any value until the deny rule gave up
+        // and the call fell through to default-allow - with an audit record
+        // indistinguishable from an ordinary allowed call.
+        var evaluator = RegexEvaluator(
+            Deny("no-secrets", new PolicyMatch
+            {
+                Arguments = [new ArgumentPredicate { Path = "$.path", Matches = "^(a+)+$" }],
+            }));
+
+        var decision = evaluator.Evaluate(new ToolCallFacts("fs__write_file", _stalling));
+
+        Assert.Equal(Verdict.Deny, decision.Verdict);
+        Assert.True(decision.IsBlocked);
+
+        // The rule name reaches the audit record, so the skipped guardrail is
+        // visible afterwards rather than silent.
+        Assert.Equal("no-secrets", decision.RuleName);
+        Assert.Contains("could not be evaluated", decision.Reason, StringComparison.Ordinal);
+        Assert.Contains("$.path", decision.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnUndecidableAllowRule_AlsoDenies()
+    {
+        // Fail closed regardless of the rule's own verdict: not knowing whether
+        // an allow rule applies is not a reason to allow.
+        var evaluator = RegexEvaluator(new PolicyRule
+        {
+            Name = "allow-safe-paths",
+            Decision = Verdict.Allow,
+            Match = new PolicyMatch
+            {
+                Arguments = [new ArgumentPredicate { Path = "$.path", Matches = "^(a+)+$" }],
+            },
+        });
+
+        var decision = evaluator.Evaluate(new ToolCallFacts("fs__write_file", _stalling));
+
+        Assert.Equal(Verdict.Deny, decision.Verdict);
+    }
+
+    [Fact]
+    public void AnUndecidableRule_StopsTheWalkAndSaysSoInTheTrail()
+    {
+        // It stops rather than continuing to later rules: once a condition the
+        // caller influences cannot be checked, no verdict below it is trustworthy.
+        var evaluator = RegexEvaluator(
+            Deny("undecidable", new PolicyMatch
+            {
+                Arguments = [new ArgumentPredicate { Path = "$.path", Matches = "^(a+)+$" }],
+            }),
+            new PolicyRule
+            {
+                Name = "allow-everything-else",
+                Decision = Verdict.Allow,
+                Match = PolicyMatch.Any,
+            });
+
+        var decision = evaluator.Evaluate(
+            new ToolCallFacts("fs__write_file", _stalling),
+            explain: true);
+
+        Assert.Equal(Verdict.Deny, decision.Verdict);
+        Assert.NotNull(decision.Trail);
+        Assert.Collection(decision.Trail,
+            line => Assert.Contains(
+                "'undecidable': UNDECIDABLE (argument $.path) -> deny",
+                line,
+                StringComparison.Ordinal));
+    }
 }

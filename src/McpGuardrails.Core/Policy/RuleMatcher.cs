@@ -1,12 +1,30 @@
 namespace McpGuardrails.Core.Policy;
 
+/// <summary>Whether a rule applied, did not apply, or could not be decided.</summary>
+internal enum MatchState
+{
+    /// <summary>At least one condition did not hold.</summary>
+    NotMatched,
+
+    /// <summary>Every condition held.</summary>
+    Matched,
+
+    /// <summary>
+    /// A condition could not be evaluated, so whether the rule applies is
+    /// unknown. Distinct from <see cref="NotMatched"/> on purpose: collapsing
+    /// the two would let an unanswerable condition disarm the rule.
+    /// </summary>
+    Indeterminate,
+}
+
 /// <summary>
-/// Why a rule did not apply, so <c>--explain</c> can say which condition failed.
+/// Whether a rule applied and, when it did not, which condition decided that -
+/// so <c>--explain</c> can name it.
 /// </summary>
-/// <param name="IsMatch">True when every condition held.</param>
-/// <param name="Condition">The condition that failed: tool, annotations or argument.</param>
+/// <param name="State">Matched, not matched, or undecidable.</param>
+/// <param name="Condition">The deciding condition: tool, annotations or argument.</param>
 /// <param name="Detail">
-/// The argument path, when the failing condition was a predicate. A reference to
+/// The argument path, when the deciding condition was a predicate. A reference to
 /// the rule's own string, never a newly built one.
 /// </param>
 /// <remarks>
@@ -14,12 +32,19 @@ namespace McpGuardrails.Core.Policy;
 /// This runs for every rule of every tool call, and the trail is formatted only
 /// when the user asked for it.
 /// </remarks>
-internal readonly record struct MatchOutcome(bool IsMatch, string? Condition, string? Detail)
+internal readonly record struct MatchOutcome(MatchState State, string? Condition, string? Detail)
 {
-    internal static MatchOutcome Matched { get; } = new(true, null, null);
+    internal static MatchOutcome Matched { get; } = new(MatchState.Matched, null, null);
 
     internal static MatchOutcome Failed(string condition, string? detail = null) =>
-        new(false, condition, detail);
+        new(MatchState.NotMatched, condition, detail);
+
+    internal static MatchOutcome Undecidable(string condition, string? detail) =>
+        new(MatchState.Indeterminate, condition, detail);
+
+    internal bool IsMatch => State is MatchState.Matched;
+
+    internal bool IsIndeterminate => State is MatchState.Indeterminate;
 }
 
 /// <summary>
@@ -57,9 +82,19 @@ internal static class RuleMatcher
         {
             foreach (var predicate in predicates)
             {
-                if (!predicate.Evaluate(facts.Arguments))
+                switch (predicate.Evaluate(facts.Arguments))
                 {
-                    return MatchOutcome.Failed(ArgumentCondition, predicate.Path);
+                    case PredicateResult.Satisfied:
+                        continue;
+
+                    // Propagated rather than folded into a non-match: only the
+                    // evaluator knows that the safe reading of "unknown" is to
+                    // refuse the call.
+                    case PredicateResult.Indeterminate:
+                        return MatchOutcome.Undecidable(ArgumentCondition, predicate.Path);
+
+                    default:
+                        return MatchOutcome.Failed(ArgumentCondition, predicate.Path);
                 }
             }
         }

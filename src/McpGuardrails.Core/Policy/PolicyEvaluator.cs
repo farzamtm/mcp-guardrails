@@ -63,6 +63,24 @@ public sealed class PolicyEvaluator
                     trail);
             }
 
+            // A rule that could not be evaluated stops the walk and refuses the
+            // call. Continuing would treat "we do not know" as "the rule does
+            // not apply", which is the same as deleting the rule - and since a
+            // condition is only undecidable because of the argument the caller
+            // supplied, the caller would be choosing which rules to skip. The
+            // verdict is Deny whatever the rule's own decision is: an unchecked
+            // guardrail is a reason to stop, not a reason to proceed.
+            if (outcome.IsIndeterminate)
+            {
+                trail?.Add($"rule '{rule.Name}': UNDECIDABLE ({DescribeMiss(outcome)}) -> deny");
+
+                return new Decision(
+                    Verdict.Deny,
+                    UndecidableMessage(rule, outcome),
+                    rule.Name,
+                    trail);
+            }
+
             // Naming the condition that failed is what makes --explain worth
             // running: "no match" tells you nothing when a rule has three of them.
             trail?.Add($"rule '{rule.Name}': no match ({DescribeMiss(outcome)})");
@@ -77,6 +95,16 @@ public sealed class PolicyEvaluator
 
     private static string DescribeMiss(MatchOutcome outcome) =>
         outcome.Detail is null ? outcome.Condition! : $"{outcome.Condition} {outcome.Detail}";
+
+    /// <remarks>
+    /// Written for the model, like every other denial: it says what to change
+    /// rather than just that something went wrong, because the one input the
+    /// caller controls here is the size of the argument.
+    /// </remarks>
+    private static string UndecidableMessage(PolicyRule rule, MatchOutcome outcome) =>
+        $"Rule '{rule.Name}' could not be evaluated: the {DescribeMiss(outcome)} condition " +
+        "exceeded its time budget. The call is refused because a guardrail could not be " +
+        "checked. Retry with a substantially smaller argument value.";
 
     /// <remarks>
     /// internal so tests can reach the defensive default arm. Validation rejects

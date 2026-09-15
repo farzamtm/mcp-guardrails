@@ -20,7 +20,16 @@ public sealed class ArgumentPredicateTests
 
     private static JsonElement Json(string json) => JsonDocument.Parse(json).RootElement.Clone();
 
-    private static bool Evaluate(ArgumentPredicate predicate) => predicate.Evaluate(_arguments);
+    /// <summary>
+    /// The outcome name, so these tests read as a table of input to outcome.
+    /// </summary>
+    private static string Outcome(
+        ArgumentPredicate predicate,
+        IReadOnlyDictionary<string, JsonElement>? arguments) =>
+        predicate.Evaluate(arguments).ToString();
+
+    private static bool Evaluate(ArgumentPredicate predicate) =>
+        Outcome(predicate, _arguments) == "Satisfied";
 
     // ------------------------------------------------------------------- eq
 
@@ -148,23 +157,35 @@ public sealed class ArgumentPredicateTests
 
     [Fact]
     public void NoArgumentsAtAll_SatisfiesNoPredicate() =>
-        Assert.False(new ArgumentPredicate { Path = "$.limit", Gt = 1 }.Evaluate(null));
+        Assert.Equal(
+            "NotSatisfied",
+            Outcome(new ArgumentPredicate { Path = "$.limit", Gt = 1 }, null));
 
     // ------------------------------------------------------------------ ReDoS
 
     [Fact]
-    public void ACatastrophicPatternTimesOutAndDoesNotMatch()
+    public void ACatastrophicPatternTimesOutAndIsUndecidable()
     {
         // Policy files are configuration and configuration must not be able to
-        // hang the proxy. On timeout the predicate reports "no match" and the
-        // remaining rules decide; the alternative - treating a timeout as a match
-        // - would let any sufficiently long argument trip a deny rule by accident.
+        // hang the proxy, so evaluation is abandoned after the timeout. What it
+        // must NOT do is report "no match": the model chooses the argument and
+        // its length, so a bounded-but-silent give-up is a bypass it can trigger
+        // on demand. Indeterminate carries "undecided" up to the evaluator, which
+        // refuses the call. See RuleMatchingTests for the other half.
         var arguments = TestArguments.From($$"""{ "path": "{{new string('a', 40)}}!" }""");
 
         var predicate = new ArgumentPredicate { Path = "$.path", Matches = "^(a+)+$" };
 
-        Assert.False(predicate.Evaluate(arguments));
+        Assert.Equal("Indeterminate", Outcome(predicate, arguments));
     }
+
+    [Fact]
+    public void ATimeoutOnANonStringValue_IsNotEvenAttempted() =>
+        // Kind is checked before the pattern runs, so a non-string can never be
+        // the thing that exhausts the budget.
+        Assert.Equal(
+            "NotSatisfied",
+            Outcome(new ArgumentPredicate { Path = "$.limit", Matches = "^(a+)+$" }, _arguments));
 
     // -------------------------------------------------------------- validation
 

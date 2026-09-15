@@ -5,6 +5,31 @@ using System.Text.RegularExpressions;
 namespace McpGuardrails.Core.Policy;
 
 /// <summary>
+/// The outcome of applying one <see cref="ArgumentPredicate"/> to one call.
+/// </summary>
+/// <remarks>
+/// Three states rather than a bool, because "we could not decide" is not the
+/// same answer as "no". A predicate abandoned mid-evaluation must not be
+/// reported as a clean non-match: the caller supplies the argument, so a silent
+/// give-up would let it choose which rules apply. See <see cref="PolicyEvaluator"/>
+/// for what the evaluator does with <see cref="Indeterminate"/>.
+/// </remarks>
+internal enum PredicateResult
+{
+    /// <summary>The predicate does not hold for this call.</summary>
+    NotSatisfied,
+
+    /// <summary>The predicate holds.</summary>
+    Satisfied,
+
+    /// <summary>
+    /// Evaluation was abandoned before an answer was reached, because a regular
+    /// expression exceeded its time budget.
+    /// </summary>
+    Indeterminate,
+}
+
+/// <summary>
 /// One assertion about a single argument of a tool call.
 /// </summary>
 /// <remarks>
@@ -73,11 +98,11 @@ public sealed record ArgumentPredicate
     /// How long a <c>matches</c> pattern may run before it is abandoned.
     /// </summary>
     /// <remarks>
-    /// A policy file is configuration, and a regex from configuration can
-    /// backtrack catastrophically. A timeout turns "the proxy hangs and every
-    /// tool call stops" into a bounded per-call cost, and
-    /// <see cref="Evaluate"/> treats the timeout as "did not match" so the rule
-    /// simply does not fire.
+    /// A policy file is configuration, and a regex over a model-supplied
+    /// argument can backtrack for an unbounded time. The timeout turns "the
+    /// proxy hangs and every tool call stops" into a bounded per-call cost;
+    /// <see cref="PredicateResult.Indeterminate"/> is what keeps that bound
+    /// from becoming a bypass.
     /// </remarks>
     private static readonly TimeSpan _regexTimeout = TimeSpan.FromMilliseconds(100);
 
@@ -182,45 +207,47 @@ public sealed record ArgumentPredicate
     }
 
     /// <summary>Applies the predicate to a call's arguments.</summary>
-    internal bool Evaluate(IReadOnlyDictionary<string, JsonElement>? arguments)
+    internal PredicateResult Evaluate(IReadOnlyDictionary<string, JsonElement>? arguments)
     {
         // Path is non-null after Validate, which every rule goes through before
         // the evaluator will use it.
         if (!JsonPath.TryResolve(arguments, Path!, out var value))
         {
-            return false;
+            return PredicateResult.NotSatisfied;
         }
 
         if (Eq is { } expected)
         {
-            return JsonValueEquals(value, expected);
+            return From(JsonValueEquals(value, expected));
         }
 
         if (Gt is { } greaterThan)
         {
-            return TryGetNumber(value, out var number) && number > greaterThan;
+            return From(TryGetNumber(value, out var number) && number > greaterThan);
         }
 
         if (Lt is { } lessThan)
         {
-            return TryGetNumber(value, out var number) && number < lessThan;
+            return From(TryGetNumber(value, out var number) && number < lessThan);
         }
 
         if (Matches is { } pattern)
         {
-            return value.ValueKind is JsonValueKind.String && IsRegexMatch(value, pattern);
+            return value.ValueKind is JsonValueKind.String
+                ? MatchRegex(value, pattern)
+                : PredicateResult.NotSatisfied;
         }
 
         if (Prefix is { } prefix)
         {
-            return value.ValueKind is JsonValueKind.String &&
-                   value.GetString()!.StartsWith(prefix, StringComparison.Ordinal);
+            return From(value.ValueKind is JsonValueKind.String &&
+                        value.GetString()!.StartsWith(prefix, StringComparison.Ordinal));
         }
 
         if (NotPrefix is { } notPrefix)
         {
-            return value.ValueKind is JsonValueKind.String &&
-                   !value.GetString()!.StartsWith(notPrefix, StringComparison.Ordinal);
+            return From(value.ValueKind is JsonValueKind.String &&
+                        !value.GetString()!.StartsWith(notPrefix, StringComparison.Ordinal));
         }
 
         // Validate guarantees one operator is set, so this is the 'in' case.
@@ -228,27 +255,33 @@ public sealed record ArgumentPredicate
         {
             if (JsonValueEquals(value, candidate))
             {
-                return true;
+                return PredicateResult.Satisfied;
             }
         }
 
-        return false;
+        return PredicateResult.NotSatisfied;
     }
 
-    private static bool IsRegexMatch(JsonElement value, string pattern)
+    private static PredicateResult From(bool satisfied) =>
+        satisfied ? PredicateResult.Satisfied : PredicateResult.NotSatisfied;
+
+    private static PredicateResult MatchRegex(JsonElement value, string pattern)
     {
         try
         {
             // The static overload keeps a small compiled-pattern cache, so a
             // policy's patterns are compiled once rather than per call.
-            return Regex.IsMatch(value.GetString()!, pattern, RegexOptions.None, _regexTimeout);
+            return From(Regex.IsMatch(
+                value.GetString()!, pattern, RegexOptions.None, _regexTimeout));
         }
         catch (RegexMatchTimeoutException)
         {
-            // A pattern that cannot finish must not block the call by accident:
-            // report "no match" and let the remaining rules decide. Failing the
-            // other way would let any long input silently trip a deny rule.
-            return false;
+            // Reporting "no match" here would hand the caller a bypass: the
+            // model chooses the argument and its length, so it could pad any
+            // value until the deny rule containing this pattern gave up and the
+            // call fell through to default-allow. An abandoned match is not
+            // evidence of safety, so it is not an answer.
+            return PredicateResult.Indeterminate;
         }
     }
 

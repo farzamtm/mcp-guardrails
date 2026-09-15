@@ -43,6 +43,12 @@ CONTENT = "written through the guardrails proxy"
 # that the proxy stops the call before the filesystem server ever sees it.
 ESCAPE = os.path.join(tempfile.gettempdir(), "guardrails-escape.txt")
 
+# A pattern that backtracks catastrophically, plus an input that provokes it.
+# Used to prove the proxy refuses a call whose guardrail it could not finish
+# checking, rather than waving it through.
+STALLING_PATTERN = "^(a+)+$"
+STALLING_CONTENT = ("a" * 40) + "!"
+
 # Exercises all three matcher kinds against a real downstream server: a tool
 # glob, an argument predicate, and the annotations the server advertises.
 # First match wins, so the order is the policy.
@@ -51,6 +57,16 @@ rules:
   - name: allow-reads
     match:
       tool: fs__read_*
+    decision: allow
+
+  # Above the allow rules on purpose: it has to be reached before the write is
+  # permitted, which is exactly the position a real scanning rule would take.
+  - name: deny-unscannable
+    match:
+      tool: fs__write_*
+      args:
+        - path: $.content
+          matches: "{STALLING_PATTERN}"
     decision: allow
 
   - name: allow-sandbox-writes
@@ -140,6 +156,17 @@ POLICY_CHECKS: list[tuple[dict, str, object]] = [
         call(4, "fs__read_text_file", {"path": PROBE}),
         "a read is still allowed by the glob rule above the denials",
         lambda r: CONTENT in json.dumps(r.get("content", [])),
+    ),
+    (
+        call(
+            5,
+            "fs__write_file",
+            {"path": PROBE, "content": STALLING_CONTENT},
+        ),
+        "a guardrail that cannot be evaluated denies instead of falling through",
+        # The rule it stalls says 'allow', and the write is inside the sandbox,
+        # so every path other than fail-closed ends in the call being forwarded.
+        lambda r: denied_with(r, "could not be evaluated"),
     ),
 ]
 
@@ -298,10 +325,21 @@ def check_policy_audit_log() -> int:
     denials = [entry for entry in lines if entry.get("decision") == "deny"]
     rules = {entry.get("rule") for entry in denials}
 
-    expect(len(denials) == 2, f"audit records both denials (got {len(denials)})")
+    expect(len(denials) == 3, f"audit records every denial (got {len(denials)})")
     expect(
-        rules == {"deny-sandbox-escape", "deny-destructive"},
+        rules == {"deny-sandbox-escape", "deny-destructive", "deny-unscannable"},
         f"audit names the rule that refused each call (got {sorted(rules)})",
+    )
+    # The refusal that matters most to have in the log: a guardrail the proxy
+    # could not finish checking is invisible in the call itself, so the record
+    # naming the rule is the only trace an operator gets.
+    expect(
+        any(
+            entry.get("rule") == "deny-unscannable"
+            and "could not be evaluated" in (entry.get("decision_reason") or "")
+            for entry in denials
+        ),
+        "audit explains the undecidable denial rather than logging a bare deny",
     )
     expect(
         all(entry.get("is_error") for entry in denials),
