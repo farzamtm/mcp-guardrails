@@ -167,11 +167,11 @@ public sealed class ArgumentPredicateTests
     public void ACatastrophicPatternTimesOutAndIsUndecidable()
     {
         // Policy files are configuration and configuration must not be able to
-        // hang the proxy, so evaluation is abandoned after the timeout. What it
+        // hang the proxy, so evaluation is abandoned after RegexTimeout. What it
         // must NOT do is report "no match": the model chooses the argument and
         // its length, so a bounded-but-silent give-up is a bypass it can trigger
         // on demand. Indeterminate carries "undecided" up to the evaluator, which
-        // refuses the call. See RuleMatchingTests for the other half.
+        // refuses the call. See PolicyEvaluatorTests for the other half.
         var arguments = TestArguments.From($$"""{ "path": "{{new string('a', 40)}}!" }""");
 
         var predicate = new ArgumentPredicate { Path = "$.path", Matches = "^(a+)+$" };
@@ -236,6 +236,66 @@ public sealed class ArgumentPredicateTests
 
         var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
         Assert.Contains("empty 'in' list", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsAnEmptyPrefix()
+    {
+        // Always true, so the rule reduces to "the argument is a string" - a
+        // guardrail the operator believes in and does not have.
+        var predicate = new ArgumentPredicate { Path = "$.path", Prefix = "" };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
+        Assert.Contains("empty 'prefix'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("every string value", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_RejectsAnEmptyNotPrefix()
+    {
+        // Never true, so the rule can never fire.
+        var predicate = new ArgumentPredicate { Path = "$.path", NotPrefix = "" };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Validate("r"));
+        Assert.Contains("empty 'not_prefix'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("never match", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_ExplainsThatANullValueIsNotAnOperator()
+    {
+        // 'eq: null' deserialises to an absent operator, so the message has to
+        // name that specifically or it describes the wrong mistake.
+        var exception = Assert.Throws<PolicyException>(
+            () => new ArgumentPredicate { Path = "$.limit", Eq = null }.Validate("r"));
+
+        Assert.Contains("eq: null", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnUnvalidatedPredicate_FailsAsAConfigurationErrorRatherThanACrash()
+    {
+        // PolicyLoader always validates, but PolicyDocument and PolicyRule are
+        // public: a predicate built in code reaches Evaluate without ever having
+        // been checked. It must not dereference its way into a NullReferenceException.
+        var predicate = new ArgumentPredicate { Path = "$.limit" };
+
+        var exception = Assert.Throws<PolicyException>(() => predicate.Evaluate(_arguments));
+        Assert.Contains("no operator", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AValidatedPredicate_ResolvesItsOperatorOnlyOnce()
+    {
+        // The resolved form is cached, so a policy's patterns are compiled once
+        // at load instead of being fetched from the small, process-global Regex
+        // cache on every call.
+        var predicate = new ArgumentPredicate { Path = "$.path", Matches = "^/etc/" };
+
+        predicate.Validate("r");
+
+        Assert.Equal("Satisfied", Outcome(predicate, _arguments));
+        Assert.Equal("Satisfied", Outcome(predicate, _arguments));
     }
 
     [Fact]

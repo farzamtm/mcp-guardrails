@@ -44,18 +44,10 @@ internal enum PredicateResult
 ///     not_prefix: /workspace/
 /// </code>
 ///
-/// One operator per predicate, rather than several combined, so that a rule
-/// reads as a list of conditions and the <c>--explain</c> trail can name the one
-/// that failed. Two conditions on the same value are two entries in the list.
-///
-/// <b>An argument that is not present never satisfies a predicate</b>, including
-/// the negated ones. <c>not_prefix</c> asserts "there is a value, and it does not
-/// start with this", not "there is no value starting with this". The alternative
-/// - treating absence as satisfying a negation - makes a rule fire on evidence
-/// that was never supplied, and "the argument was missing" is better handled by
-/// the downstream server's own schema validation than guessed at here. When a
-/// rule must also cover calls that omit the argument, follow it with a catch-all;
-/// first-match-wins makes that composition explicit.
+/// One operator per predicate so that the <c>--explain</c> trail can name the
+/// condition that failed; two conditions on one value are two list entries. The
+/// semantics operators do NOT have - absent arguments, string comparison, path
+/// syntax - are documented once in the README rather than restated here.
 /// </remarks>
 public sealed record ArgumentPredicate
 {
@@ -82,7 +74,7 @@ public sealed record ArgumentPredicate
     [JsonPropertyName("matches")]
     public string? Matches { get; init; }
 
-    /// <summary>The string value starts with this.</summary>
+    /// <summary>The string value starts with this, compared literally.</summary>
     [JsonPropertyName("prefix")]
     public string? Prefix { get; init; }
 
@@ -98,16 +90,51 @@ public sealed record ArgumentPredicate
     /// How long a <c>matches</c> pattern may run before it is abandoned.
     /// </summary>
     /// <remarks>
-    /// A policy file is configuration, and a regex over a model-supplied
-    /// argument can backtrack for an unbounded time. The timeout turns "the
-    /// proxy hangs and every tool call stops" into a bounded per-call cost;
-    /// <see cref="PredicateResult.Indeterminate"/> is what keeps that bound
-    /// from becoming a bypass.
+    /// A policy file is configuration, and a regular expression over a
+    /// model-supplied argument can backtrack for an unbounded time. The timeout
+    /// turns "the proxy hangs and every tool call stops" into a bounded per-call
+    /// cost; <see cref="Result.Indeterminate"/> is what keeps that
+    /// bound from becoming a bypass.
     /// </remarks>
-    private static readonly TimeSpan _regexTimeout = TimeSpan.FromMilliseconds(100);
+    internal static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>
+    /// The resolved form of this predicate: a validated path and exactly one
+    /// operation, worked out once instead of re-derived on every call.
+    /// </summary>
+    /// <remarks>
+    /// Resolving at load is what removes the "trust that Validate ran" contract
+    /// the evaluation path used to depend on. It also means a <c>matches</c>
+    /// pattern is compiled once per policy, rather than fetched from the
+    /// process-global <see cref="Regex"/> cache - which is small, shared with
+    /// every other component in the process, and therefore no guarantee at all.
+    /// </remarks>
+    private sealed record Resolved(string Path, PredicateOperation Operation);
+
+    private Resolved? _resolved;
+
+    /// <remarks>
+    /// A predicate built in code and never validated resolves on first use and
+    /// throws <see cref="PolicyException"/> if it is malformed. The rule name is
+    /// unavailable on that path, but a configuration error naming the problem
+    /// beats a <see cref="NullReferenceException"/> inside the call filter.
+    /// </remarks>
+    private Resolved Current => _resolved ??= Resolve("(unvalidated)");
 
     /// <summary>Validates the predicate, throwing with the rule name in context.</summary>
-    internal void Validate(string ruleName)
+    public void Validate(string ruleName) => _resolved = Resolve(ruleName);
+
+    /// <summary>Applies the predicate to a call's arguments.</summary>
+    internal PredicateResult Evaluate(IReadOnlyDictionary<string, JsonElement>? arguments)
+    {
+        var resolved = Current;
+
+        return JsonPath.TryResolve(arguments, resolved.Path, out var value)
+            ? resolved.Operation.Apply(value)
+            : PredicateResult.NotSatisfied;
+    }
+
+    private Resolved Resolve(string ruleName)
     {
         if (string.IsNullOrWhiteSpace(Path))
         {
@@ -122,168 +149,132 @@ public sealed record ArgumentPredicate
                 "Supported forms are $.name, $.name.nested, $.name[0] and $['quoted name'].");
         }
 
-        var operators = OperatorCount();
-
-        if (operators == 0)
-        {
-            throw new PolicyException(
-                $"Rule '{ruleName}' has an argument predicate on '{Path}' with no operator. " +
-                "Use one of eq, gt, lt, matches, prefix, not_prefix, in.");
-        }
-
-        if (operators > 1)
-        {
-            throw new PolicyException(
-                $"Rule '{ruleName}' has an argument predicate on '{Path}' with more than one " +
-                "operator. Write one condition per list entry so a failing one can be named.");
-        }
-
-        if (In is { Count: 0 })
-        {
-            throw new PolicyException(
-                $"Rule '{ruleName}' has an empty 'in' list on '{Path}', which can never match.");
-        }
-
-        if (Matches is not null)
-        {
-            try
-            {
-                _ = Regex.IsMatch(string.Empty, Matches, RegexOptions.None, _regexTimeout);
-            }
-            catch (ArgumentException ex)
-            {
-                // Caught at load rather than on the first tool call: an invalid
-                // pattern would otherwise throw inside the filter and turn a
-                // policy typo into a failed tool call, mid-session.
-                throw new PolicyException(
-                    $"Rule '{ruleName}' has an invalid regular expression on '{Path}': {ex.Message}",
-                    ex);
-            }
-        }
+        return new Resolved(Path, ResolveOperation(ruleName));
     }
 
-    private int OperatorCount()
+    /// <remarks>
+    /// The one place the operator set is enumerated. Adding an operator means a
+    /// property, an arm here and a subclass of <see cref="PredicateOperation"/>;
+    /// the evaluation path needs no change, and cannot be left out of date.
+    /// </remarks>
+    private PredicateOperation ResolveOperation(string ruleName)
     {
-        var count = 0;
+        PredicateOperation? operation = null;
 
-        // Counted rather than short-circuited so "more than one operator" can be
-        // reported as such instead of silently honouring the first.
-        if (Eq is not null)
-        {
-            count++;
-        }
-
-        if (Gt is not null)
-        {
-            count++;
-        }
-
-        if (Lt is not null)
-        {
-            count++;
-        }
-
-        if (Matches is not null)
-        {
-            count++;
-        }
-
-        if (Prefix is not null)
-        {
-            count++;
-        }
-
-        if (NotPrefix is not null)
-        {
-            count++;
-        }
-
-        if (In is not null)
-        {
-            count++;
-        }
-
-        return count;
-    }
-
-    /// <summary>Applies the predicate to a call's arguments.</summary>
-    internal PredicateResult Evaluate(IReadOnlyDictionary<string, JsonElement>? arguments)
-    {
-        // Path is non-null after Validate, which every rule goes through before
-        // the evaluator will use it.
-        if (!JsonPath.TryResolve(arguments, Path!, out var value))
-        {
-            return PredicateResult.NotSatisfied;
-        }
-
+        // Every operator is examined rather than short-circuited on the first
+        // hit, so "more than one operator" is reported as such instead of the
+        // others being silently ignored.
         if (Eq is { } expected)
         {
-            return From(JsonValueEquals(value, expected));
+            operation = Only(operation, new EqualsOperation(expected), ruleName);
         }
 
         if (Gt is { } greaterThan)
         {
-            return From(TryGetNumber(value, out var number) && number > greaterThan);
+            operation = Only(operation, new GreaterThanOperation(greaterThan), ruleName);
         }
 
         if (Lt is { } lessThan)
         {
-            return From(TryGetNumber(value, out var number) && number < lessThan);
+            operation = Only(operation, new LessThanOperation(lessThan), ruleName);
         }
 
         if (Matches is { } pattern)
         {
-            return value.ValueKind is JsonValueKind.String
-                ? MatchRegex(value, pattern)
-                : PredicateResult.NotSatisfied;
+            operation = Only(operation, CompileRegex(pattern, ruleName), ruleName);
         }
 
         if (Prefix is { } prefix)
         {
-            return From(value.ValueKind is JsonValueKind.String &&
-                        value.GetString()!.StartsWith(prefix, StringComparison.Ordinal));
+            operation = Only(
+                operation,
+                new PrefixOperation(RequireNonEmpty(prefix, "prefix", ruleName)),
+                ruleName);
         }
 
         if (NotPrefix is { } notPrefix)
         {
-            return From(value.ValueKind is JsonValueKind.String &&
-                        !value.GetString()!.StartsWith(notPrefix, StringComparison.Ordinal));
+            operation = Only(
+                operation,
+                new NotPrefixOperation(RequireNonEmpty(notPrefix, "not_prefix", ruleName)),
+                ruleName);
         }
 
-        // Validate guarantees one operator is set, so this is the 'in' case.
-        foreach (var candidate in In!)
+        if (In is { } candidates)
         {
-            if (JsonValueEquals(value, candidate))
+            if (candidates.Count == 0)
             {
-                return PredicateResult.Satisfied;
+                throw new PolicyException(
+                    $"Rule '{ruleName}' has an empty 'in' list on '{Path}', which can never match.");
             }
+
+            operation = Only(operation, new InOperation(candidates), ruleName);
         }
 
-        return PredicateResult.NotSatisfied;
+        return operation ?? throw new PolicyException(
+            $"Rule '{ruleName}' has an argument predicate on '{Path}' with no operator. " +
+            "Use one of eq, gt, lt, matches, prefix, not_prefix, in. A null value " +
+            "(for example 'eq: null') is not a comparison and reads as no operator.");
     }
 
-    private static PredicateResult From(bool satisfied) =>
-        satisfied ? PredicateResult.Satisfied : PredicateResult.NotSatisfied;
+    private PredicateOperation Only(
+        PredicateOperation? existing,
+        PredicateOperation candidate,
+        string ruleName) =>
+        existing is null
+            ? candidate
+            : throw new PolicyException(
+                $"Rule '{ruleName}' has an argument predicate on '{Path}' with more than one " +
+                "operator. Write one condition per list entry so a failing one can be named.");
 
-    private static PredicateResult MatchRegex(JsonElement value, string pattern)
+    /// <remarks>
+    /// An empty prefix is always true and an empty not_prefix is never true, so
+    /// both are rules that quietly do nothing - the worst outcome available to a
+    /// policy engine, because the operator believes a guardrail exists.
+    /// </remarks>
+    private string RequireNonEmpty(string value, string operatorName, string ruleName) =>
+        value.Length > 0
+            ? value
+            : throw new PolicyException(
+                $"Rule '{ruleName}' has an empty '{operatorName}' on '{Path}'. " +
+                (operatorName == "prefix"
+                    ? "It would match every string value."
+                    : "It can never match."));
+
+    /// <remarks>
+    /// Compiled at load rather than on the first tool call: an invalid pattern
+    /// would otherwise throw inside the filter and turn a policy typo into a
+    /// failed tool call, mid-session.
+    /// </remarks>
+    private RegexOperation CompileRegex(string pattern, string ruleName)
     {
         try
         {
-            // The static overload keeps a small compiled-pattern cache, so a
-            // policy's patterns are compiled once rather than per call.
-            return From(Regex.IsMatch(
-                value.GetString()!, pattern, RegexOptions.None, _regexTimeout));
+            return new RegexOperation(new Regex(pattern, RegexOptions.None, RegexTimeout));
         }
-        catch (RegexMatchTimeoutException)
+        catch (ArgumentException ex)
         {
-            // Reporting "no match" here would hand the caller a bypass: the
-            // model chooses the argument and its length, so it could pad any
-            // value until the deny rule containing this pattern gave up and the
-            // call fell through to default-allow. An abandoned match is not
-            // evidence of safety, so it is not an answer.
-            return PredicateResult.Indeterminate;
+            throw new PolicyException(
+                $"Rule '{ruleName}' has an invalid regular expression on '{Path}': {ex.Message}",
+                ex);
         }
     }
+}
+
+/// <summary>
+/// One resolved operator, ready to apply.
+/// </summary>
+/// <remarks>
+/// A type per operator rather than an enum plus seven optional operands: each
+/// subclass holds exactly the data it needs, non-nullable, so the evaluation
+/// path has nothing to assert about and no null-forgiving operator in it.
+/// </remarks>
+internal abstract class PredicateOperation
+{
+    internal abstract PredicateResult Apply(JsonElement value);
+
+    private protected static PredicateResult From(bool satisfied) =>
+        satisfied ? PredicateResult.Satisfied : PredicateResult.NotSatisfied;
 
     /// <summary>
     /// Compares two JSON values by kind and content.
@@ -294,7 +285,7 @@ public sealed record ArgumentPredicate
     /// to care about; a rule that needs to inspect inside a structure should path
     /// into it instead.
     /// </remarks>
-    private static bool JsonValueEquals(JsonElement value, JsonElement expected) =>
+    private protected static bool JsonValueEquals(JsonElement value, JsonElement expected) =>
         (value.ValueKind, expected.ValueKind) switch
         {
             (JsonValueKind.String, JsonValueKind.String) =>
@@ -307,7 +298,11 @@ public sealed record ArgumentPredicate
             _ => false,
         };
 
-    private static bool TryGetNumber(JsonElement value, out double number)
+    /// <remarks>
+    /// No coercion: a string that looks like a number is still a string, and
+    /// treating it as one would let <c>limit: "1000"</c> slip past a gt rule.
+    /// </remarks>
+    private protected static bool TryGetNumber(JsonElement value, out double number)
     {
         if (value.ValueKind is JsonValueKind.Number)
         {
@@ -317,5 +312,78 @@ public sealed record ArgumentPredicate
 
         number = 0;
         return false;
+    }
+}
+
+internal sealed class EqualsOperation(JsonElement expected) : PredicateOperation
+{
+    internal override PredicateResult Apply(JsonElement value) =>
+        From(JsonValueEquals(value, expected));
+}
+
+internal sealed class GreaterThanOperation(double bound) : PredicateOperation
+{
+    internal override PredicateResult Apply(JsonElement value) =>
+        From(TryGetNumber(value, out var number) && number > bound);
+}
+
+internal sealed class LessThanOperation(double bound) : PredicateOperation
+{
+    internal override PredicateResult Apply(JsonElement value) =>
+        From(TryGetNumber(value, out var number) && number < bound);
+}
+
+internal sealed class PrefixOperation(string prefix) : PredicateOperation
+{
+    internal override PredicateResult Apply(JsonElement value) =>
+        From(value.ValueKind is JsonValueKind.String &&
+             value.GetString()!.StartsWith(prefix, StringComparison.Ordinal));
+}
+
+internal sealed class NotPrefixOperation(string prefix) : PredicateOperation
+{
+    internal override PredicateResult Apply(JsonElement value) =>
+        From(value.ValueKind is JsonValueKind.String &&
+             !value.GetString()!.StartsWith(prefix, StringComparison.Ordinal));
+}
+
+internal sealed class InOperation(IReadOnlyList<JsonElement> candidates) : PredicateOperation
+{
+    internal override PredicateResult Apply(JsonElement value)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (JsonValueEquals(value, candidate))
+            {
+                return PredicateResult.Satisfied;
+            }
+        }
+
+        return PredicateResult.NotSatisfied;
+    }
+}
+
+internal sealed class RegexOperation(Regex pattern) : PredicateOperation
+{
+    internal override PredicateResult Apply(JsonElement value)
+    {
+        if (value.ValueKind is not JsonValueKind.String)
+        {
+            return PredicateResult.NotSatisfied;
+        }
+
+        try
+        {
+            return From(pattern.IsMatch(value.GetString()!));
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            // Reporting "no match" here would hand the caller a bypass: the
+            // model chooses the argument and its length, so it could pad any
+            // value until the deny rule containing this pattern gave up and the
+            // call fell through to default-allow. An abandoned match is not
+            // evidence of safety, so it is not an answer.
+            return PredicateResult.Indeterminate;
+        }
     }
 }
