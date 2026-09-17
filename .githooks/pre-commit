@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# main is not a workspace.
+#
+# GitHub's own branch protection is unavailable on this repository (private
+# repo, free plan - the API answers 403 "Upgrade to GitHub Pro or make this
+# repository public"), so the rule lives here instead. It is weaker than a
+# server-side ruleset because it is local and bypassable, and it still catches
+# the thing that actually happens: starting work, forgetting to branch, and
+# noticing three commits later.
+#
+# Enable with:  git config core.hooksPath .githooks
+set -euo pipefail
+
+branch="$(git symbolic-ref --quiet --short HEAD || echo '')"
+
+case "$branch" in
+  main|master)
+    cat >&2 <<EOF
+
+  ✗ refusing to commit directly to '$branch'.
+
+    Every change belongs on its own branch (CONTRIBUTING.md):
+
+        git switch -c feat/<short-description>
+
+    Your staged changes are untouched - move them with:
+
+        git stash && git switch -c feat/<short-description> && git stash pop
+
+    Deliberate exception: git commit --no-verify
+
+EOF
+    exit 1
+    ;;
+esac
+
+# A detached HEAD is not a branch either, and a commit made there is a commit
+# you will lose.
+if [ -z "$branch" ]; then
+  cat >&2 <<'EOF'
+
+  ✗ HEAD is detached - this commit would not belong to any branch.
+
+    git switch -c feat/<short-description>
+
+EOF
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+#
+# The last gate before code leaves the machine.
+#
+# Two jobs:
+#   1. Nothing is pushed straight to main. main moves through pull requests.
+#   2. Nothing is pushed at all until the full pipeline passes locally, so a
+#      red CI run is a surprise rather than a routine.
+#
+# Enable with:  git config core.hooksPath .githooks
+# Bypass with:  git push --no-verify   (a decision, not an accident)
+set -euo pipefail
+
+remote="${1:-origin}"
+protected_re='^refs/heads/(main|master)$'
+
+# git feeds one line per ref being pushed:
+#   <local ref> <local sha> <remote ref> <remote sha>
+zero='0000000000000000000000000000000000000000'
+has_refs=0
+
+# shellcheck disable=SC2034  # local_ref is positional; only the shas and the
+# remote ref matter here.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${remote_ref:-}" ] && continue
+  has_refs=1
+
+  if [[ "$remote_ref" =~ $protected_re ]]; then
+    if [ "$local_sha" = "$zero" ]; then
+      echo >&2 $'\n  ✗ refusing to delete '"$remote_ref"' on '"$remote"$'.\n'
+    else
+      cat >&2 <<EOF
+
+  ✗ refusing to push directly to $remote_ref on $remote.
+
+    main is updated by merging a reviewed pull request, never by a push:
+
+        git switch -c feat/<short-description>
+        git push -u $remote feat/<short-description>
+        gh pr create        # ask the human first
+
+    Deliberate exception: git push --no-verify
+
+EOF
+    fi
+    exit 1
+  fi
+
+  # A force-push rewrites history someone else may already have pulled. Let it
+  # happen on a feature branch, but say so out loud.
+  if [ "$remote_sha" != "$zero" ] && [ -n "$remote_sha" ]; then
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+      echo >&2 "  ! $remote_ref is being rewritten (non-fast-forward)."
+    fi
+  fi
+done
+
+# Nothing to push (or git gave us no refs): nothing to verify.
+[ "$has_refs" = "0" ] && exit 0
+
+echo
+echo "pre-push: running the full pipeline locally (scripts/preflight.sh)."
+echo "          FAST=1 trims it; --no-verify skips it entirely."
+
+if ! "$(git rev-parse --show-toplevel)/scripts/preflight.sh"; then
+  cat >&2 <<'EOF'
+
+  ✗ preflight failed - not pushing.
+
+    Fix it, or push deliberately with: git push --no-verify
+
+EOF
+  exit 1
+fi
+
+exit 0
