@@ -16,8 +16,15 @@ protected_re='^refs/heads/(main|master)$'
 
 # git feeds one line per ref being pushed:
 #   <local ref> <local sha> <remote ref> <remote sha>
-zero='0000000000000000000000000000000000000000'
+#
+# The all-zero sha is git's "this side does not exist": as the local sha it
+# means a deletion, as the remote sha it means a brand new branch. Matched as a
+# pattern rather than a 40-character literal so this keeps working in a SHA-256
+# repository, where the same sentinel is 64 characters long.
+is_zero() { case "${1:-}" in '') return 1 ;; *[!0]*) return 1 ;; *) return 0 ;; esac; }
+
 has_refs=0
+has_commits=0
 
 # shellcheck disable=SC2034  # local_ref is positional; only the shas and the
 # remote ref matter here.
@@ -25,8 +32,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   [ -z "${remote_ref:-}" ] && continue
   has_refs=1
 
+  # A deletion pushes no commits, so there is nothing for the pipeline to check.
+  if ! is_zero "$local_sha"; then
+    has_commits=1
+  fi
+
   if [[ "$remote_ref" =~ $protected_re ]]; then
-    if [ "$local_sha" = "$zero" ]; then
+    if is_zero "$local_sha"; then
       echo >&2 $'\n  ✗ refusing to delete '"$remote_ref"' on '"$remote"$'.\n'
     else
       cat >&2 <<EOF
@@ -48,7 +60,7 @@ EOF
 
   # A force-push rewrites history someone else may already have pulled. Let it
   # happen on a feature branch, but say so out loud.
-  if [ "$remote_sha" != "$zero" ] && [ -n "$remote_sha" ]; then
+  if ! is_zero "$remote_sha" && ! is_zero "$local_sha"; then
     if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
       echo >&2 "  ! $remote_ref is being rewritten (non-fast-forward)."
     fi
@@ -57,6 +69,13 @@ done
 
 # Nothing to push (or git gave us no refs): nothing to verify.
 [ "$has_refs" = "0" ] && exit 0
+
+# Every ref in this push is a deletion. Running the test suite to decide whether
+# a branch may be removed is a minute of waiting that cannot change the answer.
+if [ "$has_commits" = "0" ]; then
+  echo "pre-push: deletion only, nothing to verify."
+  exit 0
+fi
 
 echo
 echo "pre-push: running the full pipeline locally (scripts/preflight.sh)."
