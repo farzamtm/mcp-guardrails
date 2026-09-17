@@ -12,6 +12,8 @@ Requirements:
 - Python 3 — only for `scripts/smoke.py`
 
 ```bash
+git config core.hooksPath .githooks   # once per clone - see below
+
 dotnet build
 dotnet test
 python3 scripts/smoke.py     # end-to-end, spawns a real downstream server
@@ -20,9 +22,31 @@ python3 scripts/smoke.py     # end-to-end, spawns a real downstream server
 All three must pass before a change is considered done. CI runs exactly these on
 Linux, macOS and Windows.
 
+[`scripts/preflight.sh`](scripts/preflight.sh) runs the entire pipeline —
+format, build, test, coverage gate, `ruff`, `shellcheck`, smoke test and the
+example-policy check — so a green run locally means CI has nothing new to say.
+
 ## Branching
 
 `main` is always releasable. Nothing is committed to it directly.
+
+This is enforced as far as it can be: [`.githooks/`](.githooks) holds a
+`pre-commit` that refuses commits on `main` and a `pre-push` that refuses
+pushes to `main` and runs `scripts/preflight.sh` first. Hooks are not installed
+by cloning, hence the `core.hooksPath` line above. GitHub's own branch
+protection is unavailable while the repository is private on a free plan (the
+API answers `403 Upgrade to GitHub Pro or make this repository public`), so the
+hooks are a reminder, not a boundary — `--no-verify` still works, and using it
+is a decision you own.
+
+The server-side rule is committed anyway, in
+[`.github/rulesets/main.json`](.github/rulesets/main.json): required PR,
+required CI checks, no force-push, no deletion, no bypass. One command applies
+it (`scripts/apply-branch-protection.sh`) once the plan allows it. See
+[`.github/rulesets/README.md`](.github/rulesets/README.md).
+
+Agents working in this repository follow [AGENTS.md](AGENTS.md), which encodes
+the same rules plus "ask before commit, push or PR".
 
 Every change happens on a branch named `<type>/<short-description>`:
 
