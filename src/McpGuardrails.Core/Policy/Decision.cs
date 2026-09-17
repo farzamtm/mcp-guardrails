@@ -27,6 +27,25 @@ public enum Verdict
 }
 
 /// <summary>
+/// Which guardrail produced a decision.
+/// </summary>
+/// <remarks>
+/// Only used to word the refusal. "Blocked by guardrails policy rule 'no-writes'"
+/// and "Blocked by guardrails budget 'session.max_cost'" call for different
+/// actions from the agent - one means never do this, the other means not right
+/// now - and a model that cannot tell them apart will either give up too early
+/// or retry forever.
+/// </remarks>
+public enum DecisionSource
+{
+    /// <summary>A rule in the policy file.</summary>
+    Policy,
+
+    /// <summary>A spend or call cap.</summary>
+    Budget,
+}
+
+/// <summary>
 /// The outcome of evaluating one tool call against the policy.
 /// </summary>
 /// <param name="Verdict">Allow, deny, or ask a human.</param>
@@ -62,6 +81,18 @@ public sealed record Decision(
     public static Decision DefaultAllow { get; } =
         new(Verdict.Allow, "No policy rule matched; default is allow.");
 
+    /// <summary>What this call costs against the budget.</summary>
+    /// <remarks>
+    /// Carried on the decision because the rule that matched is the thing that
+    /// knows the price, and the budget gate runs after evaluation. One per call
+    /// unless a rule says otherwise, so budgets are meaningful before anyone
+    /// writes a single <c>cost:</c>.
+    /// </remarks>
+    public long Cost { get; init; } = PolicyRule.DefaultCost;
+
+    /// <summary>Which guardrail decided this.</summary>
+    public DecisionSource Source { get; init; } = DecisionSource.Policy;
+
     /// <summary>True when the call must not be forwarded as-is.</summary>
     public bool IsBlocked => Verdict is Verdict.Deny or Verdict.RequireApproval;
 
@@ -74,7 +105,10 @@ public sealed record Decision(
     /// "denied: exports over 100 rows need approval; try limit=100" changes
     /// approach. Denials that explain themselves turn a wall into a signpost.
     /// </remarks>
-    public string ToModelMessage() => RuleName is null
-        ? $"Blocked by guardrails policy: {Reason}"
-        : $"Blocked by guardrails policy rule '{RuleName}': {Reason}";
+    public string ToModelMessage() => (Source, RuleName) switch
+    {
+        (DecisionSource.Budget, { } limit) => $"Blocked by guardrails budget '{limit}': {Reason}",
+        (_, { } rule) => $"Blocked by guardrails policy rule '{rule}': {Reason}",
+        _ => $"Blocked by guardrails policy: {Reason}",
+    };
 }

@@ -41,14 +41,14 @@ public sealed class PolicyLoaderTests : IDisposable
                 message: Writing is not permitted here.
             """);
 
-        Assert.Equal(2, policy.Rules.Count);
+        Assert.Equal(2, policy.EffectiveRules.Count);
 
-        Assert.Equal("allow-reads", policy.Rules[0].Name);
-        Assert.Equal(Verdict.Allow, policy.Rules[0].EffectiveDecision);
-        Assert.Equal("fs__read_file", policy.Rules[0].EffectiveMatch.Tool);
+        Assert.Equal("allow-reads", policy.EffectiveRules[0].Name);
+        Assert.Equal(Verdict.Allow, policy.EffectiveRules[0].EffectiveDecision);
+        Assert.Equal("fs__read_file", policy.EffectiveRules[0].EffectiveMatch.Tool);
 
-        Assert.Equal(Verdict.Deny, policy.Rules[1].EffectiveDecision);
-        Assert.Equal("Writing is not permitted here.", policy.Rules[1].Message);
+        Assert.Equal(Verdict.Deny, policy.EffectiveRules[1].EffectiveDecision);
+        Assert.Equal("Writing is not permitted here.", policy.EffectiveRules[1].Message);
     }
 
     [Fact]
@@ -62,7 +62,7 @@ public sealed class PolicyLoaderTests : IDisposable
                 decision: require_approval
             """);
 
-        Assert.Equal(Verdict.RequireApproval, Assert.Single(policy.Rules).EffectiveDecision);
+        Assert.Equal(Verdict.RequireApproval, Assert.Single(policy.EffectiveRules).EffectiveDecision);
     }
 
     [Fact]
@@ -79,7 +79,7 @@ public sealed class PolicyLoaderTests : IDisposable
                   tool: fs__write_file
             """);
 
-        var rule = Assert.Single(policy.Rules);
+        var rule = Assert.Single(policy.EffectiveRules);
 
         Assert.Null(rule.Decision);                          // nothing was stated
         Assert.Equal(Verdict.Deny, rule.EffectiveDecision);  // and absent means deny
@@ -94,7 +94,7 @@ public sealed class PolicyLoaderTests : IDisposable
                 decision: deny
             """);
 
-        var rule = Assert.Single(policy.Rules);
+        var rule = Assert.Single(policy.EffectiveRules);
 
         Assert.Null(rule.Match);                    // no conditions were given
         Assert.True(rule.EffectiveMatch.IsCatchAll); // so it applies to everything
@@ -114,7 +114,7 @@ public sealed class PolicyLoaderTests : IDisposable
     [InlineData("null")]
     public void Parse_TreatsEmptyDocumentsAsNoRules(string yaml)
     {
-        Assert.Empty(PolicyLoader.Parse(yaml).Rules);
+        Assert.Empty(PolicyLoader.Parse(yaml).EffectiveRules);
     }
 
     [Fact]
@@ -123,7 +123,7 @@ public sealed class PolicyLoaderTests : IDisposable
         // The adoption default: no policy file means pure passthrough.
         var missing = Path.Combine(_directory, "does-not-exist.yaml");
 
-        Assert.Empty(PolicyLoader.LoadFromFileOrEmpty(missing).Rules);
+        Assert.Empty(PolicyLoader.LoadFromFileOrEmpty(missing).EffectiveRules);
     }
 
     [Fact]
@@ -136,7 +136,7 @@ public sealed class PolicyLoaderTests : IDisposable
                   tool: fs__write_file
             """);
 
-        Assert.Equal("deny-writes", Assert.Single(PolicyLoader.LoadFromFileOrEmpty(path).Rules).Name);
+        Assert.Equal("deny-writes", Assert.Single(PolicyLoader.LoadFromFileOrEmpty(path).EffectiveRules).Name);
     }
 
     // -------------------------------------------------------------- bad inputs
@@ -200,7 +200,7 @@ public sealed class PolicyLoaderTests : IDisposable
                   tool: "123"
             """);
 
-        var rule = Assert.Single(policy.Rules);
+        var rule = Assert.Single(policy.EffectiveRules);
         Assert.Equal("true", rule.Name);
         Assert.Equal("123", rule.EffectiveMatch.Tool);
     }
@@ -220,7 +220,7 @@ public sealed class PolicyLoaderTests : IDisposable
                 decision: require_approval
             """);
 
-        var annotations = Assert.Single(policy.Rules).EffectiveMatch.Annotations;
+        var annotations = Assert.Single(policy.EffectiveRules).EffectiveMatch.Annotations;
 
         Assert.NotNull(annotations);
         Assert.True(annotations.DestructiveHint);
@@ -244,7 +244,7 @@ public sealed class PolicyLoaderTests : IDisposable
                 decision: deny
             """);
 
-        var arguments = Assert.Single(policy.Rules).EffectiveMatch.Arguments;
+        var arguments = Assert.Single(policy.EffectiveRules).EffectiveMatch.Arguments;
 
         Assert.NotNull(arguments);
         Assert.Equal(2, arguments.Count);

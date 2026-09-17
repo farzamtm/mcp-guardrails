@@ -37,6 +37,10 @@ PROBE = f"{SANDBOX}/smoke-probe.txt"
 AUDIT = f"{SANDBOX}/audit.jsonl"
 POLICY_AUDIT = f"{SANDBOX}/audit-policy.jsonl"
 POLICY_FILE = f"{SANDBOX}/smoke-policy.yaml"
+BUDGET_AUDIT = f"{SANDBOX}/audit-budget.jsonl"
+BUDGET_FILE = f"{SANDBOX}/smoke-budget.yaml"
+BUDGET_PROBE = f"{SANDBOX}/smoke-budget-1.txt"
+BUDGET_OVER = f"{SANDBOX}/smoke-budget-2.txt"
 CONTENT = "written through the guardrails proxy"
 
 # A path the sandbox rules must refuse. Never actually written: the point is
@@ -89,6 +93,29 @@ rules:
         destructiveHint: true
     decision: deny
     message: Destructive tools are disabled here.
+"""
+
+# A budget small enough to run out inside one session, with costs that differ by
+# tool - which is the whole point of weighting. Two writes cost 4 against a cap
+# of 3, so the second one cannot happen; reads are free and keep working after
+# the budget is gone.
+BUDGET_POLICY = """
+budgets:
+  session:
+    max_cost: 3
+
+rules:
+  - name: reads-are-free
+    match:
+      tool: fs__read_*
+    decision: allow
+    cost: 0
+
+  - name: writes-cost
+    match:
+      tool: fs__write_*
+    decision: allow
+    cost: 2
 """
 
 
@@ -171,6 +198,27 @@ POLICY_CHECKS: list[tuple[dict, str, object]] = [
 ]
 
 
+# The budget is per session, so these run in order against one proxy process and
+# each check depends on the one before it. That is the behaviour under test.
+BUDGET_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": BUDGET_PROBE, "content": CONTENT}),
+        "the first write fits the budget (2 of 3)",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(2, "fs__write_file", {"path": BUDGET_OVER, "content": CONTENT}),
+        "the second write would exceed it and is refused",
+        lambda r: denied_with(r, "Blocked by guardrails budget 'session.max_cost'"),
+    ),
+    (
+        call(3, "fs__read_text_file", {"path": BUDGET_PROBE}),
+        "a cost-0 read still works after the budget is spent",
+        lambda r: CONTENT in json.dumps(r.get("content", [])),
+    ),
+]
+
+
 def main() -> int:
     try:
         os.makedirs(SANDBOX, exist_ok=True)
@@ -188,7 +236,7 @@ def main() -> int:
         print(f"cannot clear probe file {PROBE}: {exc}", file=sys.stderr)
         return 1
 
-    for stale in (AUDIT, POLICY_AUDIT, ESCAPE):
+    for stale in (AUDIT, POLICY_AUDIT, BUDGET_AUDIT, BUDGET_PROBE, BUDGET_OVER, ESCAPE):
         try:
             os.remove(stale)
         except FileNotFoundError:
@@ -200,6 +248,8 @@ def main() -> int:
     try:
         with open(POLICY_FILE, "w", encoding="utf-8") as handle:
             handle.write(POLICY)
+        with open(BUDGET_FILE, "w", encoding="utf-8") as handle:
+            handle.write(BUDGET_POLICY)
     except OSError as exc:
         print(f"cannot write policy {POLICY_FILE}: {exc}", file=sys.stderr)
         return 1
@@ -227,14 +277,27 @@ def main() -> int:
     failures += policy_failures
     failures += check_policy_audit_log()
 
+    # Phase 3: a session budget running out mid-session, with per-rule costs.
+    print("\n--- budget enforcement ---")
+    budget_failures, budget_stderr = run_session(
+        BUDGET_CHECKS,
+        {"GUARDRAILS_AUDIT": BUDGET_AUDIT, "GUARDRAILS_POLICY": BUDGET_FILE},
+    )
+    failures += budget_failures
+    failures += check_budget_audit_log()
+
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
     print(f"{'FAIL' if escaped else 'PASS'}  denied write never touched the disk")
     failures += 1 if escaped else 0
 
+    overspent = os.path.exists(BUDGET_OVER)
+    print(f"{'FAIL' if overspent else 'PASS'}  the over-budget write never happened")
+    failures += 1 if overspent else 0
+
     if failures:
         print("\n--- server stderr (last 30) ---", file=sys.stderr)
-        sys.stderr.writelines((stderr_lines + policy_stderr)[-30:])
+        sys.stderr.writelines((stderr_lines + policy_stderr + budget_stderr)[-30:])
 
     print("\nFAILED" if failures else "\nALL OK")
     return 1 if failures else 0
@@ -344,6 +407,50 @@ def check_policy_audit_log() -> int:
     expect(
         all(entry.get("is_error") for entry in denials),
         "denied calls are flagged as errors",
+    )
+
+    return failures
+
+
+def check_budget_audit_log() -> int:
+    """A budget refusal must be as traceable as a policy one."""
+    try:
+        with open(BUDGET_AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  budget audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  budget audit log unreadable: {exc}")
+        return 1
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    denials = [entry for entry in lines if entry.get("decision") == "deny"]
+
+    expect(len(denials) == 1, f"exactly one call was refused (got {len(denials)})")
+    expect(
+        any(entry.get("rule") == "session.max_cost" for entry in denials),
+        "audit names the cap that refused the call, not a policy rule",
+    )
+    # Which cap, and how much was left: without the numbers an operator cannot
+    # tell a budget that was too tight from an agent that ran away.
+    expect(
+        any(
+            "spent 2 of its 3" in (entry.get("decision_reason") or "")
+            for entry in denials
+        ),
+        "audit records what was spent and what the cap was",
+    )
+    expect(
+        len(lines) == 3,
+        f"every call is logged, refused or not (got {len(lines)})",
     )
 
     return failures

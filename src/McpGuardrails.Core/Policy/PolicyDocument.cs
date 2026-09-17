@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using McpGuardrails.Core.Budget;
 
 namespace McpGuardrails.Core.Policy;
 
@@ -13,9 +14,38 @@ namespace McpGuardrails.Core.Policy;
 /// </remarks>
 public sealed record PolicyDocument
 {
-    /// <summary>Rules in evaluation order.</summary>
+    /// <summary>Rules in evaluation order, or null when the file has none.</summary>
+    /// <remarks>
+    /// Nullable, like every other property bound from the file, and for the same
+    /// reason: <c>= []</c> here would be a lie. Property initializers are NOT
+    /// applied by System.Text.Json's source-generated deserializer, so a policy
+    /// file that omits <c>rules:</c> - a file that only sets <c>budgets:</c>, say
+    /// - produced null and threw on the first iteration. Read it through
+    /// <see cref="EffectiveRules"/>.
+    /// </remarks>
     [JsonPropertyName("rules")]
-    public IReadOnlyList<PolicyRule> Rules { get; init; } = [];
+    public IReadOnlyList<PolicyRule>? Rules { get; init; }
+
+    /// <summary>The rules, or an empty list when the file declares none.</summary>
+    /// <remarks>No rules means no opinion, which the evaluator turns into allow.</remarks>
+    [JsonIgnore]
+    public IReadOnlyList<PolicyRule> EffectiveRules => Rules ?? [];
+
+    /// <summary>
+    /// Caps on how much the agent may do, or null when nothing is capped.
+    /// </summary>
+    /// <remarks>
+    /// Nullable for the same reason as the rule properties below: property
+    /// initializers are not applied by the source-generated deserializer, so
+    /// "absent" has to be modelled rather than defaulted. Read it through
+    /// <see cref="EffectiveBudgets"/>.
+    /// </remarks>
+    [JsonPropertyName("budgets")]
+    public BudgetPolicy? Budgets { get; init; }
+
+    /// <summary>The budget section, or an empty one when the file omits it.</summary>
+    [JsonIgnore]
+    public BudgetPolicy EffectiveBudgets => Budgets ?? BudgetPolicy.None;
 
     /// <summary>An empty policy: everything allowed, nothing configured.</summary>
     public static PolicyDocument Empty { get; } = new();
@@ -66,6 +96,28 @@ public sealed record PolicyRule
     [JsonIgnore]
     public Verdict EffectiveDecision => Decision ?? Verdict.Deny;
 
+    /// <summary>What a call matching this rule costs against the budget.</summary>
+    /// <remarks>
+    /// The weight in <c>budgets.*.max_cost</c>. Omitted means
+    /// <see cref="DefaultCost"/>, so every call counts for something without any
+    /// rule having to say so; <c>cost: 0</c> makes a class of calls free, which is
+    /// the natural way to let reads run unbounded while writes are capped.
+    ///
+    /// It lives on the rule rather than in a separate cost table because a rule
+    /// already expresses "these calls" precisely - tool glob, annotations,
+    /// arguments. A second matcher would be a second thing to learn, and a second
+    /// place for the two to disagree about which call is which.
+    /// </remarks>
+    [JsonPropertyName("cost")]
+    public long? Cost { get; init; }
+
+    /// <summary>What a call costs when no rule sets a price: one.</summary>
+    public const long DefaultCost = 1;
+
+    /// <summary>The rule's cost, defaulting to <see cref="DefaultCost"/>.</summary>
+    [JsonIgnore]
+    public long EffectiveCost => Cost ?? DefaultCost;
+
     /// <summary>
     /// Explanation handed to the model when this rule blocks a call.
     /// </summary>
@@ -89,6 +141,15 @@ public sealed record PolicyRule
             throw new PolicyException(
                 $"Rule '{Name}' has an unknown decision. " +
                 "Use allow, deny or require_approval.");
+        }
+
+        // Zero is legal (a free call); negative would refund budget, which turns
+        // a cap into something an agent can top up by calling the cheap tool.
+        if (EffectiveCost < 0)
+        {
+            throw new PolicyException(
+                $"Rule '{Name}' has a negative 'cost' ({EffectiveCost}). " +
+                "Use 0 to make matching calls free.");
         }
 
         EffectiveMatch.Validate(Name);

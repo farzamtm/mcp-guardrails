@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using McpGuardrails.Core.Audit;
+using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Upstream;
@@ -92,9 +93,19 @@ var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
                      "policy.yaml");
 
 PolicyEvaluator policy;
+BudgetGate budget;
 try
 {
-    policy = new PolicyEvaluator(PolicyLoader.LoadFromFileOrEmpty(policyPath));
+    var document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
+
+    policy = new PolicyEvaluator(document);
+
+    // No `budgets:` section means an unlimited gate rather than no gate: the
+    // call path is then the same whether or not anyone configured a cap, so the
+    // configured path is not the one that only ever runs in production.
+    budget = document.EffectiveBudgets.Session is { } session
+        ? new BudgetGate(new InMemoryBudgetStore(session))
+        : BudgetGate.Unlimited;
 }
 catch (PolicyException ex)
 {
@@ -219,7 +230,7 @@ builder.Services
         });
 
         // -------------------------------------------------------------------
-        // POLICY FILTER - registered second, so it sits INSIDE audit.
+        // POLICY AND BUDGET FILTER - registered second, so it sits INSIDE audit.
         //
         // That ordering is the point: when this filter refuses a call it returns
         // without invoking `next`, so nothing downstream runs - but the audit
@@ -237,7 +248,12 @@ builder.Services
 
             var facts = PolicyFacts.ForCall(toolName, request.Params, tool);
 
-            var decision = policy.Evaluate(facts, explain);
+            // Two gates, in this order. The policy decides whether the call is
+            // permitted at all; the budget decides whether there is anything left
+            // to spend on it. Charging happens inside Apply, and only for a call
+            // that was going to be forwarded - a call the policy refused costs
+            // nothing, because nothing was done.
+            var decision = budget.Apply(policy.Evaluate(facts, explain));
 
             // Report upward so the audit record carries the verdict.
             GuardrailsCallScope.RecordDecision(decision);

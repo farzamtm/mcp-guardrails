@@ -120,10 +120,12 @@ public static class PolicyLoader
 
         // Fail at load time rather than on the first tool call, so a typo is
         // caught when the proxy starts instead of hours later mid-session.
-        foreach (var rule in document.Rules)
+        foreach (var rule in document.EffectiveRules)
         {
             rule.Validate();
         }
+
+        document.EffectiveBudgets.Validate();
 
         return document;
     }
