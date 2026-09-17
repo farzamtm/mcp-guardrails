@@ -5,36 +5,75 @@
 # passthrough, so you can install the proxy and watch the audit log before
 # writing a single rule.
 #
+# The write rules below key on the literal path prefix /tmp/guardrails-sandbox/,
+# so point the proxy at that same directory or they will never match. Left to
+# itself the proxy uses the platform temp directory, which is only /tmp on
+# Linux - on macOS it is /var/folders/**/T/ and on Windows %LOCALAPPDATA%\Temp\,
+# and every write would fall through to the denial below.
+#
 # Use it with:
-#   GUARDRAILS_POLICY=examples/filesystem-sandbox.yaml McpGuardrails
+#   GUARDRAILS_POLICY=examples/filesystem-sandbox.yaml \
+#   GUARDRAILS_SANDBOX=/tmp/guardrails-sandbox \
+#   McpGuardrails
 
 rules:
-  # Reads are fine, and saying so explicitly stops the catch-all below from
-  # catching them.
+  # A glob, so every read tool the server has (or gains later) is covered
+  # without listing them. '*' matches any run of characters, '?' exactly one.
   - name: allow-reads
     match:
-      tool: fs__read_text_file
+      tool: fs__read_*
     decision: allow
 
   - name: allow-listing
     match:
-      tool: fs__list_directory
+      tool: fs__list_*
     decision: allow
 
-  # The message is a prompt, not a log line. An agent that reads this can pick a
-  # different approach; an agent that reads "denied" just retries.
-  - name: no-writes
+  # Argument predicates narrow a rule to particular calls. This one permits
+  # writes whose requested path is SPELLED as being under the sandbox.
+  #
+  # Read that literally: 'prefix' is an ordinal string comparison on the value
+  # the model sent. Nothing is resolved or canonicalised, so a path such as
+  # /tmp/guardrails-sandbox/../../etc/passwd satisfies it. Real containment is
+  # the downstream server's job - server-filesystem is launched with the sandbox
+  # as its only allowed root and re-checks every path - and this rule is the
+  # layer above that, not a replacement for it.
+  #
+  # One operator per entry - eq, gt, lt, matches, prefix, not_prefix, in - so
+  # that --explain can name the condition that failed. A path the model did not
+  # send never satisfies a predicate, including a negated one, so pair these
+  # with a catch-all when a missing argument should also be refused.
+  - name: allow-sandbox-writes
     match:
-      tool: fs__write_file
-    decision: deny
-    message: >-
-      Writing files is disabled in this sandbox. Read the file and show the user
-      the change you would make instead of applying it.
+      tool: fs__write_*
+      args:
+        - path: $.path
+          prefix: /tmp/guardrails-sandbox/
+    decision: allow
 
-  - name: no-deletes
+  # Reached only when the rule above did not match, i.e. a write aimed outside
+  # the sandbox. The message is a prompt, not a log line: an agent that reads
+  # this can pick a different approach, whereas one that reads "denied" retries.
+  - name: deny-sandbox-escape
     match:
-      tool: fs__move_file
+      tool: fs__write_*
     decision: deny
     message: >-
-      Moving or renaming files is disabled. Ask the user to do it manually if it
-      is genuinely required.
+      Writes must target a path under /tmp/guardrails-sandbox/. Write your file
+      there, or show the user the change instead of applying it.
+
+  # The safety net underneath the named rules: anything the downstream server
+  # flags as destructive, including every tool that declares no annotations at
+  # all, because the MCP default for destructiveHint is true. This is what
+  # covers a tool added next month that nobody has written a rule for yet.
+  #
+  # Annotations are hints from an upstream server, so treat this as a blanket,
+  # not a guarantee - a hostile server can describe its delete tool as harmless.
+  - name: deny-destructive
+    match:
+      annotations:
+        destructiveHint: true
+    decision: deny
+    message: >-
+      Destructive tools are disabled in this sandbox. Ask the user to perform
+      the change manually if it is genuinely required.

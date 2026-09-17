@@ -113,6 +113,41 @@ public sealed class UpstreamRegistryTests
     }
 
     [Fact]
+    public async Task TryGetTool_ReturnsTheDefinitionThePolicyEngineMatchesOn()
+    {
+        await using var server = InMemoryMcpServer.Start("fixture", DestructiveTool());
+
+        await using var registry = await UpstreamRegistry.ConnectAsync(
+            [Config("fs")], NullLoggerFactory.Instance, server.TransportFactory);
+
+        Assert.True(registry.TryGetTool("fs__delete_everything", out var tool));
+
+        // The downstream name on the DTO, and the annotations policy rules match
+        // on. Without these arriving here, every annotation rule would silently
+        // see an undeclared tool.
+        Assert.Equal("delete_everything", tool.Name);
+        Assert.True(tool.Annotations?.DestructiveHint);
+    }
+
+    [Theory]
+    [InlineData("delete_everything")]  // un-namespaced
+    [InlineData("fs__nope")]           // unknown tool
+    public async Task TryGetTool_ReturnsFalseForAnUnknownName(string requested)
+    {
+        await using var server = InMemoryMcpServer.Start("fixture", DestructiveTool());
+
+        await using var registry = await UpstreamRegistry.ConnectAsync(
+            [Config("fs")], NullLoggerFactory.Instance, server.TransportFactory);
+
+        Assert.False(registry.TryGetTool(requested, out var tool));
+
+        // Null, not a non-nullable reference the analyzer has been told to trust.
+        // The CLI passes this straight into PolicyFacts.ForCall, which accepts an
+        // absent tool; a lie here would only surface as a crash on the call path.
+        Assert.Null(tool);
+    }
+
+    [Fact]
     public async Task ConnectAsync_PreservesToolAnnotationsThroughDiscovery()
     {
         await using var server = InMemoryMcpServer.Start("fixture", DestructiveTool());

@@ -1,0 +1,23 @@
+# Ruff settings for the Python tooling in scripts/.
+#
+# The repository is mostly C#, where .editorconfig plus `dotnet format` settle
+# layout and analyzers catch the rest. scripts/smoke.py is the integration test
+# and scripts/coverage.sh gates coverage, so the Python here is load-bearing CI
+# code, not a scratch file - it gets linted to the same standard.
+
+line-length = 88
+
+# The version CI installs, so a local run and a pipeline run agree about which
+# syntax is modern enough to suggest rewriting.
+target-version = "py313"
+
+[lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes: unused imports, undefined names
+    "I",   # import ordering
+    "B",   # bugbear: likely bugs, e.g. mutable defaults, loop-variable capture
+    "UP",  # pyupgrade
+    "SIM", # simplifiable constructs
+    "RUF",
+]

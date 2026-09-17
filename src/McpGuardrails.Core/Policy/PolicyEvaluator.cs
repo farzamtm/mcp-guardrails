@@ -1,20 +1,4 @@
-using System.Text.Json;
-
 namespace McpGuardrails.Core.Policy;
-
-/// <summary>
-/// The facts about a tool call that rules are matched against.
-/// </summary>
-/// <param name="ToolName">Client-visible name, e.g. <c>fs__write_file</c>.</param>
-/// <param name="Arguments">Arguments supplied by the model, if any.</param>
-/// <remarks>
-/// Deliberately a plain data snapshot rather than the live MCP request: it keeps
-/// the evaluator free of any protocol types, which is what makes it trivially
-/// unit-testable. Step 6 adds tool annotations here.
-/// </remarks>
-public sealed record ToolCallFacts(
-    string ToolName,
-    IReadOnlyDictionary<string, JsonElement>? Arguments = null);
 
 /// <summary>
 /// Decides what to do with a tool call, first matching rule wins.
@@ -66,7 +50,9 @@ public sealed class PolicyEvaluator
             // properties: an omitted `decision:` must mean Deny, and reading
             // rule.Decision directly would give null (and previously, silently,
             // Allow - the zero value of the enum).
-            if (Matches(rule.EffectiveMatch, facts))
+            var outcome = RuleMatcher.Match(rule.EffectiveMatch, facts);
+
+            if (outcome.IsMatch)
             {
                 trail?.Add($"rule '{rule.Name}': MATCHED -> {Describe(rule.EffectiveDecision)}");
 
@@ -77,7 +63,27 @@ public sealed class PolicyEvaluator
                     trail);
             }
 
-            trail?.Add($"rule '{rule.Name}': no match");
+            // A rule that could not be evaluated stops the walk and refuses the
+            // call. Continuing would treat "we do not know" as "the rule does
+            // not apply", which is the same as deleting the rule - and since a
+            // condition is only undecidable because of the argument the caller
+            // supplied, the caller would be choosing which rules to skip. The
+            // verdict is Deny whatever the rule's own decision is: an unchecked
+            // guardrail is a reason to stop, not a reason to proceed.
+            if (outcome.IsIndeterminate)
+            {
+                trail?.Add($"rule '{rule.Name}': UNDECIDABLE ({DescribeMiss(outcome)}) -> deny");
+
+                return new Decision(
+                    Verdict.Deny,
+                    UndecidableMessage(rule, outcome),
+                    rule.Name,
+                    trail);
+            }
+
+            // Naming the condition that failed is what makes --explain worth
+            // running: "no match" tells you nothing when a rule has three of them.
+            trail?.Add($"rule '{rule.Name}': no match ({DescribeMiss(outcome)})");
         }
 
         trail?.Add("no rule matched -> default allow");
@@ -87,18 +93,18 @@ public sealed class PolicyEvaluator
             : Decision.DefaultAllow with { Trail = trail };
     }
 
-    private static bool Matches(PolicyMatch match, ToolCallFacts facts)
-    {
-        // A match with no conditions matches everything. Each condition below is
-        // skipped when unspecified, so conditions combine with AND.
-        if (match.Tool is not null &&
-            !string.Equals(match.Tool, facts.ToolName, StringComparison.Ordinal))
-        {
-            return false;
-        }
+    private static string DescribeMiss(MatchOutcome outcome) =>
+        outcome.Detail is null ? outcome.Condition! : $"{outcome.Condition} {outcome.Detail}";
 
-        return true;
-    }
+    /// <remarks>
+    /// Written for the model, like every other denial: it says what to change
+    /// rather than just that something went wrong, because the one input the
+    /// caller controls here is the size of the argument.
+    /// </remarks>
+    private static string UndecidableMessage(PolicyRule rule, MatchOutcome outcome) =>
+        $"Rule '{rule.Name}' could not be evaluated: the {DescribeMiss(outcome)} condition " +
+        "exceeded its time budget. The call is refused because a guardrail could not be " +
+        "checked. Retry with a substantially smaller argument value.";
 
     /// <remarks>
     /// internal so tests can reach the defensive default arm. Validation rejects

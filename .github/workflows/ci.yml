@@ -24,6 +24,50 @@ permissions:
 # .git/config, where any later step (or dependency) could read it.
 
 jobs:
+  # Linting is its own job rather than a step inside the matrix. It is platform
+  # independent, so running it three times only makes the pipeline slower, and
+  # it covers the Python and shell tooling the .NET build cannot see at all -
+  # scripts/smoke.py is the integration test and scripts/coverage.sh is the
+  # coverage gate, so both are load-bearing CI code and are linted like source.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Restore
+        run: dotnet restore
+
+      # Whitespace, code style and analyzer rules, all driven by .editorconfig,
+      # so the command that decides the outcome here is the one developers
+      # already run locally.
+      - name: Verify C# formatting
+        run: dotnet format --verify-no-changes
+
+      # Pinned version: a linter that changes its mind between runs turns a
+      # green PR red without anyone pushing a commit.
+      - name: Lint Python
+        run: |
+          pipx install ruff==0.16.6
+          ruff check scripts
+          ruff format --check scripts
+
+      - name: Lint shell
+        run: shellcheck scripts/*.sh
+
   build:
     name: build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -49,19 +93,35 @@ jobs:
       - name: Restore
         run: dotnet restore
 
-      - name: Verify formatting
-        # Only once - formatting is platform independent, so running it on all
-        # three would just be slower.
-        if: matrix.os == 'ubuntu-latest'
-        run: dotnet format --verify-no-changes
-
       - name: Build
         # Directory.Build.props sets TreatWarningsAsErrors, so any new warning
         # (including the AOT-compatibility analyzers) fails the build here.
         run: dotnet build --no-restore --configuration Release
 
+      # --logger trx leaves a machine-readable result file behind, so a failure
+      # can be inspected from the artifact instead of by scrolling the log.
+      #
+      # One line on purpose: this matrix includes windows-latest, where `run`
+      # executes in PowerShell and a trailing backslash is not a line
+      # continuation - it parses as a unary operator and fails before dotnet is
+      # ever invoked.
       - name: Test
-        run: dotnet test --no-build --configuration Release --verbosity normal
+        run: >-
+          dotnet test --no-build --configuration Release --verbosity normal
+          --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        # always(), because the results are most useful precisely when the step
+        # above failed.
+        if: always()
+        # actions/upload-artifact v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: "**/TestResults/*.trx"
+          # warn, not error: if the test step died before writing a trx, the
+          # test failure is the story and a second red step only hides it.
+          if-no-files-found: warn
 
   coverage:
     name: coverage gate
@@ -124,3 +184,15 @@ jobs:
         run: |
           python3 scripts/smoke.py \
             src/McpGuardrails.Cli/bin/Release/net10.0/McpGuardrails.Cli
+
+      # Examples are documentation, and documentation rots. Loading each one
+      # through the real loader proves the policy syntax in the README still
+      # parses - a malformed policy is a fatal startup error, so a non-zero exit
+      # here means we shipped an example nobody could use.
+      - name: Validate the example policies
+        run: |
+          BIN=src/McpGuardrails.Cli/bin/Release/net10.0/McpGuardrails.Cli
+          for policy in examples/*.yaml; do
+            echo "checking $policy"
+            GUARDRAILS_POLICY="$policy" "$BIN" list-upstream > /dev/null
+          done

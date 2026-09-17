@@ -99,9 +99,10 @@ public sealed record PolicyRule
 /// The conditions of a rule. All specified conditions must hold (logical AND).
 /// </summary>
 /// <remarks>
-/// Step 5 matches on tool name only. Step 6 adds MCP annotations
-/// (destructiveHint / readOnlyHint) and JSONPath predicates over the arguments;
-/// this type is where they land.
+/// Three kinds of condition, deliberately ordered cheapest-first in
+/// <see cref="RuleMatcher"/>: a tool-name glob, the tool's advertised behaviour
+/// hints, and predicates over the arguments the model supplied. Most rules never
+/// get past the name.
 /// </remarks>
 public sealed record PolicyMatch
 {
@@ -112,10 +113,32 @@ public sealed record PolicyMatch
     /// Tool name to match, as the client sees it (e.g. <c>fs__write_file</c>).
     /// </summary>
     /// <remarks>
-    /// Exact match in step 5; step 6 makes this a glob.
+    /// A glob: <c>*</c> matches any run of characters and <c>?</c> exactly one,
+    /// so <c>fs__*</c> covers a whole server and <c>"*__delete_*"</c> covers a
+    /// verb across every server. A pattern with no wildcard is an exact, ordinal,
+    /// case-sensitive match, so existing policy files keep their meaning.
+    ///
+    /// Quote any pattern that starts with <c>*</c> in the policy file: a bare
+    /// leading <c>*</c> is YAML's alias indicator, so <c>tool: *__delete_*</c> is
+    /// a syntax error rather than a glob.
     /// </remarks>
     [JsonPropertyName("tool")]
     public string? Tool { get; init; }
+
+    /// <summary>Behaviour hints the tool must advertise, if any.</summary>
+    [JsonPropertyName("annotations")]
+    public AnnotationMatch? Annotations { get; init; }
+
+    /// <summary>
+    /// Conditions on the call's arguments; all must hold.
+    /// </summary>
+    /// <remarks>
+    /// Named <c>args</c> in the policy file because that is what the thing is
+    /// called at the call site, and policy files are read far more often than
+    /// this class is.
+    /// </remarks>
+    [JsonPropertyName("args")]
+    public IReadOnlyList<ArgumentPredicate>? Arguments { get; init; }
 
     /// <summary>True when this match specifies no conditions at all.</summary>
     /// <remarks>
@@ -123,7 +146,7 @@ public sealed record PolicyMatch
     /// the bottom of the file), but it is worth being able to detect.
     /// </remarks>
     [JsonIgnore]
-    public bool IsCatchAll => Tool is null;
+    public bool IsCatchAll => Tool is null && Annotations is null && Arguments is null;
 
     internal void Validate(string ruleName)
     {
@@ -132,6 +155,25 @@ public sealed record PolicyMatch
             throw new PolicyException(
                 $"Rule '{ruleName}' has an empty 'tool'. " +
                 "Omit the field entirely to match every tool.");
+        }
+
+        Annotations?.Validate(ruleName);
+
+        if (Arguments is null)
+        {
+            return;
+        }
+
+        if (Arguments.Count == 0)
+        {
+            throw new PolicyException(
+                $"Rule '{ruleName}' has an empty 'args' list. " +
+                "Omit the field entirely to match regardless of arguments.");
+        }
+
+        foreach (var predicate in Arguments)
+        {
+            predicate.Validate(ruleName);
         }
     }
 }
