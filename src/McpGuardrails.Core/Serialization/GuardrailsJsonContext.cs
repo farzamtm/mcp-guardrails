@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Policy;
@@ -50,4 +51,6 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(Verdict))]
 [JsonSerializable(typeof(BudgetPolicy))]
 [JsonSerializable(typeof(BudgetLimits))]
+[JsonSerializable(typeof(ApprovalSettings))]
+[JsonSerializable(typeof(ApprovalMode))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

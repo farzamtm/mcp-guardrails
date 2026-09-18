@@ -33,6 +33,11 @@ SANDBOX = os.environ.get(
     os.path.join(tempfile.gettempdir(), "guardrails-sandbox"),
 ).rstrip("/")
 
+# Sent on the initialize handshake. Only the approval phases handshake at all;
+# everything else drives the proxy without one, which is what the earlier phases
+# have always done.
+PROTOCOL_VERSION = "2025-06-18"
+
 PROBE = f"{SANDBOX}/smoke-probe.txt"
 AUDIT = f"{SANDBOX}/audit.jsonl"
 POLICY_AUDIT = f"{SANDBOX}/audit-policy.jsonl"
@@ -41,6 +46,10 @@ BUDGET_AUDIT = f"{SANDBOX}/audit-budget.jsonl"
 BUDGET_FILE = f"{SANDBOX}/smoke-budget.yaml"
 BUDGET_PROBE = f"{SANDBOX}/smoke-budget-1.txt"
 BUDGET_OVER = f"{SANDBOX}/smoke-budget-2.txt"
+APPROVAL_AUDIT = f"{SANDBOX}/audit-approval.jsonl"
+APPROVAL_FILE = f"{SANDBOX}/smoke-approval.yaml"
+APPROVAL_PROBE = f"{SANDBOX}/smoke-approved.txt"
+APPROVAL_REFUSED = f"{SANDBOX}/smoke-unapproved.txt"
 CONTENT = "written through the guardrails proxy"
 
 # A path the sandbox rules must refuse. Never actually written: the point is
@@ -116,6 +125,24 @@ rules:
       tool: fs__write_*
     decision: allow
     cost: 2
+"""
+
+# Every write goes to a human. The timeout is deliberately tiny: one phase below
+# never answers at all, and CI should not spend five minutes proving it.
+APPROVAL_POLICY = """
+rules:
+  - name: allow-reads
+    match:
+      tool: fs__read_*
+    decision: allow
+
+  - name: approve-writes
+    match:
+      tool: fs__write_*
+    decision: require_approval
+    approval:
+      timeout_s: 2
+      prompt: Allow the agent to write a file in the sandbox?
 """
 
 
@@ -219,6 +246,47 @@ BUDGET_CHECKS: list[tuple[dict, str, object]] = [
 ]
 
 
+# Four sessions, one per answer a human can give - including not being there at
+# all. Each runs against its own proxy process because the answer is fixed for
+# the session.
+APPROVED_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": APPROVAL_PROBE, "content": CONTENT}),
+        "a human approves and the write goes through",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(2, "fs__read_text_file", {"path": APPROVAL_PROBE}),
+        "the approved write really reached the server",
+        lambda r: CONTENT in json.dumps(r.get("content", [])),
+    ),
+]
+
+DECLINED_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
+        "a human declines and the call is refused",
+        lambda r: denied_with(r, "declined it"),
+    ),
+]
+
+TIMEOUT_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
+        "nobody answers and silence is refusal",
+        lambda r: denied_with(r, "nobody answered"),
+    ),
+]
+
+NO_APPROVER_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
+        "a client that cannot ask anyone is refused, and told why",
+        lambda r: denied_with(r, "cannot ask anyone"),
+    ),
+]
+
+
 def main() -> int:
     try:
         os.makedirs(SANDBOX, exist_ok=True)
@@ -236,7 +304,17 @@ def main() -> int:
         print(f"cannot clear probe file {PROBE}: {exc}", file=sys.stderr)
         return 1
 
-    for stale in (AUDIT, POLICY_AUDIT, BUDGET_AUDIT, BUDGET_PROBE, BUDGET_OVER, ESCAPE):
+    for stale in (
+        AUDIT,
+        POLICY_AUDIT,
+        BUDGET_AUDIT,
+        BUDGET_PROBE,
+        BUDGET_OVER,
+        APPROVAL_AUDIT,
+        APPROVAL_PROBE,
+        APPROVAL_REFUSED,
+        ESCAPE,
+    ):
         try:
             os.remove(stale)
         except FileNotFoundError:
@@ -250,6 +328,8 @@ def main() -> int:
             handle.write(POLICY)
         with open(BUDGET_FILE, "w", encoding="utf-8") as handle:
             handle.write(BUDGET_POLICY)
+        with open(APPROVAL_FILE, "w", encoding="utf-8") as handle:
+            handle.write(APPROVAL_POLICY)
     except OSError as exc:
         print(f"cannot write policy {POLICY_FILE}: {exc}", file=sys.stderr)
         return 1
@@ -286,6 +366,37 @@ def main() -> int:
     failures += budget_failures
     failures += check_budget_audit_log()
 
+    # Phase 4: a human in the loop. One session per answer, because the fake
+    # human's answer is fixed for a session - and the last one is not there at
+    # all, which is the case most operators will actually hit.
+    print("\n--- approval ---")
+    approval_env = {
+        "GUARDRAILS_AUDIT": APPROVAL_AUDIT,
+        "GUARDRAILS_POLICY": APPROVAL_FILE,
+    }
+    approval_stderr: list[str] = []
+
+    for checks, answer, handshake in (
+        (APPROVED_CHECKS, "approve", True),
+        (DECLINED_CHECKS, "decline", True),
+        (TIMEOUT_CHECKS, "ignore", True),
+        (NO_APPROVER_CHECKS, "approve", False),
+    ):
+        session_failures, session_stderr = run_session(
+            checks,
+            approval_env,
+            handshake=handshake,
+            elicit=answer,
+        )
+        failures += session_failures
+        approval_stderr += session_stderr
+
+    failures += check_approval_audit_log()
+
+    unapproved = os.path.exists(APPROVAL_REFUSED)
+    print(f"{'FAIL' if unapproved else 'PASS'}  no unapproved write reached the disk")
+    failures += 1 if unapproved else 0
+
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
     print(f"{'FAIL' if escaped else 'PASS'}  denied write never touched the disk")
@@ -297,16 +408,30 @@ def main() -> int:
 
     if failures:
         print("\n--- server stderr (last 30) ---", file=sys.stderr)
-        sys.stderr.writelines((stderr_lines + policy_stderr + budget_stderr)[-30:])
+        sys.stderr.writelines(
+            (stderr_lines + policy_stderr + budget_stderr + approval_stderr)[-30:]
+        )
 
     print("\nFAILED" if failures else "\nALL OK")
     return 1 if failures else 0
 
 
 def run_session(
-    checks: list[tuple[dict, str, object]], extra_env: dict[str, str]
+    checks: list[tuple[dict, str, object]],
+    extra_env: dict[str, str],
+    *,
+    handshake: bool = False,
+    elicit: str = "approve",
 ) -> tuple[int, list[str]]:
-    """Drive one proxy process through a list of checks."""
+    """Drive one proxy process through a list of checks.
+
+    handshake sends initialize declaring the elicitation capability, which is
+    what makes the proxy willing to ask this client for approval. Without it the
+    proxy has nobody to ask, which is itself a case worth testing.
+
+    elicit decides how this fake human answers: approve, decline, or ignore (say
+    nothing at all and let the approval time out).
+    """
     proc = subprocess.Popen(
         [BIN],
         stdin=subprocess.PIPE,
@@ -329,16 +454,37 @@ def run_session(
     threading.Thread(target=lambda: stderr_lines.extend(stderr), daemon=True).start()
 
     failures = 0
-    try:
-        for req, label, predicate in checks:
-            stdin.write(json.dumps(req) + "\n")
-            stdin.flush()
 
+    def send(message: dict) -> None:
+        stdin.write(json.dumps(message) + "\n")
+        stdin.flush()
+
+    def answer_elicitation(message: dict) -> None:
+        """Play the human at the client."""
+        if elicit == "ignore":
+            # Say nothing at all. The proxy's own deadline has to be what ends
+            # the wait, which is the only way to test it honestly.
+            return
+
+        result = (
+            {"action": "accept", "content": {"approve": True}}
+            if elicit == "approve"
+            else {"action": "decline"}
+        )
+        send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    def read_reply(rid: int, label: str) -> dict | None:
+        """Read until the reply to rid arrives, serving requests met on the way.
+
+        Approval inverts the usual direction: while the client waits for a tool
+        result, the SERVER asks the client a question. A driver that assumed one
+        line in per line out would deadlock on it.
+        """
+        while True:
             line = stdout.readline()
             if not line:
                 print(f"FAIL  {label}: stdout closed early")
-                failures += 1
-                break
+                return None
 
             try:
                 msg = json.loads(line)
@@ -346,8 +492,45 @@ def run_session(
                 # Non-JSON on stdout almost always means something logged there
                 # and corrupted the JSON-RPC stream - the classic stdio bug.
                 print(f"FAIL  {label}: non-JSON on stdout ({exc}): {line[:200]}")
-                failures += 1
+                return None
+
+            if msg.get("method") == "elicitation/create":
+                answer_elicitation(msg)
                 continue
+
+            # Any other server-initiated traffic (notifications, requests we do
+            # not implement) is not what we are waiting for.
+            if msg.get("id") != rid:
+                continue
+
+            return msg
+
+    try:
+        if handshake:
+            # Without this the proxy has no client capabilities to inspect, so
+            # it has nobody to ask and every require_approval rule denies.
+            send(
+                request(
+                    0,
+                    "initialize",
+                    {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {"elicitation": {}},
+                        "clientInfo": {"name": "smoke.py", "version": "0"},
+                    },
+                )
+            )
+            if read_reply(0, "initialize") is None:
+                return 1, stderr_lines
+            send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        for req, label, predicate in checks:
+            send(req)
+
+            msg = read_reply(req["id"], label)
+            if msg is None:
+                failures += 1
+                break
 
             result = msg.get("result")
             ok = result is not None and bool(predicate(result))  # type: ignore[operator]
@@ -407,6 +590,53 @@ def check_policy_audit_log() -> int:
     expect(
         all(entry.get("is_error") for entry in denials),
         "denied calls are flagged as errors",
+    )
+
+    return failures
+
+
+def check_approval_audit_log() -> int:
+    """Every answer a human can give must be distinguishable in the log."""
+    try:
+        with open(APPROVAL_AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  approval audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  approval audit log unreadable: {exc}")
+        return 1
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    outcomes = {entry.get("approval") for entry in lines if entry.get("approval")}
+
+    expect(
+        outcomes == {"approved", "declined", "timed_out", "unavailable"},
+        f"audit distinguishes all four approval outcomes (got {sorted(outcomes)})",
+    )
+    # The distinction the verdict alone destroys: an allowed call that a person
+    # actually looked at.
+    expect(
+        any(
+            entry.get("approval") == "approved" and entry.get("decision") == "allow"
+            for entry in lines
+        ),
+        "an approved call is logged as allowed AND as approved",
+    )
+    expect(
+        all(
+            entry.get("decision") == "deny"
+            for entry in lines
+            if entry.get("approval") in {"declined", "timed_out", "unavailable"}
+        ),
+        "every unapproved call is logged as denied",
     )
 
     return failures

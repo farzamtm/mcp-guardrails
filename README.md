@@ -8,12 +8,13 @@ A policy-enforcing proxy that sits between an MCP client (Claude Desktop, an
 agent framework) and the MCP servers it calls, so you can see and control what
 your agent actually does.
 
-> **Status: early.** Steps 0-7 of the build plan are done: the proxy connects to
+> **Status: early.** Steps 0-8 of the build plan are done: the proxy connects to
 > downstream servers, aggregates their tools under a namespace, forwards calls,
 > audits every one of them, can **refuse** them by policy - matching on tool
-> globs, the tool's own MCP annotations, and predicates over the arguments - and
-> enforces a **session budget** with per-rule costs.
-> Approval and result scanning are next.
+> globs, the tool's own MCP annotations, and predicates over the arguments -
+> enforces a **session budget** with per-rule costs, and can **hold a call until
+> a human approves it**.
+> Result scanning and the Streamable HTTP host are next.
 > See [the spec](mcp-guardrails-dotnet-spec.md).
 
 ## What works today
@@ -27,6 +28,8 @@ your agent actually does.
   name globs, MCP annotations and the call's arguments
 - **Caps a session** — a maximum number of calls, or a maximum total cost with
   per-rule weights, refused with a message that tells the agent to stop
+- **Asks a human** — `require_approval` puts the question to the person at the
+  MCP client and waits for an answer, with a configurable deadline
 
 ## Policy
 
@@ -185,6 +188,61 @@ so the counters live in memory and start again with the next session. Daily caps
 need a store that survives process exit; until that ships, a `budgets.daily:`
 block is a **load-time error** rather than a limit that silently enforces
 nothing.
+
+## Approval
+
+Some calls should not be decided in advance. `require_approval` holds the call
+and asks the person at the MCP client:
+
+```yaml
+rules:
+  - name: approve-destructive
+    match:
+      annotations:
+        destructiveHint: true
+    decision: require_approval
+    approval:
+      timeout_s: 300        # how long to wait; default 300
+      on_timeout: deny      # what silence means; default deny
+      prompt: >-
+        This tool can delete data that is not backed up. Approve?
+```
+
+The client shows the prompt, the human answers, and the call either goes
+downstream or comes back refused. Nothing is forwarded while the question is
+open, and an approved call is charged to the budget exactly like a normal one —
+approval runs *before* the budget precisely so a call waiting on a human never
+spends anything.
+
+**Silence is not consent.** The default `on_timeout: deny` exists because the
+usual reason nobody answered is that nobody was looking, which is exactly when a
+destructive call should not run. `on_timeout: allow` is available and is logged
+distinctly — see below.
+
+**A client that cannot ask is a denial, not a bypass.** Approval uses MCP
+elicitation, and not every client implements it. When yours does not, a
+`require_approval` rule refuses the call and says so, rather than quietly
+behaving like `allow`. If that is not what you want, the honest fix is to change
+the rule, not to let the gate fail open.
+
+The audit log keeps the distinction the verdict alone destroys:
+
+```bash
+# Calls a person actually looked at and approved
+jq 'select(.approval == "approved")' ~/.mcp-guardrails/audit.jsonl
+
+# Calls that went through only because nobody answered in time
+jq 'select(.approval == "timed_out" and .decision == "allow")' ~/.mcp-guardrails/audit.jsonl
+```
+
+`approval` is one of `approved`, `declined`, `timed_out`, `unavailable` or
+`failed`.
+
+**Not implemented yet:** `mode: slack` and `mode: webhook` (out-of-band
+approvers) are rejected at load time rather than silently ignored, for the same
+reason `budgets.daily:` is. The Tasks/MRTR path the spec prefers — returning an
+`input_required` task instead of holding the request open — lands behind the same
+`IApprovalChannel` seam.
 
 ## The audit log
 

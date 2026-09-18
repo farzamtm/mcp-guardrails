@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using McpGuardrails.Cli;
+using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Pipeline;
@@ -217,6 +219,7 @@ builder.Services
                     Decision = decision?.Verdict.ToString().ToLowerInvariant(),
                     Rule = decision?.RuleName,
                     DecisionReason = decision?.Reason,
+                    Approval = Describe(decision?.ApprovalResult),
                     DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
@@ -248,12 +251,23 @@ builder.Services
 
             var facts = PolicyFacts.ForCall(toolName, request.Params, tool);
 
-            // Two gates, in this order. The policy decides whether the call is
-            // permitted at all; the budget decides whether there is anything left
-            // to spend on it. Charging happens inside Apply, and only for a call
-            // that was going to be forwarded - a call the policy refused costs
-            // nothing, because nothing was done.
-            var decision = budget.Apply(policy.Evaluate(facts, explain));
+            // Three gates, in this order, and the order is the design.
+            //
+            // The policy decides whether the call is permitted at all. Approval
+            // turns a 'require_approval' verdict into a real answer from a real
+            // human - which can only happen before the budget runs, because a
+            // call waiting on a person has not been forwarded and must not be
+            // charged. Budget then decides whether there is anything left to
+            // spend on the call that is finally going out.
+            var decision = policy.Evaluate(facts, explain);
+
+            decision = await ApprovalGate.ApplyAsync(
+                decision,
+                facts,
+                new ElicitationApprovalChannel(request.Server),
+                cancellationToken);
+
+            decision = budget.Apply(decision);
 
             // Report upward so the audit record carries the verdict.
             GuardrailsCallScope.RecordDecision(decision);
@@ -331,3 +345,17 @@ builder.Services
 await builder.Build().RunAsync();
 
 return 0;
+
+// A local function, so the audit filter above can render the approval outcome
+// without either duplicating the mapping or exposing a wire format from Core.
+// snake_case to match every other value in the log, so `jq 'select(.approval ==
+// "timed_out")'` reads the way an operator expects.
+static string? Describe(ApprovalOutcome? outcome) => outcome switch
+{
+    ApprovalOutcome.Approved => "approved",
+    ApprovalOutcome.Declined => "declined",
+    ApprovalOutcome.TimedOut => "timed_out",
+    ApprovalOutcome.Unavailable => "unavailable",
+    ApprovalOutcome.Failed => "failed",
+    _ => null,
+};
