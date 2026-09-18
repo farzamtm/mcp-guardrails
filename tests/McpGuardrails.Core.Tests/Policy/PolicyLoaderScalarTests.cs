@@ -51,7 +51,7 @@ public sealed class PolicyLoaderScalarTests : IDisposable
                 decision: deny
             """);
 
-        Assert.Equal("r", Assert.Single(policy.Rules).Name);
+        Assert.Equal("r", Assert.Single(policy.EffectiveRules).Name);
     }
 
     [Fact]
@@ -71,7 +71,7 @@ public sealed class PolicyLoaderScalarTests : IDisposable
                 decision: deny
             """);
 
-        Assert.Single(policy.Rules);
+        Assert.Single(policy.EffectiveRules);
     }
 
     [Fact]
@@ -150,7 +150,7 @@ public sealed class PolicyLoaderScalarTests : IDisposable
                 decision: deny
             """);
 
-        Assert.Single(policy.Rules);
+        Assert.Single(policy.EffectiveRules);
     }
 }
 

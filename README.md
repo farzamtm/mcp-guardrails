@@ -8,11 +8,12 @@ A policy-enforcing proxy that sits between an MCP client (Claude Desktop, an
 agent framework) and the MCP servers it calls, so you can see and control what
 your agent actually does.
 
-> **Status: early.** Steps 0-6 of the build plan are done: the proxy connects to
+> **Status: early.** Steps 0-7 of the build plan are done: the proxy connects to
 > downstream servers, aggregates their tools under a namespace, forwards calls,
-> audits every one of them, and can **refuse** them by policy - matching on tool
-> globs, the tool's own MCP annotations, and predicates over the arguments.
-> Budgets, approval and result scanning are next.
+> audits every one of them, can **refuse** them by policy - matching on tool
+> globs, the tool's own MCP annotations, and predicates over the arguments - and
+> enforces a **session budget** with per-rule costs.
+> Approval and result scanning are next.
 > See [the spec](mcp-guardrails-dotnet-spec.md).
 
 ## What works today
@@ -24,6 +25,8 @@ your agent actually does.
 - **Audits every call** to a JSONL log, including calls the proxy rejects
 - **Enforces a YAML policy** — allow or deny, first match wins, matching on tool
   name globs, MCP annotations and the call's arguments
+- **Caps a session** — a maximum number of calls, or a maximum total cost with
+  per-rule weights, refused with a message that tells the agent to stop
 
 ## Policy
 
@@ -120,6 +123,68 @@ could trigger: the model chooses the argument, so it could pad a value until the
 rule gave up and the call fell through to default-allow. A denial of this kind
 names the rule in both the refusal and the audit log, so it is visible rather
 than silent.
+
+## Budgets
+
+A policy answers *may this call happen?*. A budget answers *how many times?* —
+because the expensive agent is rarely the one making a call it should not make,
+it is the one making a permitted call four thousand times in a loop.
+
+```yaml
+budgets:
+  session:
+    max_calls: 200      # chattiness
+    max_cost: 50        # damage
+
+rules:
+  - name: reads-are-free
+    match:
+      annotations:
+        readOnlyHint: true
+    decision: allow
+    cost: 0
+
+  - name: expensive-export
+    match:
+      tool: ct__export_*
+    decision: allow
+    cost: 25
+```
+
+The agent sees:
+
+```text
+Blocked by guardrails budget 'session.max_cost': this call costs 25 and the
+session has already spent 40 of its 50 budget. Stop calling tools and tell the
+user the budget is exhausted; only they can raise 'budgets.session.max_cost' or
+start a new session.
+```
+
+That wording is deliberate, and it is the opposite of a policy denial. "Choose a
+different approach" is right when one tool is forbidden and wrong when the
+session is out of money, where every approach fails and a retrying agent only
+burns the user's time.
+
+**Cost lives on the rule** that matched, because a rule already says *which
+calls* precisely — tool glob, annotations, arguments. Omitted means `1`, so a
+budget is meaningful before anyone writes a single `cost:`. `cost: 0` makes a
+class of calls free to spend but not free to make: they still count against
+`max_calls`, or a free tool would be an unbounded loop.
+
+What gets charged, and when:
+
+- A call the **policy refused** costs nothing. It never reached a server.
+- A call **awaiting approval** costs nothing yet, for the same reason.
+- A call that was **forwarded** is charged even if the server then failed.
+  Refunding failures would let a broken tool be retried without limit.
+- Refusals are **audited like any other denial**, with `rule` naming the cap
+  (`session.max_cost`) rather than a policy rule.
+
+**`session` means this process.** An stdio proxy is spawned per client session,
+so the counters live in memory and start again with the next session. Daily caps
+need a store that survives process exit; until that ships, a `budgets.daily:`
+block is a **load-time error** rather than a limit that silently enforces
+nothing.
 
 ## The audit log
 

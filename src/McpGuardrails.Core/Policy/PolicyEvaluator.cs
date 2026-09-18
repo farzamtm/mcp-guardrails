@@ -16,7 +16,7 @@ public sealed class PolicyEvaluator
     {
         ArgumentNullException.ThrowIfNull(policy);
 
-        foreach (var rule in policy.Rules)
+        foreach (var rule in policy.EffectiveRules)
         {
             rule.Validate();
         }
@@ -44,7 +44,7 @@ public sealed class PolicyEvaluator
         // not allocate at all.
         List<string>? trail = explain ? [] : null;
 
-        foreach (var rule in _policy.Rules)
+        foreach (var rule in _policy.EffectiveRules)
         {
             // EffectiveMatch / EffectiveDecision, never the raw nullable
             // properties: an omitted `decision:` must mean Deny, and reading
@@ -60,7 +60,13 @@ public sealed class PolicyEvaluator
                     rule.EffectiveDecision,
                     rule.Message ?? DefaultMessage(rule),
                     rule.Name,
-                    trail);
+                    trail)
+                {
+                    // The matched rule prices the call. Carried on the decision
+                    // so the budget gate never has to re-run the matcher to find
+                    // out what the policy already worked out.
+                    Cost = rule.EffectiveCost,
+                };
             }
 
             // A rule that could not be evaluated stops the walk and refuses the
