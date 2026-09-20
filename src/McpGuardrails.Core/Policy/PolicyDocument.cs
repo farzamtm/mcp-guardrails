@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Budget;
 
 namespace McpGuardrails.Core.Policy;
@@ -118,6 +119,14 @@ public sealed record PolicyRule
     [JsonIgnore]
     public long EffectiveCost => Cost ?? DefaultCost;
 
+    /// <summary>How to ask for approval, on a <c>require_approval</c> rule.</summary>
+    /// <remarks>
+    /// Optional: a bare <c>decision: require_approval</c> asks the client and
+    /// waits five minutes, which is the sensible default for the common case.
+    /// </remarks>
+    [JsonPropertyName("approval")]
+    public ApprovalSettings? Approval { get; init; }
+
     /// <summary>
     /// Explanation handed to the model when this rule blocks a call.
     /// </summary>
@@ -151,6 +160,19 @@ public sealed record PolicyRule
                 $"Rule '{Name}' has a negative 'cost' ({EffectiveCost}). " +
                 "Use 0 to make matching calls free.");
         }
+
+        // An approval block on an allow or deny rule looks like a gate and is
+        // not one. Refusing it costs an operator one startup error; accepting it
+        // costs them a destructive call they believed was being reviewed.
+        if (Approval is not null && EffectiveDecision is not Verdict.RequireApproval)
+        {
+            throw new PolicyException(
+                $"Rule '{Name}' has an 'approval' block but its decision is " +
+                $"'{PolicyEvaluator.Describe(EffectiveDecision)}', so nobody would ever be " +
+                "asked. Use 'decision: require_approval', or remove the block.");
+        }
+
+        Approval?.Validate(Name);
 
         EffectiveMatch.Validate(Name);
     }

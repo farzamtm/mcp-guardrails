@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using McpGuardrails.Core.Approval;
 
 namespace McpGuardrails.Core.Policy;
 
@@ -43,6 +44,9 @@ public enum DecisionSource
 
     /// <summary>A spend or call cap.</summary>
     Budget,
+
+    /// <summary>A human, or the absence of one.</summary>
+    Approval,
 }
 
 /// <summary>
@@ -93,6 +97,26 @@ public sealed record Decision(
     /// <summary>Which guardrail decided this.</summary>
     public DecisionSource Source { get; init; } = DecisionSource.Policy;
 
+    /// <summary>
+    /// How to ask for approval, when the verdict is <see cref="Verdict.RequireApproval"/>.
+    /// </summary>
+    /// <remarks>
+    /// Carried from the matched rule for the same reason as <see cref="Cost"/>:
+    /// the rule knows, and the gate that needs it runs later. Null on any other
+    /// verdict, and on a require_approval rule that configured nothing.
+    /// </remarks>
+    public ApprovalSettings? Approval { get; init; }
+
+    /// <summary>
+    /// What the human said, once one has been asked.
+    /// </summary>
+    /// <remarks>
+    /// Recorded rather than inferred from the verdict, because "allowed" and
+    /// "allowed because nobody answered and the rule permits that" are very
+    /// different lines to find in an audit log six weeks later.
+    /// </remarks>
+    public ApprovalOutcome? ApprovalResult { get; init; }
+
     /// <summary>True when the call must not be forwarded as-is.</summary>
     public bool IsBlocked => Verdict is Verdict.Deny or Verdict.RequireApproval;
 
@@ -108,6 +132,8 @@ public sealed record Decision(
     public string ToModelMessage() => (Source, RuleName) switch
     {
         (DecisionSource.Budget, { } limit) => $"Blocked by guardrails budget '{limit}': {Reason}",
+        (DecisionSource.Approval, { } rule) =>
+            $"Blocked by guardrails approval for rule '{rule}': {Reason}",
         (_, { } rule) => $"Blocked by guardrails policy rule '{rule}': {Reason}",
         _ => $"Blocked by guardrails policy: {Reason}",
     };

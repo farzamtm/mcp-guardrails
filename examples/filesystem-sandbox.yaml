@@ -83,6 +83,26 @@ rules:
       Writes must target a path under /tmp/guardrails-sandbox/. Write your file
       there, or show the user the change instead of applying it.
 
+  # Moving a file is not obviously safe and not obviously fatal, which is the
+  # shape of decision a human should make rather than a policy file. The call
+  # waits while the MCP client asks; nothing is forwarded meanwhile, and an
+  # approved call is charged to the budget like any other.
+  #
+  # This needs a client that supports elicitation. One that does not gets a
+  # clear refusal, not a silent allow - see the README's approval section.
+  - name: approve-moves
+    match:
+      tool: fs__move_*
+    decision: require_approval
+    cost: 5
+    approval:
+      timeout_s: 120
+      # Silence is not consent: the usual reason nobody answered is that nobody
+      # was looking, which is when a move should least of all happen unattended.
+      on_timeout: deny
+      prompt: >-
+        The agent wants to move or rename a file in the sandbox. Approve?
+
   # The safety net underneath the named rules: anything the downstream server
   # flags as destructive, including every tool that declares no annotations at
   # all, because the MCP default for destructiveHint is true. This is what

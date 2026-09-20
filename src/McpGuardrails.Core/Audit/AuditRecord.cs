@@ -67,6 +67,16 @@ public sealed record AuditRecord
     [JsonPropertyName("decision_reason")]
     public string? DecisionReason { get; init; }
 
+    /// <summary>What the human said, when one was asked: approved, declined, timed_out…</summary>
+    /// <remarks>
+    /// Separate from <see cref="Decision"/> because the verdict alone loses the
+    /// part an auditor cares about. "allow" covers both "a person looked at this
+    /// and said yes" and "nobody answered and the rule let it through", and those
+    /// are not the same event.
+    /// </remarks>
+    [JsonPropertyName("approval")]
+    public string? Approval { get; init; }
+
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }
 

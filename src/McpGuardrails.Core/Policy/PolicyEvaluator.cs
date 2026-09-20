@@ -66,6 +66,11 @@ public sealed class PolicyEvaluator
                     // so the budget gate never has to re-run the matcher to find
                     // out what the policy already worked out.
                     Cost = rule.EffectiveCost,
+
+                    // Same reasoning for the approval settings: the rule knows
+                    // who to ask and how long to wait, and the gate that needs
+                    // that runs after evaluation is over.
+                    Approval = rule.Approval,
                 };
             }
 

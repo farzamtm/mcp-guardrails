@@ -1,0 +1,166 @@
+using System.Globalization;
+using McpGuardrails.Core.Policy;
+
+namespace McpGuardrails.Core.Approval;
+
+/// <summary>
+/// Turns a <c>require_approval</c> verdict into a real answer from a real human.
+/// </summary>
+/// <remarks>
+/// Runs between the policy evaluator and the budget gate, and that order is the
+/// whole design: a call waiting on a human has not been forwarded, so it must not
+/// spend budget, and an approved call must be charged before it goes out. Budget
+/// already refuses to charge anything blocked, so approving a call here is what
+/// makes it billable.
+///
+/// The gate owns the deadline rather than the channel, so every approver - the
+/// client today, Slack later - inherits the same semantics for "nobody answered".
+/// </remarks>
+public static class ApprovalGate
+{
+    /// <summary>
+    /// Asks, waits, and converts the answer into a decision.
+    /// </summary>
+    /// <param name="decision">The policy's verdict; returned untouched unless it asks for approval.</param>
+    /// <param name="facts">The call being approved, for the generated question.</param>
+    /// <param name="channel">Where to ask.</param>
+    /// <param name="cancellationToken">The client's own cancellation, not the approval deadline.</param>
+    public static async ValueTask<Decision> ApplyAsync(
+        Decision decision,
+        ToolCallFacts facts,
+        IApprovalChannel channel,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(decision);
+        ArgumentNullException.ThrowIfNull(facts);
+        ArgumentNullException.ThrowIfNull(channel);
+
+        if (decision.Verdict is not Verdict.RequireApproval)
+        {
+            return decision;
+        }
+
+        var settings = decision.Approval ?? ApprovalSettings.Default;
+        var outcome = await AskAsync(decision, facts, settings, channel, cancellationToken);
+
+        return Resolve(decision, settings, outcome);
+    }
+
+    private static async ValueTask<ApprovalOutcome> AskAsync(
+        Decision decision,
+        ToolCallFacts facts,
+        ApprovalSettings settings,
+        IApprovalChannel channel,
+        CancellationToken cancellationToken)
+    {
+        // Linked, so the client hanging up cancels the question too - there is no
+        // point holding a prompt open for a session that has gone away.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(settings.EffectiveTimeout);
+
+        var request = new ApprovalRequest(
+            facts.ToolName,
+            decision.RuleName ?? "(unnamed rule)",
+            settings.Prompt ?? Question(decision, facts));
+
+        try
+        {
+            return await channel.RequestAsync(request, deadline.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Our deadline fired, not the caller's cancellation. The distinction
+            // matters: one is a policy outcome the operator configured, the other
+            // is the client abandoning the call, and only the first is ours to
+            // answer.
+            return ApprovalOutcome.TimedOut;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A channel that throws is a broken channel, and a broken guardrail
+            // is a reason to stop rather than a reason to proceed. Swallowed here
+            // so the failure becomes a denial the model can read instead of an
+            // exception surfacing as a transport error.
+            return ApprovalOutcome.Failed;
+        }
+    }
+
+    private static Decision Resolve(
+        Decision decision,
+        ApprovalSettings settings,
+        ApprovalOutcome outcome)
+    {
+        var seconds = settings.EffectiveTimeout.TotalSeconds.ToString(
+            "0.#",
+            CultureInfo.InvariantCulture);
+
+        return outcome switch
+        {
+            ApprovalOutcome.Approved => Approved(decision, outcome),
+
+            ApprovalOutcome.Declined => Refuse(
+                decision,
+                outcome,
+                "a human reviewed this call and declined it. Do not retry and do not work " +
+                "around it; tell the user what you were trying to do and ask how they would " +
+                "like to proceed."),
+
+            ApprovalOutcome.TimedOut when settings.EffectiveOnTimeout is Verdict.Allow =>
+                Approved(decision, outcome),
+
+            ApprovalOutcome.TimedOut => Refuse(
+                decision,
+                outcome,
+                $"nobody answered the approval request within {seconds}s, and this rule " +
+                "treats silence as refusal. Tell the user the call is waiting on their " +
+                "approval rather than retrying."),
+
+            ApprovalOutcome.Unavailable => Refuse(
+                decision,
+                outcome,
+                "this call needs human approval and your MCP client cannot ask anyone - it " +
+                "does not support elicitation. Nothing you can do will change that; tell the " +
+                "user, who can approve the action themselves or adjust the policy."),
+
+            _ => Refuse(
+                decision,
+                outcome,
+                "the approval request could not be delivered, so the call is refused. Tell " +
+                "the user that the approval channel is broken."),
+        };
+    }
+
+    /// <remarks>
+    /// Keeps the rule's name and cost. The call is now an ordinary allowed call -
+    /// it gets charged to the budget like any other - and the audit line still
+    /// says which rule sent it to a human.
+    /// </remarks>
+    private static Decision Approved(Decision decision, ApprovalOutcome outcome) => decision with
+    {
+        Verdict = Verdict.Allow,
+        Reason = outcome is ApprovalOutcome.TimedOut
+            ? $"Approved by default: rule '{decision.RuleName}' allows the call when the " +
+              "approval request goes unanswered."
+            : $"Approved by a human for rule '{decision.RuleName}'.",
+        ApprovalResult = outcome,
+    };
+
+    private static Decision Refuse(Decision decision, ApprovalOutcome outcome, string reason) =>
+        decision with
+        {
+            Verdict = Verdict.Deny,
+            Reason = reason,
+            Source = DecisionSource.Approval,
+            ApprovalResult = outcome,
+        };
+
+    /// <remarks>
+    /// What the human reads when the rule does not supply its own prompt. It
+    /// names the tool and the rule because those are the two facts an approver
+    /// cannot get anywhere else in that moment - the client shows them a dialog,
+    /// not the policy file.
+    /// </remarks>
+    private static string Question(Decision decision, ToolCallFacts facts) =>
+        $"Allow the agent to call '{facts.ToolName}'? " +
+        $"Guardrails rule '{decision.RuleName}' requires your approval.";
+}
