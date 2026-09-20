@@ -28,6 +28,22 @@ budgets:
     max_calls: 500
     max_cost: 100
 
+# What to do with what comes BACK. Everything else in this file inspects the
+# call going out; a file's CONTENT is the one thing no rule above can predict.
+#
+# This section is here to be read, not because it changes anything: annotate is
+# the default, so deleting it leaves the behaviour identical. A proxy with no
+# policy file at all still scans - a guardrail that has to be switched on
+# protects nobody, and annotating cannot break a call.
+#
+# 'block' withholds a matching result entirely and returns a tool error. That
+# suits a server whose output should be structured data; it is risky for one
+# returning prose, because these are heuristics and they do misfire.
+# 'off' disables scanning, which is an honest choice to make deliberately.
+scanners:
+  injection:
+    action: annotate
+
 rules:
   # A glob, so every read tool the server has (or gains later) is covered
   # without listing them. '*' matches any run of characters, '?' exactly one.

@@ -4,6 +4,7 @@ using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
 
 namespace McpGuardrails.Core.Serialization;
 
@@ -38,6 +39,7 @@ namespace McpGuardrails.Core.Serialization;
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(AuditRecord))]
 [JsonSerializable(typeof(IReadOnlyDictionary<string, JsonElement>))]
+[JsonSerializable(typeof(IReadOnlyList<string>))]
 // Policy types are deserialized from the YAML-derived JsonNode tree. Registering
 // them here is what keeps policy loading working under Native AOT; without it,
 // trimming would leave the binder unable to see these properties and every rule
@@ -53,4 +55,7 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(BudgetLimits))]
 [JsonSerializable(typeof(ApprovalSettings))]
 [JsonSerializable(typeof(ApprovalMode))]
+[JsonSerializable(typeof(ScannerPolicy))]
+[JsonSerializable(typeof(ScannerSettings))]
+[JsonSerializable(typeof(ScanAction))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

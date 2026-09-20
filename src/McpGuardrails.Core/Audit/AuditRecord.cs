@@ -44,9 +44,9 @@ public sealed record AuditRecord
     /// Arguments the client supplied.
     /// </summary>
     /// <remarks>
-    /// Logged verbatim today. Step 9 adds secret/PII redaction, and this is the
-    /// field it has to scrub - an audit log that quietly records API keys is a
-    /// liability rather than a safety feature.
+    /// Logged verbatim today. Secret/PII redaction is the next piece of work and
+    /// this is the field it has to scrub - an audit log that quietly records API
+    /// keys is a liability rather than a safety feature.
     /// </remarks>
     [JsonPropertyName("arguments")]
     public IReadOnlyDictionary<string, JsonElement>? Arguments { get; init; }
@@ -76,6 +76,25 @@ public sealed record AuditRecord
     /// </remarks>
     [JsonPropertyName("approval")]
     public string? Approval { get; init; }
+
+    /// <summary>
+    /// Heuristics the result scanner matched, when the call returned something.
+    /// </summary>
+    /// <remarks>
+    /// Absent means one of two things and the difference is visible from the rest
+    /// of the line: a refused call never produced a result to scan, and a
+    /// forwarded call that says nothing here came back clean.
+    ///
+    /// Names only, never the matched text. The evidence is attacker-controlled
+    /// content, and a log somebody greps - or pipes into another model - is not
+    /// where it should be replayed.
+    /// </remarks>
+    [JsonPropertyName("scanner_hits")]
+    public IReadOnlyList<string>? ScannerHits { get; init; }
+
+    /// <summary>What the proxy did about them: annotated or blocked.</summary>
+    [JsonPropertyName("scanner_action")]
+    public string? ScannerAction { get; init; }
 
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }

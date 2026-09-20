@@ -5,6 +5,7 @@ using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -96,11 +97,16 @@ var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
 
 PolicyEvaluator policy;
 BudgetGate budget;
+InjectionGate scanner;
 try
 {
     var document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
 
     policy = new PolicyEvaluator(document);
+
+    // On by default, including with no policy file at all: a result scanner that
+    // has to be switched on protects nobody, and annotating cannot break a call.
+    scanner = new InjectionGate(document.EffectiveScanners.EffectiveInjection);
 
     // No `budgets:` section means an unlimited gate rather than no gate: the
     // call path is then the same whether or not anyone configured a cap, so the
@@ -220,6 +226,13 @@ builder.Services
                     Rule = decision?.RuleName,
                     DecisionReason = decision?.Reason,
                     Approval = Describe(decision?.ApprovalResult),
+                    // Null unless something matched, so a clean result stays one
+                    // narrow line and `jq 'select(.scanner_hits)'` is the whole
+                    // query for "show me what the scanner caught".
+                    ScannerHits = scope.Scan is { Effect: not ScanEffect.None } scan
+                        ? scan.Heuristics
+                        : null,
+                    ScannerAction = scope.Scan?.Describe(),
                     DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
@@ -293,6 +306,28 @@ builder.Services
                 IsError = true,
                 Content = [new TextContentBlock { Text = text }],
             };
+        });
+
+        // -------------------------------------------------------------------
+        // RESULT SCANNER - registered last, so it is the INNERMOST layer.
+        //
+        // Everything above this point guards the way in. This one is the first
+        // guardrail that runs on the way back, and innermost is the only correct
+        // position for it: it must see what a downstream server actually
+        // returned, and must not see the refusals the gates above it produce -
+        // those are the proxy's own words, addressed to the model.
+        // -------------------------------------------------------------------
+        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
+        {
+            var result = await next(request, cancellationToken);
+
+            var outcome = scanner.Inspect(result, request.Params?.Name ?? UnnamedTool);
+
+            // Report upward so the audit record carries the finding, exactly as
+            // the policy filter reports its decision.
+            GuardrailsCallScope.RecordScan(outcome);
+
+            return outcome.Result;
         });
     })
     .WithStdioServerTransport()
