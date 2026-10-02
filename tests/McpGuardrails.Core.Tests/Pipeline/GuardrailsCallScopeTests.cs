@@ -1,5 +1,7 @@
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
+using ModelContextProtocol.Protocol;
 
 namespace McpGuardrails.Core.Tests.Pipeline;
 
@@ -11,6 +13,11 @@ public sealed class GuardrailsCallScopeTests
 {
     private static Decision SomeDecision(string rule = "r") =>
         new(Verdict.Deny, "because", rule);
+
+    private static ScanOutcome SomeScan(params string[] heuristics) => new(
+        new CallToolResult(),
+        new InjectionReport(heuristics),
+        ScanEffect.Annotated);
 
     [Fact]
     public void NoScope_MeansNoCurrent()
@@ -61,6 +68,42 @@ public sealed class GuardrailsCallScopeTests
         using var scope = GuardrailsCallScope.Begin();
 
         Assert.Null(scope.Decision);
+    }
+
+    // --------------------------------------------------------- result scanning
+
+    [Fact]
+    public void RecordScan_IsVisibleOnTheScope()
+    {
+        using var scope = GuardrailsCallScope.Begin();
+
+        GuardrailsCallScope.RecordScan(SomeScan(InjectionScanner.RoleHijack));
+
+        Assert.Equal([InjectionScanner.RoleHijack], scope.Scan?.Heuristics);
+    }
+
+    [Fact]
+    public void RecordScan_WithoutAScope_IsANoOp()
+    {
+        GuardrailsCallScope.RecordScan(SomeScan());
+
+        Assert.Null(GuardrailsCallScope.Current);
+    }
+
+    [Fact]
+    public void RecordScan_RejectsNull()
+    {
+        Assert.Throws<ArgumentNullException>(() => GuardrailsCallScope.RecordScan(null!));
+    }
+
+    [Fact]
+    public void ScanIsNullOnACallThatNeverReturnedAResult()
+    {
+        // The distinction the audit log depends on: no scanner field means
+        // nothing came back to scan, not that what came back was clean.
+        using var scope = GuardrailsCallScope.Begin();
+
+        Assert.Null(scope.Scan);
     }
 
     /// <summary>

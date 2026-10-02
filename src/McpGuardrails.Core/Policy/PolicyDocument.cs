@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Budget;
+using McpGuardrails.Core.Scanners;
 
 namespace McpGuardrails.Core.Policy;
 
@@ -47,6 +48,24 @@ public sealed record PolicyDocument
     /// <summary>The budget section, or an empty one when the file omits it.</summary>
     [JsonIgnore]
     public BudgetPolicy EffectiveBudgets => Budgets ?? BudgetPolicy.None;
+
+    /// <summary>
+    /// What to do with suspicious tool results, or null when the file says nothing.
+    /// </summary>
+    /// <remarks>
+    /// Note the asymmetry with <see cref="Budgets"/>: an omitted budget section
+    /// means no cap, but an omitted scanner section means the default scanner,
+    /// which is ON. A cap nobody configured would be a number invented on the
+    /// operator's behalf; a scanner nobody configured only adds a warning to
+    /// content that already looks like an attack. Read it through
+    /// <see cref="EffectiveScanners"/>.
+    /// </remarks>
+    [JsonPropertyName("scanners")]
+    public ScannerPolicy? Scanners { get; init; }
+
+    /// <summary>The scanner section, or the defaults when the file omits it.</summary>
+    [JsonIgnore]
+    public ScannerPolicy EffectiveScanners => Scanners ?? ScannerPolicy.Default;
 
     /// <summary>An empty policy: everything allowed, nothing configured.</summary>
     public static PolicyDocument Empty { get; } = new();
