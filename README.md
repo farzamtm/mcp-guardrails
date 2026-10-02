@@ -31,6 +31,82 @@ your agent actually does.
 - **Asks a human** — `require_approval` puts the question to the person at the
   MCP client and waits for an answer, with a configurable deadline
 
+## Install
+
+The same program ships three ways. Pick by what is already on the machine.
+
+The downstream servers are still the hardcoded filesystem server started with
+`npx` (configurable upstreams are on the roadmap), so wherever the proxy runs
+needs **Node.js** on `PATH` too.
+
+### Native binary — nothing else to install
+
+Each [GitHub Release](https://github.com/farzamtm/mcp-guardrails/releases)
+carries a self-contained Native AOT executable for `linux-x64`, `linux-arm64`,
+`osx-arm64` and `win-x64`, plus a `SHA256SUMS` file. No .NET runtime needed, and
+startup is fast enough not to matter when a client spawns one proxy per session.
+
+```bash
+VERSION=0.1.0 RID=osx-arm64
+curl -LO "https://github.com/farzamtm/mcp-guardrails/releases/download/v$VERSION/mcp-guardrails-$VERSION-$RID.tar.gz"
+curl -LO "https://github.com/farzamtm/mcp-guardrails/releases/download/v$VERSION/SHA256SUMS"
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf "mcp-guardrails-$VERSION-$RID.tar.gz"
+./mcp-guardrails-$VERSION-$RID/mcp-guardrails list-upstream
+```
+
+The binaries are not code-signed yet, so macOS Gatekeeper will refuse a
+downloaded one until you clear the quarantine flag:
+`xattr -d com.apple.quarantine mcp-guardrails`. Windows gets a `.zip` with
+`mcp-guardrails.exe`.
+
+Building one yourself is a single command; naming a runtime is what switches
+the build to Native AOT:
+
+```bash
+dotnet publish src/McpGuardrails.Cli -c Release -r osx-arm64 -o out
+```
+
+### `dotnet tool` — if you already have the .NET 10 SDK
+
+```bash
+dotnet tool install -g McpGuardrails
+mcp-guardrails list-upstream
+```
+
+The tool package is portable IL rather than a native binary (a tool package has
+to run on every platform), so it needs the .NET 10 runtime. Until the package is
+on nuget.org, install the `.nupkg` attached to a release build from a folder:
+`dotnet tool install -g McpGuardrails --add-source ./folder-with-nupkg`.
+
+### Docker
+
+```bash
+docker build -t mcp-guardrails .
+```
+
+The image is a Native AOT build on Microsoft's chiseled `runtime-deps` base — no
+shell, no package manager, running as a non-root user (uid 1654) — so it
+contains the proxy and nothing else. The downstream servers it spawns have to
+live in the same container, so build on top of it rather than running it bare
+(bare, it exits at startup because there is no `npx` to spawn):
+
+```dockerfile
+FROM mcp-guardrails AS guardrails
+
+FROM node:22-bookworm-slim
+COPY --from=guardrails /usr/local/bin/mcp-guardrails /usr/local/bin/mcp-guardrails
+USER node
+ENTRYPOINT ["/usr/local/bin/mcp-guardrails"]
+```
+
+```bash
+docker build -t my-guardrails -f Dockerfile.mine .
+docker run -i --rm my-guardrails list-upstream
+```
+
+`-i` matters: stdio is the transport, so stdin has to stay open.
+
 ## Policy
 
 Point `GUARDRAILS_POLICY` at a YAML file. No file means pure passthrough.
@@ -328,6 +404,8 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | `scripts/smoke.py` | Dependency-free MCP driver for end-to-end checks |
 | `scripts/coverage.sh` | Coverage run + threshold gate, same in CI and locally |
 | `ruff.toml` | Lint settings for the Python tooling |
+| `Dockerfile` | Native AOT image on a chiseled, non-root base |
+| `.github/workflows/release.yml` | On a version tag: AOT binaries per platform, tool package, draft release |
 
 ## Testing
 
