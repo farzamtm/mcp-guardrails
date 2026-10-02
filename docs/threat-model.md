@@ -361,9 +361,12 @@ Resources and prompts are not proxied at all.
   restarting the client resets the session counters. Daily caps persist in a
   SQLite file (`GUARDRAILS_BUDGET_DB`) shared by every proxy pointed at it, so
   anyone who can write that file can reset or inflate the daily spend.
-- **A call to an unknown tool is charged.** If policy allows it, the budget
-  charges it before the call handler finds no such tool. Harmless, but not quite
-  "only forwarded calls cost".
+- **A call to an unknown tool is free, so the budget does not bound it.** Only
+  calls that can be forwarded are charged; a name no downstream server owns ends
+  at the proxy's "unknown tool" error. An agent looping on a bad name is
+  therefore not stopped by the budget — harmless downstream, since nothing is
+  forwarded, but every such call is still evaluated by policy and written to
+  the audit log, so a runaway loop shows up there (and grows it).
 - **`--explain` shows the model your policy.** The decision trail names every
   rule considered and the condition that failed — exactly what an injected model
   would want in order to find the call that gets through. Use it to debug, not

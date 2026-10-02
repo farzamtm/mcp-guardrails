@@ -103,11 +103,19 @@ public sealed class BudgetGate
     /// <summary>
     /// Applies the budget to a decision the policy already made.
     /// </summary>
+    /// <param name="decision">What policy, scanning and approval decided.</param>
+    /// <param name="toolResolved">
+    /// Whether the tool name resolved to a downstream server. False means the
+    /// call handler is going to answer "unknown tool" without forwarding
+    /// anything, so the call is not charged. Defaults to true, so a caller that
+    /// does not say is charged - the safe direction for a bound.
+    /// </param>
     /// <returns>
     /// The original decision when the call fits the budget (or was already
-    /// blocked), otherwise a denial explaining which cap ran out.
+    /// blocked, or names no known tool), otherwise a denial explaining which cap
+    /// ran out.
     /// </returns>
-    public Decision Apply(Decision decision)
+    public Decision Apply(Decision decision, bool toolResolved = true)
     {
         ArgumentNullException.ThrowIfNull(decision);
 
@@ -116,6 +124,19 @@ public sealed class BudgetGate
         // free" a property of the gate instead of a convention callers have to
         // remember.
         if (decision.IsBlocked)
+        {
+            return decision;
+        }
+
+        // Same reasoning for a tool no downstream server owns: nothing is
+        // forwarded, so nothing is spent, and the budget measures work done
+        // rather than typos. It does mean an agent looping on an unknown name is
+        // not stopped by the budget. That is acceptable: every such call ends at
+        // the proxy's own "unknown tool" error without touching a downstream
+        // system, and it is still evaluated by policy and written to the audit
+        // log. Skipped rather than charged and refunded, so a concurrent call can
+        // never be refused for budget that was only spent for a moment.
+        if (!toolResolved)
         {
             return decision;
         }

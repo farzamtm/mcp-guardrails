@@ -72,6 +72,50 @@ public sealed class BudgetGateTests
         Assert.Equal(2, gate.Store.Calls);
     }
 
+    [Fact]
+    public void ACallToAnUnknownTool_SpendsNothing()
+    {
+        // Policy allowed it, but no downstream server owns the name, so the call
+        // handler answers "unknown tool" and nothing is forwarded.
+        var gate = Gate(maxCalls: 1);
+        var allowed = Allowed(cost: 1);
+
+        for (var i = 0; i < 5; i++)
+        {
+            Assert.Same(allowed, gate.Apply(allowed, toolResolved: false));
+        }
+
+        Assert.Equal((0, 0), (gate.Store.Calls, gate.Store.Cost));
+
+        // The one unit is still there for a call that actually goes out.
+        Assert.Same(allowed, gate.Apply(allowed, toolResolved: true));
+        Assert.Equal(1, gate.Store.Calls);
+    }
+
+    [Fact]
+    public void ACallToAnUnknownTool_IsNotRefusedByAnExhaustedBudget()
+    {
+        // Refusing it as "budget exhausted" would tell the model to stop working
+        // over a call that costs nothing; the call handler's "unknown tool" is
+        // the answer it needs.
+        var gate = Gate(maxCalls: 0);
+        var allowed = Allowed();
+
+        Assert.Same(allowed, gate.Apply(allowed, toolResolved: false));
+    }
+
+    [Fact]
+    public void ACallerThatDoesNotSayWhetherTheToolResolved_IsCharged()
+    {
+        // The default must be the bounded direction: forgetting the argument
+        // costs budget rather than silently making calls free.
+        var gate = Gate(maxCalls: 5);
+
+        gate.Apply(Allowed());
+
+        Assert.Equal(1, gate.Store.Calls);
+    }
+
     // ------------------------------------------------------------- refusals
 
     [Fact]
@@ -244,6 +288,18 @@ public sealed class BudgetGateTests
         Assert.Equal((1, 3), (daily.Calls, daily.Cost));
         Assert.Same(session, gate.Store);
         Assert.Same(daily, gate.DailyStore);
+    }
+
+    [Fact]
+    public void WithBothScopes_ACallToAnUnknownTool_IsChargedToNeither()
+    {
+        var (gate, session, daily) = Both(new BudgetLimits { MaxCalls = 5 }, new BudgetLimits { MaxCalls = 5 });
+
+        var decision = Allowed(cost: 3);
+
+        Assert.Same(decision, gate.Apply(decision, toolResolved: false));
+        Assert.Equal((0, 0), (session.Calls, session.Cost));
+        Assert.Equal((0, 0), (daily.Calls, daily.Cost));
     }
 
     [Fact]
