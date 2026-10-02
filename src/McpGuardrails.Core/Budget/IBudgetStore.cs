@@ -41,10 +41,9 @@ public sealed record BudgetCharge(
 /// Keeps the running totals a budget is enforced against.
 /// </summary>
 /// <remarks>
-/// An interface with one implementation today, which is usually a smell - here it
-/// is the seam the spec asks for. Session counters live in memory; daily counters
-/// need a store that survives process exit (SQLite, per the spec), and that
-/// arrives behind this same interface without the gate or the CLI noticing.
+/// The seam between the gate and where totals live. Session counters live in
+/// memory (<see cref="InMemoryBudgetStore"/>); daily counters must survive
+/// process exit, so they live in a file (<see cref="SqliteBudgetStore"/>).
 ///
 /// Implementations must be safe to call concurrently: nothing serialises tool
 /// calls, so two calls can reach the gate at once, and a budget that can be

@@ -7,11 +7,66 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
+
+    <!-- OpenTelemetry SDK + OTLP exporter, CLI only. Core emits through the
+         BCL's ActivitySource/Meter and never sees these; they are wired up only
+         when the otel flag or OTEL_EXPORTER_OTLP_ENDPOINT asks for them
+         (XML comments cannot contain a double hyphen, hence no flag spelling). -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.19.1" />
   </ItemGroup>
 
   <PropertyGroup>
     <!-- TargetFramework / Nullable / ImplicitUsings come from Directory.Build.props. -->
     <OutputType>Exe</OutputType>
   </PropertyGroup>
+
+  <!--
+    Two ways to ship the same program, and they cannot both be on at once.
+
+    - Native AOT binaries for GitHub Releases and the Docker image: one
+      self-contained executable per platform, no runtime to install, fast
+      startup (stdio servers are spawned once per client session).
+    - A `dotnet tool` package for people who already have the SDK. A tool
+      package is framework-dependent IL that runs on any platform, so it cannot
+      be a native binary.
+
+    The switch is the RuntimeIdentifier: `dotnet publish -r linux-x64` names a
+    platform, so it gets AOT; `dotnet pack` and `dotnet build` name none, so they
+    get the portable tool. Keying AOT on the RID rather than on a custom property
+    means nobody has to remember an extra flag to get the right artefact.
+  -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <PublishAot>true</PublishAot>
+    <!-- Smaller binary, and nothing the proxy does depends on culture-specific
+         formatting: it moves JSON-RPC frames and compares ordinal strings. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Stack traces keep their method names; dropping them saves little and
+         makes a crash report from a user's machine far less useful. -->
+    <StackTraceSupport>true</StackTraceSupport>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>mcp-guardrails</ToolCommandName>
+    <PackageId>McpGuardrails</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>farzamtm</Authors>
+    <Description>A policy-enforcing proxy between an MCP client and the MCP servers it calls: audit every tool call, deny by policy, cap a session with budgets, and hold calls for human approval.</Description>
+    <PackageTags>mcp;model-context-protocol;guardrails;proxy;ai-agents;security</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/farzamtm/mcp-guardrails</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/farzamtm/mcp-guardrails</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The licence expression above names the licence; shipping the file and
+         NOTICE as well is what Apache-2.0 section 4 asks of redistributions. -->
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="..\..\NOTICE" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
 
 </Project>

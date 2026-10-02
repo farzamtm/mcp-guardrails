@@ -73,14 +73,30 @@ public sealed class BudgetPolicyLoadingTests
     }
 
     [Fact]
-    public void ADailyBudget_FailsAtLoadTime()
+    public void DailyLimits_AreParsedAlongsideSessionLimits()
+    {
+        var document = PolicyLoader.Parse("""
+            budgets:
+              session:
+                max_calls: 200
+              daily:
+                max_calls: 1000
+                max_cost: 500
+            """);
+
+        Assert.Equal(200, document.EffectiveBudgets.Session?.MaxCalls);
+        Assert.Equal(1000, document.EffectiveBudgets.Daily?.MaxCalls);
+        Assert.Equal(500, document.EffectiveBudgets.Daily?.MaxCost);
+    }
+
+    [Fact]
+    public void AnEmptyDailySection_FailsAtLoadTime()
     {
         // At load time, not on the first call: the operator finds out when they
-        // start the proxy, not hours into a session that was never capped.
+        // start the proxy, not hours into a day that was never capped.
         var error = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
             budgets:
-              daily:
-                max_cost: 500
+              daily: {}
             """));
 
         Assert.Contains("budgets.daily", error.Message, StringComparison.Ordinal);

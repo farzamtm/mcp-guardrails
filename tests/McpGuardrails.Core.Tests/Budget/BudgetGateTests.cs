@@ -169,16 +169,217 @@ public sealed class BudgetGateTests
     [Fact]
     public void TheScopeName_AppearsInTheRefusal()
     {
-        // The parameter exists so the daily gate, when it lands, reads correctly
-        // without touching any of this.
         var gate = new BudgetGate(
             new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 0 }),
-            "daily");
+            "weekly");
 
         var refused = gate.Apply(Allowed());
 
-        Assert.Equal("daily.max_calls", refused.RuleName);
-        Assert.Contains("the daily has made", refused.Reason, StringComparison.Ordinal);
+        Assert.Equal("weekly.max_calls", refused.RuleName);
+        Assert.Contains("the weekly has made", refused.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ADailyCallRefusal_SaysWhenItResetsInsteadOfNewSession()
+    {
+        // "Start a new session" is exactly the advice that does not help against
+        // a daily cap, and the model would follow it.
+        var refused = new BudgetGate(
+            new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 3 }),
+            BudgetGate.DailyScope);
+
+        refused.Apply(Allowed());
+        refused.Apply(Allowed());
+        refused.Apply(Allowed());
+
+        var denial = refused.Apply(Allowed());
+
+        Assert.Equal("daily.max_calls", denial.RuleName);
+        Assert.Contains("3 tool calls have been made today (UTC)", denial.Reason, StringComparison.Ordinal);
+        Assert.Contains("daily limit of 3", denial.Reason, StringComparison.Ordinal);
+        Assert.Contains("budgets.daily.max_calls", denial.Reason, StringComparison.Ordinal);
+        Assert.Contains("resets at 00:00 UTC", denial.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("new session", denial.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ADailyCostRefusal_GivesTheNumbersAndTheReset()
+    {
+        var gate = new BudgetGate(
+            new InMemoryBudgetStore(new BudgetLimits { MaxCost = 50 }),
+            BudgetGate.DailyScope);
+
+        gate.Apply(Allowed(cost: 40));
+
+        var denial = gate.Apply(Allowed(cost: 25));
+
+        Assert.Equal("daily.max_cost", denial.RuleName);
+        Assert.Contains("costs 25", denial.Reason, StringComparison.Ordinal);
+        Assert.Contains("40 of today's 50 budget", denial.Reason, StringComparison.Ordinal);
+        Assert.Contains("budgets.daily.max_cost", denial.Reason, StringComparison.Ordinal);
+        Assert.Contains("resets at 00:00 UTC", denial.Reason, StringComparison.Ordinal);
+    }
+
+    // ------------------------------------------------------- session + daily
+
+    private static (BudgetGate Gate, InMemoryBudgetStore Session, InMemoryBudgetStore Daily) Both(
+        BudgetLimits session,
+        BudgetLimits daily)
+    {
+        var sessionStore = new InMemoryBudgetStore(session);
+        var dailyStore = new InMemoryBudgetStore(daily);
+
+        return (new BudgetGate(sessionStore, dailyStore), sessionStore, dailyStore);
+    }
+
+    [Fact]
+    public void WithBothScopes_ACallWithinBoth_IsChargedToBoth()
+    {
+        var (gate, session, daily) = Both(new BudgetLimits { MaxCalls = 5 }, new BudgetLimits { MaxCalls = 5 });
+
+        var decision = Allowed(cost: 3);
+
+        Assert.Same(decision, gate.Apply(decision));
+        Assert.Equal((1, 3), (session.Calls, session.Cost));
+        Assert.Equal((1, 3), (daily.Calls, daily.Cost));
+        Assert.Same(session, gate.Store);
+        Assert.Same(daily, gate.DailyStore);
+    }
+
+    [Fact]
+    public void WithBothScopes_TheSessionRefusal_LeavesTheDayUntouched()
+    {
+        var (gate, _, daily) = Both(new BudgetLimits { MaxCalls = 0 }, new BudgetLimits { MaxCalls = 5 });
+
+        var refused = gate.Apply(Allowed());
+
+        Assert.Equal("session.max_calls", refused.RuleName);
+
+        // The session said no first, so the shared daily budget never saw it.
+        Assert.Equal(0, daily.Calls);
+    }
+
+    [Fact]
+    public void WithBothScopes_TheDailyRefusal_HandsTheSessionChargeBack()
+    {
+        var (gate, session, _) = Both(new BudgetLimits { MaxCost = 100 }, new BudgetLimits { MaxCost = 4 });
+
+        Assert.Equal(Verdict.Allow, gate.Apply(Allowed(cost: 3)).Verdict);
+
+        var refused = gate.Apply(Allowed(cost: 3));
+
+        Assert.Equal("daily.max_cost", refused.RuleName);
+
+        // The refused call was not forwarded, so the session paid only for the
+        // first one - otherwise a daily refusal would quietly eat session budget.
+        Assert.Equal((1, 3), (session.Calls, session.Cost));
+    }
+
+    [Fact]
+    public void WithBothScopes_AFailingDailyStore_FailsTheCallAndRefundsTheSession()
+    {
+        var session = new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 5 });
+        var gate = new BudgetGate(session, new ThrowingStore());
+
+        // Fails closed: the exception propagates, so the call is not forwarded.
+        Assert.Throws<InvalidOperationException>(() => gate.Apply(Allowed(cost: 2)));
+
+        Assert.Equal((0, 0), (session.Calls, session.Cost));
+    }
+
+    [Fact]
+    public void WithBothScopes_ConcurrentCalls_OvershootNeither()
+    {
+        var (gate, session, daily) = Both(new BudgetLimits { MaxCalls = 30 }, new BudgetLimits { MaxCalls = 10 });
+        var allowed = 0;
+
+        Parallel.For(0, 64, _ =>
+        {
+            if (!gate.Apply(Allowed()).IsBlocked)
+            {
+                Interlocked.Increment(ref allowed);
+            }
+        });
+
+        Assert.Equal(10, allowed);
+        Assert.Equal(10, daily.Calls);
+
+        // Every daily refusal was refunded, so the session counts only the
+        // calls that actually went out.
+        Assert.Equal(10, session.Calls);
+    }
+
+    private sealed class ThrowingStore : IBudgetStore
+    {
+        public long Calls => 0;
+
+        public long Cost => 0;
+
+        public BudgetCharge TryCharge(long cost) => throw new InvalidOperationException("disk on fire");
+    }
+
+    // ------------------------------------------------------------ composition
+
+    [Fact]
+    public void For_NoBudgets_IsTheUnlimitedGateAndOpensNothing()
+    {
+        var gate = BudgetGate.For(BudgetPolicy.None, _ => throw new InvalidOperationException("opened"));
+
+        Assert.Same(BudgetGate.Unlimited, gate);
+    }
+
+    [Fact]
+    public void For_SessionOnly_NeverOpensTheDailyStore()
+    {
+        var gate = BudgetGate.For(
+            new BudgetPolicy { Session = new BudgetLimits { MaxCalls = 0 } },
+            _ => throw new InvalidOperationException("opened"));
+
+        Assert.Null(gate.DailyStore);
+        Assert.Equal("session.max_calls", gate.Apply(Allowed()).RuleName);
+    }
+
+    [Fact]
+    public void For_DailyOnly_EnforcesTheDailyScope()
+    {
+        BudgetLimits? opened = null;
+        var limits = new BudgetLimits { MaxCalls = 0 };
+
+        var gate = BudgetGate.For(
+            new BudgetPolicy { Daily = limits },
+            l => new InMemoryBudgetStore(opened = l));
+
+        Assert.Same(limits, opened);
+        Assert.Equal("daily.max_calls", gate.Apply(Allowed()).RuleName);
+    }
+
+    [Fact]
+    public void For_Both_EnforcesBoth()
+    {
+        var gate = BudgetGate.For(
+            new BudgetPolicy
+            {
+                Session = new BudgetLimits { MaxCalls = 5 },
+                Daily = new BudgetLimits { MaxCalls = 1 },
+            },
+            l => new InMemoryBudgetStore(l));
+
+        Assert.NotNull(gate.DailyStore);
+        Assert.Equal(Verdict.Allow, gate.Apply(Allowed()).Verdict);
+        Assert.Equal("daily.max_calls", gate.Apply(Allowed()).RuleName);
+    }
+
+    [Fact]
+    public void For_RejectsNullArguments()
+    {
+        Assert.Throws<ArgumentNullException>(() => BudgetGate.For(null!, l => new InMemoryBudgetStore(l)));
+        Assert.Throws<ArgumentNullException>(() => BudgetGate.For(BudgetPolicy.None, null!));
+    }
+
+    [Fact]
+    public void TheTwoScopeGate_RejectsANullDailyStore()
+    {
+        Assert.Throws<ArgumentNullException>(() => new BudgetGate(new InMemoryBudgetStore(), (IBudgetStore)null!));
     }
 
     // ------------------------------------------------------------- arguments

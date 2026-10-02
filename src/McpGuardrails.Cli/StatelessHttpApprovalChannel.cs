@@ -15,8 +15,10 @@ namespace McpGuardrails.Cli;
 /// <c>require_approval</c> call is refused at once, with a message that names the
 /// cause, instead of hanging until the deadline or failing with an exception.
 ///
-/// The Tasks/MRTR channel the spec plans is the way to make approval work here;
-/// it plugs into the same seam.
+/// Over HTTP today, a rule that needs a human should use <c>mode: webhook</c>,
+/// which asks out of band and never needs the client. The Tasks/MRTR channel the
+/// spec plans is the way to make in-band approval work here; it plugs into the
+/// same seam.
 /// </remarks>
 internal sealed class StatelessHttpApprovalChannel : IApprovalChannel
 {

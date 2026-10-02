@@ -6,14 +6,19 @@ using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Hosting;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 // ---------------------------------------------------------------------------
 // STEP 3 - the pass-through proxy.
@@ -49,6 +54,26 @@ catch (ServeOptionsException ex)
     await Console.Error.WriteLineAsync(ex.Message);
     return 2;
 }
+
+// --injection-classifier turns on the LLM second stage of the injection scanner
+// with its defaults (confirm mode, Haiku, ANTHROPIC_API_KEY) when the policy does
+// not configure it. A policy `classifier:` block always wins, including one that
+// says `mode: off`: the file is the reviewed, committed statement of intent, and
+// a flag in a launcher config should not be able to quietly override it.
+var classifierFlag = args.Contains("--injection-classifier", StringComparer.Ordinal);
+
+// OpenTelemetry export is opt-in. Setting the standard OTLP endpoint variable is
+// itself the opt-in, so the proxy behaves like any other OTel-instrumented
+// process; --otel means "export to the default collector on localhost". Off by
+// default because a security tool should not open network connections nobody
+// asked for.
+var otel = args.Contains("--otel", StringComparer.Ordinal)
+           || !string.IsNullOrWhiteSpace(
+               Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT"));
+
+// Reported as the MCP server version and as the OTel service.version, so a
+// trace and a client's server list agree on what was running.
+const string ProxyVersion = "0.1.0";
 
 // Where the sandboxed filesystem server is allowed to operate.
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
@@ -95,6 +120,38 @@ builder.Logging.ClearProviders();
 builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 builder.Logging.SetMinimumLevel(listOnly ? LogLevel.Warning : LogLevel.Information);
 
+// Created unconditionally: with no exporter attached the span and instruments
+// are inert, and the audit filter does not need a second code path.
+using var telemetry = new ToolCallTelemetry();
+
+if (otel)
+{
+    // Traces and metrics only, not logs. The proxy's log lines are for the
+    // operator's terminal; exporting them would be a second, unreviewed channel
+    // out of the process.
+    //
+    // "Experimental.ModelContextProtocol" is the MCP SDK's own source and meter.
+    // Subscribing to it adds the semconv tools/call server span above ours and a
+    // client span per downstream call beneath it, so one trace shows the whole
+    // hop: client -> guardrails -> downstream server.
+    //
+    // Endpoint, protocol, headers, export intervals and OTEL_SDK_DISABLED come
+    // from the standard OTEL_* environment variables, read by the SDK. The
+    // exporter writes to the network, never to stdout, so the JSON-RPC wire is
+    // not at risk.
+    const string McpSdkSource = "Experimental.ModelContextProtocol";
+
+    builder.Services.AddOpenTelemetry()
+        .ConfigureResource(resource =>
+            resource.AddService("mcp-guardrails", serviceVersion: ProxyVersion))
+        .WithTracing(tracing => tracing
+            .AddSource(ToolCallTelemetry.SourceName, McpSdkSource)
+            .AddOtlpExporter())
+        .WithMetrics(metrics => metrics
+            .AddMeter(ToolCallTelemetry.SourceName, McpSdkSource)
+            .AddOtlpExporter());
+}
+
 using var loggerFactory = LoggerFactory.Create(logging =>
 {
     logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
@@ -114,7 +171,8 @@ await using var upstream = await UpstreamRegistry.ConnectAsync(
 // Declared after the registry so it is disposed BEFORE it: `await using` unwinds
 // in reverse order, so the sink drains its queue while the tool calls that feed
 // it are already finished.
-await using var audit = new JsonlAuditSink(auditPath);
+await using var audit = new JsonlAuditSink(
+    auditPath, logger: loggerFactory.CreateLogger<JsonlAuditSink>());
 
 // ---------------------------------------------------------------------------
 // Load the policy.
@@ -129,20 +187,54 @@ var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
                      ".mcp-guardrails",
                      "policy.yaml");
 
+// One client for the life of the process, as HttpClient is designed to be used.
+// Infinite timeout because the injection gate owns the classifier deadline;
+// two competing timeouts would make "timed out" mean two different things.
+// Created unconditionally because it is cheap and opens no connection until used.
+using var classifierHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+
 PolicyEvaluator policy;
-BudgetGate budget;
+PolicyDocument document;
+BudgetPolicy budgets;
+InjectionGate scanner;
+SecretGate secrets;
 try
 {
-    var document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
+    document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
 
     policy = new PolicyEvaluator(document);
+    budgets = document.EffectiveBudgets;
 
-    // No `budgets:` section means an unlimited gate rather than no gate: the
-    // call path is then the same whether or not anyone configured a cap, so the
-    // configured path is not the one that only ever runs in production.
-    budget = document.EffectiveBudgets.Session is { } session
-        ? new BudgetGate(new InMemoryBudgetStore(session))
-        : BudgetGate.Unlimited;
+    // On by default, including with no policy file at all: a result scanner that
+    // has to be switched on protects nobody, and annotating cannot break a call.
+    var injection = document.EffectiveScanners.EffectiveInjection;
+
+    if (classifierFlag && injection.Classifier is null)
+    {
+        injection = injection with { Classifier = ClassifierSettings.Default };
+    }
+
+    // Also on by default. Out of the box it changes no call - arguments are
+    // forwarded as sent and only the audit log is scrubbed - but it does redact
+    // secrets from results, because a key the model has read cannot be unread.
+    var secretSettings = document.EffectiveScanners.EffectiveSecrets;
+    secrets = new SecretGate(secretSettings);
+
+    // The classifier is opt-in and off by default: it sends tool output to a
+    // third party and costs money per call. A missing API key is a startup
+    // error (PolicyException, caught below) rather than a classifier that
+    // silently fails on every call. It runs inside the secret gate, so it
+    // redacts for itself before anything leaves the process.
+    scanner = injection.UsesClassifier
+        ? new InjectionGate(
+            injection,
+            new RedactingInjectionClassifier(
+                AnthropicInjectionClassifier.Create(
+                    injection.Classifier!,
+                    classifierHttp,
+                    Environment.GetEnvironmentVariable),
+                secretSettings.IncludePii))
+        : new InjectionGate(injection);
 }
 catch (PolicyException ex)
 {
@@ -150,6 +242,47 @@ catch (PolicyException ex)
     await Console.Error.WriteLineAsync($"Invalid policy file '{policyPath}': {ex.Message}");
     return 1;
 }
+
+// Where daily budget counters persist. An environment variable like the audit
+// and policy paths, not a policy key: the policy says what the limits are, the
+// deployment says where state lives - and two agents sharing one policy file
+// may well want separate daily budgets. Every proxy pointed at the same file
+// shares one budget. Only opened when `budgets.daily` is configured.
+var budgetDbPath = Environment.GetEnvironmentVariable("GUARDRAILS_BUDGET_DB")
+                   ?? Path.Combine(
+                       Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                       ".mcp-guardrails",
+                       "budgets.db");
+
+// Captured so it can be disposed on exit; null when no daily cap is configured.
+SqliteBudgetStore? dailyStore = null;
+BudgetGate budget;
+
+// list-upstream only prints tools, so it must not create a database file - the
+// example-policy check in CI runs exactly this.
+if (listOnly)
+{
+    budget = BudgetGate.Unlimited;
+}
+else
+{
+    try
+    {
+        // No `budgets:` section means an unlimited gate rather than no gate: the
+        // call path is then the same whether or not anyone configured a cap, so
+        // the configured path is not the one that only ever runs in production.
+        budget = BudgetGate.For(budgets, limits => dailyStore = new SqliteBudgetStore(budgetDbPath, limits));
+    }
+    catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
+    {
+        // Fatal, like a malformed policy: running without the daily cap the
+        // operator asked for would be failing open.
+        await Console.Error.WriteLineAsync($"Cannot open budget store '{budgetDbPath}': {ex.Message}");
+        return 1;
+    }
+}
+
+using var dailyStoreLifetime = dailyStore;
 
 // ---------------------------------------------------------------------------
 // STEP 2 demo: print what we discovered downstream, then exit.
@@ -168,15 +301,46 @@ if (listOnly)
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// The webhook approver, if the policy configures one.
+//
+// Built here, after list-upstream has returned, because this is the first point
+// that needs the signing secret: listing (and CI's example-policy check) should
+// work on a machine that does not hold it. Serving without it is fatal, for the
+// same reason a malformed policy is - a rule routed to an approver we cannot
+// authenticate to would deny every call, and the operator should hear about it
+// now rather than from the first refusal.
+// ---------------------------------------------------------------------------
+WebhookApprovalChannel? webhook = null;
+if (document.EffectiveApprovers.Webhook is { } webhookSettings)
+{
+    try
+    {
+        webhook = new WebhookApprovalChannel(
+            webhookSettings.Endpoint,
+            webhookSettings.ReadSecret(Environment.GetEnvironmentVariable),
+            WebhookApprovalChannel.CreateHandler());
+    }
+    catch (PolicyException ex)
+    {
+        await Console.Error.WriteLineAsync($"Invalid policy file '{policyPath}': {ex.Message}");
+        return 1;
+    }
+}
+
+using var webhookLifetime = webhook;
+
 // The name a call is known by when the client did not send one. Shared by the
 // audit filter and the policy filter on purpose: if they disagreed, the log and
 // the policy would describe different calls, in exactly the malformed-traffic
 // case where someone reading the log afterwards most needs to trust it.
 const string UnnamedTool = "(missing)";
 
-// Who a require_approval call is put to. Over stdio, the human at the client via
-// elicitation. Over stateless HTTP there is no channel back to the client, so the
-// answer is "nobody", given immediately - see StatelessHttpApprovalChannel.
+// Who an in-band require_approval call is put to. Over stdio, the human at the
+// client via elicitation. Over stateless HTTP there is no channel back to the
+// client, so the answer is "nobody", given immediately - see
+// StatelessHttpApprovalChannel. A `mode: webhook` rule does not depend on the
+// client, so it works the same on either transport.
 Func<McpServer, IApprovalChannel> approvalChannel = serve.Transport is Transport.Http
     ? _ => StatelessHttpApprovalChannel.Instance
     : server => new ElicitationApprovalChannel(server);
@@ -190,13 +354,13 @@ Func<McpServer, IApprovalChannel> approvalChannel = serve.Transport is Transport
 //                          names rewritten into the proxy's namespace
 //   WithCallToolHandler  - routes an incoming call to the owning server
 //
-// Right now both are pure pass-through. Every guardrail in the spec - policy,
-// budget, approval, redaction - becomes a filter wrapped around these.
+// Both are pure pass-through. Every guardrail in the spec - policy, budget,
+// approval, scanning, redaction - is a filter wrapped around these.
 // ---------------------------------------------------------------------------
 var mcp = builder.Services
     .AddMcpServer(options =>
     {
-        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = "0.1.0" };
+        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = ProxyVersion };
 
         // -------------------------------------------------------------------
         // THE INTERCEPTOR PIPELINE.
@@ -221,10 +385,41 @@ var mcp = builder.Services
 
             var toolName = request.Params?.Name ?? UnnamedTool;
 
+            // Fail closed: with the log broken, a forwarded call would leave no
+            // evidence at all. Refuse BEFORE forwarding - the sink would throw
+            // afterwards anyway, but only once the downstream action had run.
+            if (audit.IsFaulted)
+            {
+                return new CallToolResult
+                {
+                    IsError = true,
+                    Content = [new TextContentBlock
+                    {
+                        Text = $"Refused '{toolName}': the guardrails audit log cannot be written, " +
+                               "so no tool calls are being forwarded. This needs an operator.",
+                    }],
+                };
+            }
+
             // Resolve purely to enrich the log. The call handler resolves again
             // to actually route; duplicating a dictionary lookup is cheaper than
             // coupling the two concerns together.
             var resolved = upstream.TryResolve(toolName, out var connection, out var downstreamName);
+
+            // Opened before `next` so policy, approval and the downstream call
+            // all run inside the span, and the SDK's client span for the forward
+            // nests under it rather than becoming a sibling.
+            using var span = telemetry.Start(
+                toolName,
+                resolved ? connection.Name : null,
+                resolved ? downstreamName : null);
+
+            // Scanned here, before anything runs, rather than taken from the
+            // filters inside: a call the policy refuses never reaches them, and
+            // its arguments are exactly as likely to hold a key. Before `next`,
+            // too, because the redaction filter may rewrite the arguments in
+            // place and this must see what the model actually sent.
+            var arguments = secrets.ScanArguments(request.Params?.Arguments);
 
             // Stopwatch timestamps rather than DateTime subtraction: this reads a
             // monotonic clock, so an NTP correction mid-call cannot produce a
@@ -232,7 +427,7 @@ var mcp = builder.Services
             var startedAt = Stopwatch.GetTimestamp();
 
             CallToolResult? result = null;
-            string? failure = null;
+            Exception? thrown = null;
 
             try
             {
@@ -243,12 +438,14 @@ var mcp = builder.Services
             {
                 // Record the failure, then rethrow. The audit sink observes; it
                 // must never change the outcome of a call.
-                failure = $"{ex.GetType().Name}: {ex.Message}";
+                thrown = ex;
                 throw;
             }
             finally
             {
                 var decision = scope.Decision;
+                var elapsed = Stopwatch.GetElapsedTime(startedAt);
+                var failure = thrown is null ? null : $"{thrown.GetType().Name}: {thrown.Message}";
 
                 var record = new AuditRecord
                 {
@@ -257,15 +454,35 @@ var mcp = builder.Services
                     Tool = toolName,
                     Server = resolved ? connection.Name : null,
                     DownstreamTool = resolved ? downstreamName : null,
-                    Arguments = request.Params?.Arguments?.AsReadOnly(),
+                    Arguments = arguments.Redacted,
                     Decision = decision?.Verdict.ToString().ToLowerInvariant(),
                     Rule = decision?.RuleName,
                     DecisionReason = decision?.Reason,
                     Approval = Describe(decision?.ApprovalResult),
-                    DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    // Null unless something matched, so a clean result stays one
+                    // narrow line and `jq 'select(.scanner_hits)'` is the whole
+                    // query for "show me what the scanner caught".
+                    ScannerHits = scope.Scan is { Effect: not ScanEffect.None } scan
+                        ? scan.Heuristics
+                        : null,
+                    ScannerAction = scope.Scan?.Describe(),
+                    Classifier = scope.Scan?.Classifier?.Describe(),
+                    ClassifierTruncated = scope.Scan?.Classifier is { Truncated: true } ? true : null,
+                    ClassifierError = scope.Scan?.Classifier?.Error,
+                    ArgumentSecrets = arguments.Report.IsClean ? null : arguments.Report.Detectors,
+                    ArgumentSecretsAction = secrets.DescribeArguments(arguments, decision),
+                    ResultSecrets = scope.Redaction is { Effect: not RedactionEffect.None } redaction
+                        ? redaction.Report.Detectors
+                        : null,
+                    ResultSecretsAction = scope.Redaction?.Describe(),
+                    DurationMs = elapsed.TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
                 };
+
+                // Same duration and decision as the record, so a dashboard and
+                // the log never disagree about the same call.
+                span.Complete(decision, elapsed, result?.IsError is true, thrown);
 
                 // CancellationToken.None on purpose: if the caller cancelled, we
                 // still want the record. Losing the evidence of an aborted call
@@ -291,11 +508,19 @@ var mcp = builder.Services
             // audit log and the policy would tell different stories.
             upstream.TryGetTool(toolName, out var tool);
 
-            var facts = PolicyFacts.ForCall(toolName, request.Params, tool);
+            // The owning server is not matched on, but an out-of-band approver
+            // shows it: "fs" or "prod-db" changes what a human says to a delete.
+            var server = upstream.TryResolve(toolName, out var owner, out _) ? owner.Name : null;
 
-            // Three gates, in this order, and the order is the design.
+            var facts = PolicyFacts.ForCall(toolName, request.Params, tool, server);
+
+            // Four gates, in this order, and the order is the design.
             //
-            // The policy decides whether the call is permitted at all. Approval
+            // The policy decides whether the call is permitted at all. The secret
+            // scanner, under `arguments: block`, refuses a call carrying a
+            // credential - before approval, so nobody is asked to approve a call
+            // that will be refused, and so a human who approves a harmless-looking
+            // write is not also approving the key buried in its content. Approval
             // turns a 'require_approval' verdict into a real answer from a real
             // human - which can only happen before the budget runs, because a
             // call waiting on a person has not been forwarded and must not be
@@ -303,10 +528,14 @@ var mcp = builder.Services
             // spend on the call that is finally going out.
             var decision = policy.Evaluate(facts, explain);
 
+            decision = secrets.Apply(decision, request.Params?.Arguments);
+
             decision = await ApprovalGate.ApplyAsync(
                 decision,
                 facts,
-                approvalChannel(request.Server),
+                new ApprovalChannelRouter(
+                    approvalChannel(request.Server),
+                    webhook),
                 cancellationToken);
 
             decision = budget.Apply(decision);
@@ -335,6 +564,62 @@ var mcp = builder.Services
                 IsError = true,
                 Content = [new TextContentBlock { Text = text }],
             };
+        });
+
+        // -------------------------------------------------------------------
+        // SECRET REDACTION - registered after the gates and before the result
+        // scanner, which puts both of its halves where the spec puts them.
+        //
+        // On the way in it runs after every gate has said yes, so the policy
+        // judged the real arguments and only the copy that leaves is redacted.
+        // On the way back it runs after the injection scanner, so it is the last
+        // thing to touch a result before the model reads it - and, like that
+        // scanner, it never sees the proxy's own refusals.
+        // -------------------------------------------------------------------
+        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
+        {
+            if (request.Params is { } parameters &&
+                secrets.RedactForwarded(parameters.Arguments) is { } redacted)
+            {
+                parameters.Arguments = redacted;
+            }
+
+            var result = await next(request, cancellationToken);
+
+            var outcome = secrets.Inspect(result, request.Params?.Name ?? UnnamedTool);
+
+            GuardrailsCallScope.RecordRedaction(outcome);
+
+            return outcome.Result;
+        });
+
+        // -------------------------------------------------------------------
+        // RESULT SCANNER - registered last, so it is the INNERMOST layer.
+        //
+        // Everything above this point guards the way in. This one is the first
+        // guardrail that runs on the way back, and innermost is the only correct
+        // position for it: it must see what a downstream server actually
+        // returned, and must not see the refusals the gates above it produce -
+        // those are the proxy's own words, addressed to the model.
+        // -------------------------------------------------------------------
+        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
+        {
+            var result = await next(request, cancellationToken);
+
+            // Async because the optional classifier is a network call. Without
+            // one configured this completes synchronously and costs what Inspect
+            // did. Classifier failures never surface here - the gate turns them
+            // into "the heuristic verdict stands" and records why.
+            var outcome = await scanner.InspectAsync(
+                result,
+                request.Params?.Name ?? UnnamedTool,
+                cancellationToken);
+
+            // Report upward so the audit record carries the finding, exactly as
+            // the policy filter reports its decision.
+            GuardrailsCallScope.RecordScan(outcome);
+
+            return outcome.Result;
         });
     })
     .WithListToolsHandler((_, _) =>

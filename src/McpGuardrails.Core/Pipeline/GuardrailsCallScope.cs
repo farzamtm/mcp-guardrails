@@ -1,4 +1,5 @@
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
 
 namespace McpGuardrails.Core.Pipeline;
 
@@ -38,6 +39,24 @@ public sealed class GuardrailsCallScope : IDisposable
     /// <summary>The policy decision recorded for this call, if one was reached.</summary>
     public Decision? Decision { get; private set; }
 
+    /// <summary>
+    /// What the result scanner found, if the call got far enough to return one.
+    /// </summary>
+    /// <remarks>
+    /// Null on a call that was refused: nothing was forwarded, so there was no
+    /// result to scan. That is the distinction the audit log needs - an absent
+    /// scanner field means "no result came back", not "the result was clean".
+    /// </remarks>
+    public ScanOutcome? Scan { get; private set; }
+
+    /// <summary>
+    /// What secret redaction did to the result, if the call returned one.
+    /// </summary>
+    /// <remarks>
+    /// Null on a refused call for the same reason as <see cref="Scan"/>.
+    /// </remarks>
+    public RedactionOutcome? Redaction { get; private set; }
+
     /// <summary>Opens a scope for one tool call. Dispose at the end of the call.</summary>
     public static GuardrailsCallScope Begin()
     {
@@ -60,6 +79,39 @@ public sealed class GuardrailsCallScope : IDisposable
         if (_currentScope.Value is { } scope)
         {
             scope.Decision = decision;
+        }
+    }
+
+    /// <summary>
+    /// Records what the scanner made of the result for the call in progress.
+    /// </summary>
+    /// <remarks>
+    /// A no-op without an active scope, for the same reason as
+    /// <see cref="RecordDecision"/>: the scanner filter has to work on its own.
+    /// </remarks>
+    public static void RecordScan(ScanOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+
+        if (_currentScope.Value is { } scope)
+        {
+            scope.Scan = outcome;
+        }
+    }
+
+    /// <summary>
+    /// Records what secret redaction did to the result for the call in progress.
+    /// </summary>
+    /// <remarks>
+    /// A no-op without an active scope, like the other two recorders.
+    /// </remarks>
+    public static void RecordRedaction(RedactionOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+
+        if (_currentScope.Value is { } scope)
+        {
+            scope.Redaction = outcome;
         }
     }
 

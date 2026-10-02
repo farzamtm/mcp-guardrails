@@ -1,0 +1,224 @@
+name: Release
+
+# A version tag is the only trigger. Tags are created by a human, after the
+# commit they point at has been through CI on main; this workflow packages that
+# commit, it does not decide whether it is good.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+# Two pushes of the same tag must not race to create the same release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Read-only by default. Only the final job, which creates the release, is
+# granted contents: write - the build jobs run third-party compilers and
+# restore packages from nuget.org, and none of that needs to write anything.
+permissions:
+  contents: read
+
+# Actions are pinned to commit SHAs with the tag in a comment, as in ci.yml:
+# a tag is mutable, so a pin by tag would let whoever controls it change what
+# runs here. persist-credentials: false keeps the token out of .git/config.
+
+jobs:
+  binaries:
+    name: native AOT (${{ matrix.rid }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One broken platform should not stop the others from producing an
+      # artefact; the release job still refuses to publish an incomplete set.
+      fail-fast: false
+      matrix:
+        # Native AOT does not cross-compile between OSes and only awkwardly
+        # between architectures, so each RID builds on a runner of its own kind.
+        include:
+          - rid: linux-x64
+            os: ubuntu-24.04
+          - rid: linux-arm64
+            os: ubuntu-24.04-arm
+          - rid: osx-arm64
+            os: macos-15
+          - rid: win-x64
+            os: windows-2025
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+
+      # The AOT linker on Linux shells out to clang and links zlib. Usually
+      # present on the hosted image; installing explicitly means an image
+      # update cannot silently break a release.
+      - name: Install AOT prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang zlib1g-dev
+
+      # "v1.2.3" -> "1.2.3". Read through env rather than interpolating the
+      # ref into the script: a tag name is attacker-influenced text, and ${{ }}
+      # inside `run:` is pasted in before the shell parses it.
+      - name: Derive version from tag
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # A RuntimeIdentifier is what switches the CLI project to Native AOT (see
+      # McpGuardrails.Cli.csproj); TreatWarningsAsErrors makes any trim or AOT
+      # warning fail the release here rather than surface as a runtime crash.
+      - name: Publish
+        shell: bash
+        env:
+          RID: ${{ matrix.rid }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          dotnet publish src/McpGuardrails.Cli
+          --configuration Release
+          --runtime "$RID"
+          -p:Version="$VERSION"
+          --output "artifacts/publish/$RID"
+
+      # The binary is renamed to the same command the dotnet tool installs, so
+      # instructions do not depend on how someone installed it. Debug symbols
+      # (.dbg, .dSYM, .pdb) stay out of the archive to keep it small. SQLite,
+      # used by daily budgets, is a native library AOT does not link in, so it
+      # ships beside the binary.
+      - name: Archive
+        id: archive
+        shell: bash
+        env:
+          RID: ${{ matrix.rid }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="mcp-guardrails-$VERSION-$RID"
+          stage="artifacts/stage/$name"
+          mkdir -p "$stage" artifacts/dist
+          cp README.md LICENSE NOTICE "$stage/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "artifacts/publish/$RID/McpGuardrails.Cli.exe" "$stage/mcp-guardrails.exe"
+            cp "artifacts/publish/$RID/e_sqlite3.dll" "$stage/"
+            (cd artifacts/stage && 7z a -tzip "../dist/$name.zip" "$name" > /dev/null)
+          else
+            cp "artifacts/publish/$RID/McpGuardrails.Cli" "$stage/mcp-guardrails"
+            cp artifacts/publish/"$RID"/libe_sqlite3.* "$stage/"
+            tar -C artifacts/stage -czf "artifacts/dist/$name.tar.gz" "$name"
+          fi
+          ls -l artifacts/dist
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+
+      # The staged directory - what goes into the archive users download - is
+      # what gets tested, not the build tree, so a file the archive forgot fails
+      # here. Windows is skipped only because smoke.py has never been run there.
+      - name: Smoke test the native binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          STAGE: ${{ steps.archive.outputs.stage }}
+        run: python3 scripts/smoke.py "$STAGE/mcp-guardrails"
+
+      - name: Upload archive
+        # actions/upload-artifact v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: binary-${{ matrix.rid }}
+          path: artifacts/dist/*
+          if-no-files-found: error
+
+  tool-package:
+    name: dotnet tool package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+
+      - name: Derive version from tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # No RuntimeIdentifier, so this is the portable framework-dependent
+      # build a tool package has to be. Pushing to nuget.org is deliberately
+      # not automated yet: it needs an API key secret, which is a decision for
+      # the maintainer, not a side effect of adding a workflow.
+      - name: Pack
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          dotnet pack src/McpGuardrails.Cli
+          --configuration Release
+          -p:Version="$VERSION"
+          --output artifacts/nupkg
+
+      # Install the package exactly as a user would and run it once, so a
+      # package that installs but cannot start never reaches anyone.
+      - name: Install and run the packed tool
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          dotnet tool install McpGuardrails --version "$VERSION" \
+            --add-source artifacts/nupkg --tool-path artifacts/tool
+          GUARDRAILS_POLICY=examples/filesystem-sandbox.yaml \
+            artifacts/tool/mcp-guardrails list-upstream
+
+      - name: Upload package
+        # actions/upload-artifact v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: nupkg
+          path: artifacts/nupkg/*.nupkg
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [binaries, tool-package]
+    runs-on: ubuntu-24.04
+    # The one job allowed to write: it creates the release and uploads assets.
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        # actions/download-artifact v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+
+      # Checksums let a user verify a download without trusting the transport,
+      # and give the release notes something to pin against.
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+
+      # Created as a draft: the assets are attached, but publishing the
+      # release - the moment users can see it - stays a human decision, in
+      # line with "pushing is the human's call" in AGENTS.md.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$TAG" dist/*
+          --draft
+          --verify-tag
+          --title "$TAG"
+          --generate-notes

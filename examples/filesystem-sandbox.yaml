@@ -23,10 +23,61 @@
 # 'session' is this proxy process, which for an stdio server is one client
 # session: the counters start again next time. Costs come from the matched rule
 # below, defaulting to 1, so a call cap works even with no cost: anywhere.
+#
+# 'daily' is one UTC day (00:00-24:00 UTC) across every session and restart. It
+# persists in a SQLite file - ~/.mcp-guardrails/budgets.db, or wherever
+# GUARDRAILS_BUDGET_DB points - and every proxy using that file shares the same
+# daily budget. Point a different agent at a different file to keep its budget
+# separate. A call has to fit both caps.
 budgets:
   session:
     max_calls: 500
     max_cost: 100
+  daily:
+    max_calls: 2000
+    max_cost: 400
+
+# What to do with what comes BACK. Everything else in this file inspects the
+# call going out; a file's CONTENT is the one thing no rule above can predict.
+#
+# This section is here to be read, not because it changes anything: annotate is
+# the default, so deleting it leaves the behaviour identical. A proxy with no
+# policy file at all still scans - a guardrail that has to be switched on
+# protects nobody, and annotating cannot break a call.
+#
+# 'block' withholds a matching result entirely and returns a tool error. That
+# suits a server whose output should be structured data; it is risky for one
+# returning prose, because these are heuristics and they do misfire.
+# 'off' disables scanning, which is an honest choice to make deliberately.
+#
+# 'secrets' runs in both directions. The values below are the defaults, spelled
+# out: results are scrubbed before the model reads them, and arguments reach the
+# server unchanged but the audit log only ever sees markers. Change arguments to
+# 'redact' if this server should never receive a credential, or 'block' to
+# refuse any call that carries one. pii: true also redacts email addresses and
+# card numbers - off by default because they are often the point of the call.
+scanners:
+  injection:
+    action: annotate
+  secrets:
+    arguments: redact_audit
+    results: redact
+    pii: false
+
+    # Optional second opinion from Claude. Left commented out because it sends
+    # file contents to the Anthropic API, costs money, and needs a key in
+    # ANTHROPIC_API_KEY - startup fails without one, by design.
+    #
+    # The classifier can soften a heuristic 'block' into an annotation but can
+    # never remove a warning, so pair it with 'action: block' (withhold only
+    # when both stages agree) or 'mode: all' (also catch what the heuristics
+    # miss). With 'annotate' + 'confirm' it only adds evidence to the audit log.
+    # If it times out or fails, the heuristic verdict stands.
+    #
+    # classifier:
+    #   mode: confirm          # confirm: only flagged results | all: every result
+    #   timeout_ms: 5000
+    #   max_chars: 32000
 
 rules:
   # A glob, so every read tool the server has (or gains later) is covered
@@ -89,7 +140,9 @@ rules:
   # approved call is charged to the budget like any other.
   #
   # This needs a client that supports elicitation. One that does not gets a
-  # clear refusal, not a silent allow - see the README's approval section.
+  # clear refusal, not a silent allow - see the README's approval section. For
+  # an agent with nobody at the client, webhook-approval.yaml sends the question
+  # to an HTTP endpoint instead.
   - name: approve-moves
     match:
       tool: fs__move_*
