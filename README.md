@@ -32,7 +32,7 @@ your agent actually does.
   MCP client and waits for an answer, with a configurable deadline
 - **Scans what comes back** — tool results are checked for prompt-injection
   attempts and fenced as untrusted data before the model reads them, on by
-  default
+  default, with an optional LLM classifier as a second opinion
 
 ## Policy
 
@@ -347,6 +347,83 @@ jq 'select(.scanner_hits)' ~/.mcp-guardrails/audit.jsonl
 jq 'select(.scanner_action == "blocked")' ~/.mcp-guardrails/audit.jsonl
 ```
 
+### Optional: a second opinion from a model
+
+The heuristics can't tell a document *about* prompt injection from an attack.
+A language model usually can. The classifier is an optional second stage that
+asks Claude, through the Anthropic Messages API, whether a result is trying to
+steer the agent. It is **off unless you ask for it**: it sends tool output to a
+third party and costs money, and neither should be a default.
+
+```yaml
+scanners:
+  injection:
+    action: block
+    classifier:
+      mode: confirm                        # confirm (default) | all | off
+      model: claude-haiku-4-5-20251001     # default
+      api_key_env: ANTHROPIC_API_KEY       # default; the key itself never goes in the file
+      timeout_ms: 5000                     # default; 1 to 60000
+      max_chars: 32000                     # default; longer results are cut down to this
+      # base_url: https://api.anthropic.com  # default; a gateway path prefix is kept
+```
+
+An empty `classifier: {}` block turns it on with every default. Without a
+policy file, `--injection-classifier` on the command line does the same thing.
+A `classifier:` block in the policy always wins over the flag, including
+`mode: off`. Startup fails if the API key variable is unset or blank. A
+classifier that failed on every call would otherwise sit there looking enabled.
+
+**When it runs.**
+
+- `confirm` asks only about results the heuristics already flagged, which costs
+  nothing on the clean majority.
+- `all` asks about every result that has readable text, so it can catch what
+  the heuristics miss, at one API call per tool call.
+- Image-only results are never sent.
+
+**How the two stages combine.**
+
+| Heuristics | Classifier | Result |
+| --- | --- | --- |
+| flagged | `INJECTION` | the configured `action` |
+| flagged | `BENIGN` | **annotated**. Never blocked, never forwarded bare |
+| clean | `INJECTION` (`mode: all` only) | the configured `action`, reported as hit `llm-classifier` |
+| clean | `BENIGN` | forwarded untouched |
+| either | timed out / failed | the heuristic verdict, exactly as without a classifier |
+
+The classifier reads the same attacker-controlled text as the agent, so it
+might be talked round too. It is therefore trusted only to soften a block into
+a warning, and never to remove a warning. That is what makes `action: block`
+workable on prose: a result is withheld only when both stages agree. With
+`action: annotate` and `mode: confirm`, the verdict changes nothing the model
+sees. It only adds evidence to the audit log. Use `block` + `confirm`, or
+`mode: all`, if you want the classifier to change outcomes.
+
+**Failure never breaks a call.** If the call times out, returns a non-2xx
+status, has a network error, or comes back with anything other than the single
+word `INJECTION` or `BENIGN`, the heuristic verdict stands and the audit log
+records `classifier: "timed_out"` or `"failed"` with a short reason. The proxy
+applies the deadline itself. If the client cancels the call, the classifier
+request is cancelled with it.
+
+**Large results** go to the classifier as their first and last `max_chars / 2`
+characters, with a marker in between saying how much was dropped. Payloads
+usually sit at the start or end of a result. One deliberately padded into the
+middle of a very large result will not be seen. The audit log marks such calls
+with `classifier_truncated`.
+
+**The tool output is data in the prompt, not instructions.** It is wrapped in
+tags named with a fresh random nonce on every call, so the content can't guess
+the closing tag and break out. The instruction to answer with one word comes
+*after* it. Anything other than exactly one of the two words counts as a
+failure, and the reply is never logged.
+
+**Privacy and cost.** Every classified result, up to `max_chars`, is sent to
+Anthropic, or to `base_url` if you point it at a gateway. `base_url` must be
+https. Plain http is accepted only for a loopback address, because the API key
+travels in a header.
+
 **Not implemented yet:** `scanners.secrets` (secret and PII redaction of
 arguments, results and the audit log) is rejected at load time rather than
 silently ignored, for the same reason `budgets.daily:` is. Until it ships,
@@ -376,6 +453,22 @@ nothing came back to scan.
  "server":"fs","downstream_tool":"read_text_file","decision":"allow",
  "scanner_hits":["instruction-override","exfiltration"],"scanner_action":"annotated",
  "duration_ms":3.21,"is_error":false}
+```
+
+When the classifier ran, there are up to three more fields:
+
+- `classifier`: `benign`, `injection`, `timed_out` or `failed`
+- `classifier_truncated`: `true` only when the result was cut down to `max_chars`
+- `classifier_error`: on failure, a short reason such as an HTTP status
+
+As with `scanner_hits`, these record the verdict and never the text.
+
+```bash
+# Calls where the heuristics and the classifier disagreed
+jq 'select(.scanner_hits and .classifier == "benign")' ~/.mcp-guardrails/audit.jsonl
+
+# Is the classifier actually working?
+jq -r 'select(.classifier) | .classifier' ~/.mcp-guardrails/audit.jsonl | sort | uniq -c
 ```
 
 ```bash

@@ -96,6 +96,27 @@ public sealed record AuditRecord
     [JsonPropertyName("scanner_action")]
     public string? ScannerAction { get; init; }
 
+    /// <summary>
+    /// What the LLM classifier said, when it was consulted: injection, benign,
+    /// timed_out or failed.
+    /// </summary>
+    /// <remarks>
+    /// Recorded even when it changed nothing, because "the classifier failed and
+    /// the heuristics decided" and "the classifier agreed" are different events
+    /// that produce identical results. The verdict only, never the text either
+    /// side saw or wrote.
+    /// </remarks>
+    [JsonPropertyName("classifier")]
+    public string? Classifier { get; init; }
+
+    /// <summary>True when the result was longer than the classifier was shown.</summary>
+    [JsonPropertyName("classifier_truncated")]
+    public bool? ClassifierTruncated { get; init; }
+
+    /// <summary>Why the classifier failed, when it did: an HTTP status, a timeout, a bad reply.</summary>
+    [JsonPropertyName("classifier_error")]
+    public string? ClassifierError { get; init; }
+
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }
 

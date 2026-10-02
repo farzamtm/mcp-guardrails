@@ -127,6 +127,21 @@ public sealed record ScannerSettings
     [JsonIgnore]
     public bool IsOff => EffectiveAction is ScanAction.Off;
 
+    /// <summary>
+    /// The optional LLM second stage. Absent means no classifier: the heuristics
+    /// alone decide, and nothing leaves the machine.
+    /// </summary>
+    [JsonPropertyName("classifier")]
+    public ClassifierSettings? Classifier { get; init; }
+
+    /// <summary>True when the classifier should be consulted.</summary>
+    /// <remarks>
+    /// <c>action: off</c> wins over a classifier block: off means the scanner does
+    /// not run, and a classifier with no scanner around it has nothing to confirm.
+    /// </remarks>
+    [JsonIgnore]
+    public bool UsesClassifier => !IsOff && Classifier is { IsOff: false };
+
     internal void Validate(string scanner)
     {
         if (!Enum.IsDefined(EffectiveAction))
@@ -135,5 +150,21 @@ public sealed record ScannerSettings
                 $"'scanners.{scanner}.action' is not a known action. " +
                 "Use annotate, block or off.");
         }
+
+        if (Classifier is null)
+        {
+            return;
+        }
+
+        // Only the injection scanner knows how to ask one. Accepting the block
+        // elsewhere would read like a configured second opinion and be none.
+        if (scanner != "injection")
+        {
+            throw new PolicyException(
+                $"'scanners.{scanner}.classifier' is not supported. Only the injection scanner " +
+                "has a classifier stage.");
+        }
+
+        Classifier.Validate();
     }
 }

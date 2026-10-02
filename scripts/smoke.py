@@ -13,6 +13,7 @@ Usage:
     python3 scripts/smoke.py [path-to-binary]
 """
 
+import http.server
 import json
 import os
 import subprocess
@@ -53,6 +54,8 @@ APPROVAL_REFUSED = f"{SANDBOX}/smoke-unapproved.txt"
 SCAN_AUDIT = f"{SANDBOX}/audit-scan.jsonl"
 SCAN_BLOCK_FILE = f"{SANDBOX}/smoke-scan-block.yaml"
 POISONED = f"{SANDBOX}/smoke-poisoned.txt"
+CLASSIFIER_AUDIT = f"{SANDBOX}/audit-classifier.jsonl"
+CLASSIFIER_FILE = f"{SANDBOX}/smoke-classifier.yaml"
 CONTENT = "written through the guardrails proxy"
 
 # A file whose CONTENT is the attack. Nothing about the call that reads it is
@@ -149,6 +152,96 @@ scanners:
   injection:
     action: block
 """
+
+# The LLM classifier, pointed at a fake Messages API on loopback so the run
+# needs neither a real key nor the network. block + confirm is the combination
+# where the classifier changes the outcome: a heuristic hit it calls BENIGN is
+# softened to an annotation, and one it cannot answer stays blocked.
+CLASSIFIER_POLICY = """
+scanners:
+  injection:
+    action: block
+    classifier:
+      mode: confirm
+      base_url: {base_url}
+      api_key_env: GUARDRAILS_SMOKE_CLASSIFIER_KEY
+      timeout_ms: 5000
+"""
+
+CLASSIFIER_KEY = "smoke-test-key-not-a-real-one"
+
+
+class FakeAnthropic:
+    """A stand-in for POST /v1/messages that answers with a fixed verdict.
+
+    status 200 replies with `verdict` as the single text block; anything else
+    replies with that status and an Anthropic-shaped error body. Every request
+    is kept so the run can check what the proxy actually sent.
+    """
+
+    def __init__(self) -> None:
+        self.verdict = "BENIGN"
+        self.status = 200
+        self.requests: list[tuple[str, dict[str, str], dict]] = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                body = json.loads(read_http_body(self) or b"{}")
+                fake.requests.append((self.path, dict(self.headers), body))
+
+                if fake.status == 200:
+                    reply = {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": fake.verdict}],
+                        "stop_reason": "end_turn",
+                    }
+                else:
+                    reply = {"type": "error", "error": {"type": "api_error"}}
+
+                payload = json.dumps(reply).encode()
+                self.send_response(fake.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                # The default handler logs every request to stderr, which would
+                # interleave with the check output.
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def read_http_body(handler: http.server.BaseHTTPRequestHandler) -> bytes:
+    """Read a request body, chunked or not.
+
+    HttpClient streams JsonContent without a Content-Length, so the request
+    arrives chunked, and BaseHTTPRequestHandler does not decode that itself.
+    """
+    if handler.headers.get("Transfer-Encoding", "").lower() != "chunked":
+        return handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+
+    chunks: list[bytes] = []
+    while True:
+        size = int(handler.rfile.readline().split(b";")[0].strip(), 16)
+        if size == 0:
+            handler.rfile.readline()
+            return b"".join(chunks)
+        chunks.append(handler.rfile.read(size))
+        handler.rfile.readline()
+
 
 # Every write goes to a human. The timeout is deliberately tiny: one phase below
 # never answers at all, and CI should not spend five minutes proving it.
@@ -369,6 +462,39 @@ SCAN_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
+# The fake classifier says BENIGN: it can soften the block, never drop the
+# warning, because it read the same attacker-controlled text and may have been
+# talked round.
+CLASSIFIER_BENIGN_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__read_text_file", {"path": POISONED}),
+        "a classifier that calls the hit benign softens block to annotate",
+        lambda r: (
+            not r.get("isError")
+            and "begin untrusted output" in result_text(r)
+            and "exfiltration agent" in result_text(r)
+        ),
+    ),
+    (
+        call(2, "fs__read_text_file", {"path": PROBE}),
+        "confirm mode leaves a clean result alone",
+        lambda r: CONTENT in result_text(r) and "untrusted" not in result_text(r),
+    ),
+]
+
+# The fake classifier answers HTTP 500: an unavailable second opinion must not
+# break the call, and must not weaken it either.
+CLASSIFIER_FAILED_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__read_text_file", {"path": POISONED}),
+        "a failing classifier leaves the heuristic block in place",
+        lambda r: (
+            bool(r.get("isError"))
+            and "Blocked by guardrails scanner 'injection'" in result_text(r)
+        ),
+    ),
+]
+
 
 def main() -> int:
     try:
@@ -397,6 +523,7 @@ def main() -> int:
         APPROVAL_PROBE,
         APPROVAL_REFUSED,
         SCAN_AUDIT,
+        CLASSIFIER_AUDIT,
         POISONED,
         ESCAPE,
     ):
@@ -500,6 +627,11 @@ def main() -> int:
     scan_stderr += block_stderr
     failures += check_scan_audit_log()
 
+    # Phase 6: the optional LLM classifier, against a fake API on loopback.
+    print("\n--- injection classifier ---")
+    classifier_failures, classifier_stderr = run_classifier_phase()
+    failures += classifier_failures
+
     unapproved = os.path.exists(APPROVAL_REFUSED)
     print(f"{'FAIL' if unapproved else 'PASS'}  no unapproved write reached the disk")
     failures += 1 if unapproved else 0
@@ -522,6 +654,7 @@ def main() -> int:
                 + budget_stderr
                 + approval_stderr
                 + scan_stderr
+                + classifier_stderr
             )[-30:]
         )
 
@@ -860,6 +993,128 @@ def check_scan_audit_log() -> int:
             for entry in lines
         ),
         "a clean result adds no scanner fields",
+    )
+
+    return failures
+
+
+def run_classifier_phase() -> tuple[int, list[str]]:
+    """The classifier end to end: wiring, wire format, combination, audit."""
+    fake = FakeAnthropic()
+    try:
+        with open(CLASSIFIER_FILE, "w", encoding="utf-8") as handle:
+            handle.write(CLASSIFIER_POLICY.format(base_url=fake.base_url))
+
+        env = {
+            "GUARDRAILS_AUDIT": CLASSIFIER_AUDIT,
+            "GUARDRAILS_POLICY": CLASSIFIER_FILE,
+        }
+        failures = check_classifier_needs_key(env)
+
+        keyed = {**env, "GUARDRAILS_SMOKE_CLASSIFIER_KEY": CLASSIFIER_KEY}
+        benign_failures, stderr_lines = run_session(CLASSIFIER_BENIGN_CHECKS, keyed)
+        failures += benign_failures
+        failures += check_classifier_requests(fake)
+
+        fake.status = 500
+        failed_failures, failed_stderr = run_session(CLASSIFIER_FAILED_CHECKS, keyed)
+        failures += failed_failures
+        failures += check_classifier_audit_log()
+
+        return failures, stderr_lines + failed_stderr
+    except OSError as exc:
+        print(f"FAIL  classifier phase could not run: {exc}")
+        return 1, []
+    finally:
+        fake.close()
+
+
+def check_classifier_needs_key(env: dict[str, str]) -> int:
+    """An enabled classifier without a key is a startup error, not a silent no-op."""
+    clean = {
+        k: v for k, v in os.environ.items() if k != "GUARDRAILS_SMOKE_CLASSIFIER_KEY"
+    }
+    proc = subprocess.run(
+        [BIN, "list-upstream"],
+        env={**clean, "GUARDRAILS_SANDBOX": SANDBOX, **env},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    ok = proc.returncode != 0 and "GUARDRAILS_SMOKE_CLASSIFIER_KEY" in proc.stderr
+    print(f"{'PASS' if ok else 'FAIL'}  a classifier with no API key refuses to start")
+    return 0 if ok else 1
+
+
+def check_classifier_requests(fake: FakeAnthropic) -> int:
+    """What went over the wire: one call, the right headers, the content fenced."""
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    # Confirm mode: only the flagged read is sent, not the clean one.
+    expect(
+        len(fake.requests) == 1,
+        f"confirm mode asks only about the flagged result (got {len(fake.requests)})",
+    )
+    if not fake.requests:
+        return failures
+
+    path, headers, body = fake.requests[0]
+    lowered = {k.lower(): v for k, v in headers.items()}
+    expect(path == "/v1/messages", "the request goes to /v1/messages")
+    expect(
+        lowered.get("x-api-key") == CLASSIFIER_KEY
+        and lowered.get("anthropic-version") == "2023-06-01",
+        "the request carries the key and the API version",
+    )
+    content = (body.get("messages") or [{}])[0].get("content", "")
+    expect(
+        "exfiltration agent" in content and "</tool_output_" in content,
+        "the tool output is sent fenced inside nonce-named tags",
+    )
+
+    return failures
+
+
+def check_classifier_audit_log() -> int:
+    """The verdict is audited; the text never is."""
+    try:
+        with open(CLASSIFIER_AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  classifier audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  classifier audit log unreadable: {exc}")
+        return 1
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    judged = [entry for entry in lines if entry.get("classifier")]
+    expect(
+        [(e.get("classifier"), e.get("scanner_action")) for e in judged]
+        == [("benign", "annotated"), ("failed", "blocked")],
+        "audit records each verdict next to the action it led to",
+    )
+    expect(
+        any("HTTP 500" in entry.get("classifier_error", "") for entry in judged),
+        "a failed classification says why",
+    )
+    expect(
+        not any("exfiltration agent" in json.dumps(entry) for entry in judged),
+        "audit records the verdict, never the classified text",
     )
 
     return failures

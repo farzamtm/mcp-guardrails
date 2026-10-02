@@ -32,6 +32,13 @@ var listOnly = args.Contains("list-upstream", StringComparer.Ordinal);
 // the trail allocates on a path that runs for every single tool call.
 var explain = args.Contains("--explain", StringComparer.Ordinal);
 
+// --injection-classifier turns on the LLM second stage of the injection scanner
+// with its defaults (confirm mode, Haiku, ANTHROPIC_API_KEY) when the policy does
+// not configure it. A policy `classifier:` block always wins, including one that
+// says `mode: off`: the file is the reviewed, committed statement of intent, and
+// a flag in a launcher config should not be able to quietly override it.
+var classifierFlag = args.Contains("--injection-classifier", StringComparer.Ordinal);
+
 // Where the sandboxed filesystem server is allowed to operate.
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
               ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
@@ -95,6 +102,12 @@ var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
                      ".mcp-guardrails",
                      "policy.yaml");
 
+// One client for the life of the process, as HttpClient is designed to be used.
+// Infinite timeout because the injection gate owns the classifier deadline;
+// two competing timeouts would make "timed out" mean two different things.
+// Created unconditionally because it is cheap and opens no connection until used.
+using var classifierHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+
 PolicyEvaluator policy;
 BudgetGate budget;
 InjectionGate scanner;
@@ -106,7 +119,25 @@ try
 
     // On by default, including with no policy file at all: a result scanner that
     // has to be switched on protects nobody, and annotating cannot break a call.
-    scanner = new InjectionGate(document.EffectiveScanners.EffectiveInjection);
+    var injection = document.EffectiveScanners.EffectiveInjection;
+
+    if (classifierFlag && injection.Classifier is null)
+    {
+        injection = injection with { Classifier = ClassifierSettings.Default };
+    }
+
+    // The classifier is opt-in and off by default: it sends tool output to a
+    // third party and costs money per call. A missing API key is a startup
+    // error (PolicyException, caught below) rather than a classifier that
+    // silently fails on every call.
+    scanner = injection.UsesClassifier
+        ? new InjectionGate(
+            injection,
+            AnthropicInjectionClassifier.Create(
+                injection.Classifier!,
+                classifierHttp,
+                Environment.GetEnvironmentVariable))
+        : new InjectionGate(injection);
 
     // No `budgets:` section means an unlimited gate rather than no gate: the
     // call path is then the same whether or not anyone configured a cap, so the
@@ -233,6 +264,9 @@ builder.Services
                         ? scan.Heuristics
                         : null,
                     ScannerAction = scope.Scan?.Describe(),
+                    Classifier = scope.Scan?.Classifier?.Describe(),
+                    ClassifierTruncated = scope.Scan?.Classifier is { Truncated: true } ? true : null,
+                    ClassifierError = scope.Scan?.Classifier?.Error,
                     DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
@@ -321,7 +355,14 @@ builder.Services
         {
             var result = await next(request, cancellationToken);
 
-            var outcome = scanner.Inspect(result, request.Params?.Name ?? UnnamedTool);
+            // Async because the optional classifier is a network call. Without
+            // one configured this completes synchronously and costs what Inspect
+            // did. Classifier failures never surface here - the gate turns them
+            // into "the heuristic verdict stands" and records why.
+            var outcome = await scanner.InspectAsync(
+                result,
+                request.Params?.Name ?? UnnamedTool,
+                cancellationToken);
 
             // Report upward so the audit record carries the finding, exactly as
             // the policy filter reports its decision.
