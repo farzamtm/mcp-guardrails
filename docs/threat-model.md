@@ -225,8 +225,12 @@ question, and it is the operator's.
   `Origin` is refused so a web page cannot drive it through the user's browser.
   Anything that gets past those calls every tool the policy allows. Elicitation
   has no channel back over stateless HTTP, so in-band approval fails closed
-  (`unavailable`), and the session budget is per process — shared by every
-  client — rather than per session.
+  (`unavailable`). For the same reason there is no per-client budget: a
+  `budgets.session` cap would silently be one pool shared by every client, so
+  the proxy refuses to start with one over HTTP (exit code 2). The only cap
+  available is `budgets.daily`, which every client — and every proxy on the
+  same `GUARDRAILS_BUDGET_DB` — draws from together; one noisy client can spend
+  the others' day.
 - The proxy does not authenticate the servers it spawns either, and the approval
   prompt carries no proof of where it came from beyond the client's own UI.
 
@@ -358,8 +362,10 @@ Resources and prompts are not proxied at all.
 ### Smaller sharp edges
 
 - **Session budgets are per process.** "Session" means this proxy process;
-  restarting the client resets the session counters. Daily caps persist in a
-  SQLite file (`GUARDRAILS_BUDGET_DB`) shared by every proxy pointed at it, so
+  restarting the client resets the session counters. Over HTTP, where one
+  process serves many clients, a session budget is refused at startup. Daily
+  caps persist in a SQLite file (`GUARDRAILS_BUDGET_DB`) shared by every proxy
+  pointed at it — and over HTTP by every client of each proxy — so
   anyone who can write that file can reset or inflate the daily spend.
 - **A call to an unknown tool is charged.** If policy allows it, the budget
   charges it before the call handler finds no such tool. Harmless, but not quite

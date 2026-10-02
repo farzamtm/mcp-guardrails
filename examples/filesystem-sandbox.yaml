@@ -23,6 +23,8 @@
 # 'session' is this proxy process, which for an stdio server is one client
 # session: the counters start again next time. Costs come from the matched rule
 # below, defaulting to 1, so a call cap works even with no cost: anywhere.
+# Stateless HTTP has no session, so '--transport http' refuses to start with a
+# 'session' cap: delete it there and rely on 'daily'.
 #
 # 'daily' is one UTC day (00:00-24:00 UTC) across every session and restart. It
 # persists in a SQLite file - ~/.mcp-guardrails/budgets.db, or wherever

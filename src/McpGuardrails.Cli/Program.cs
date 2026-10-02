@@ -243,6 +243,20 @@ catch (PolicyException ex)
     return 1;
 }
 
+// A valid policy can still ask for something the chosen transport cannot do:
+// a session budget over stateless HTTP would quietly become one pool shared by
+// every client. Exit code 2 like the other transport refusals, because the
+// policy is fine - it is the combination with --transport that is not.
+try
+{
+    serve.EnsureEnforceable(budgets);
+}
+catch (ServeOptionsException ex)
+{
+    await Console.Error.WriteLineAsync($"Policy file '{policyPath}': {ex.Message}");
+    return 2;
+}
+
 // Where daily budget counters persist. An environment variable like the audit
 // and policy paths, not a policy key: the policy says what the limits are, the
 // deployment says where state lives - and two agents sharing one policy file

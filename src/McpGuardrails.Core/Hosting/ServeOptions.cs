@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using McpGuardrails.Core.Budget;
 
 namespace McpGuardrails.Core.Hosting;
 
@@ -126,6 +127,36 @@ public sealed record ServeOptions(
             address,
             ParsePort(port),
             ParseToken(bearerToken, address));
+    }
+
+    /// <summary>
+    /// Refuses a budget section this transport cannot enforce as written.
+    /// </summary>
+    /// <remarks>
+    /// <c>budgets.session</c> promises a cap per client session. Stateless HTTP
+    /// has no session, so the only thing the counter could hang off is the
+    /// process: one pool, silently shared by every client for as long as the
+    /// proxy runs. That is a different limit from the one the operator wrote,
+    /// and a cap that would mean something other than it says is refused rather
+    /// than reinterpreted. <c>budgets.daily</c> is unaffected - it is persisted
+    /// and process-wide by design, so it means the same over either transport.
+    /// </remarks>
+    /// <param name="budgets">The policy's validated budget section.</param>
+    /// <exception cref="ServeOptionsException">
+    /// The transport is HTTP and a session budget is configured.
+    /// </exception>
+    public void EnsureEnforceable(BudgetPolicy budgets)
+    {
+        ArgumentNullException.ThrowIfNull(budgets);
+
+        if (Transport is Transport.Http && budgets.Session is not null)
+        {
+            throw new ServeOptionsException(
+                $"'budgets.{BudgetGate.SessionScope}' cannot be enforced over '--transport http': " +
+                "stateless HTTP has no session, so the cap would be one pool shared by every " +
+                $"client for the life of the process. Use 'budgets.{BudgetGate.DailyScope}' " +
+                "(persisted, and process-wide by design), or serve over stdio.");
+        }
     }
 
     private static string Value(IReadOnlyList<string> args, ref int i, string? existing)

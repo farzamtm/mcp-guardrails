@@ -66,7 +66,9 @@ is worse than none:
   permissions question.
 - The Streamable HTTP host serves plain HTTP, with one optional shared bearer
   token and no per-client identity. It binds loopback by default; anything
-  wider belongs behind a TLS-terminating reverse proxy you trust.
+  wider belongs behind a TLS-terminating reverse proxy you trust. With no
+  per-client identity there is no per-client budget either: session budgets
+  are refused over HTTP, and the daily budget is shared by every client.
 
 ## Supported versions
 
