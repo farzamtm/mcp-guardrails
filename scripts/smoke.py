@@ -557,9 +557,18 @@ APPROVED_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
+# The declined write carries a credential: nothing reaches the disk either way,
+# and the question the fake human was shown is checked afterwards for the path,
+# for the redaction marker, and for the absence of the key itself.
+APPROVAL_SECRET_CONTENT = f"{CONTENT}\naws_access_key_id = {AWS_KEY}\n"
+
 DECLINED_CHECKS: list[tuple[dict, str, object]] = [
     (
-        call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
+        call(
+            1,
+            "fs__write_file",
+            {"path": APPROVAL_REFUSED, "content": APPROVAL_SECRET_CONTENT},
+        ),
         "a human declines and the call is refused",
         lambda r: denied_with(r, "declined it"),
     ),
@@ -1044,22 +1053,25 @@ def main() -> int:
         "GUARDRAILS_POLICY": APPROVAL_FILE,
     }
     approval_stderr: list[str] = []
+    declined_questions: list[str] = []
 
-    for checks, answer, handshake in (
-        (APPROVED_CHECKS, "approve", True),
-        (DECLINED_CHECKS, "decline", True),
-        (TIMEOUT_CHECKS, "ignore", True),
-        (NO_APPROVER_CHECKS, "approve", False),
+    for checks, answer, handshake, questions in (
+        (APPROVED_CHECKS, "approve", True, None),
+        (DECLINED_CHECKS, "decline", True, declined_questions),
+        (TIMEOUT_CHECKS, "ignore", True, None),
+        (NO_APPROVER_CHECKS, "approve", False, None),
     ):
         session_failures, session_stderr = run_session(
             checks,
             approval_env,
             handshake=handshake,
             elicit=answer,
+            questions=questions,
         )
         failures += session_failures
         approval_stderr += session_stderr
 
+    failures += check_approval_question(declined_questions)
     failures += check_approval_audit_log()
 
     # Phase 5: the first guardrail that runs on the way BACK. The call is
@@ -1194,6 +1206,7 @@ def run_session(
     *,
     handshake: bool = False,
     elicit: str = "approve",
+    questions: list[str] | None = None,
 ) -> tuple[int, list[str]]:
     """Drive one proxy process through a list of checks.
 
@@ -1203,6 +1216,9 @@ def run_session(
 
     elicit decides how this fake human answers: approve, decline, or ignore (say
     nothing at all and let the approval time out).
+
+    questions, when given, collects the message of every elicitation, so a
+    caller can check what the human was actually shown.
     """
     proc = subprocess.Popen(
         [BIN],
@@ -1233,6 +1249,9 @@ def run_session(
 
     def answer_elicitation(message: dict) -> None:
         """Play the human at the client."""
+        if questions is not None:
+            questions.append(message.get("params", {}).get("message", ""))
+
         if elicit == "ignore":
             # Say nothing at all. The proxy's own deadline has to be what ends
             # the wait, which is the only way to test it honestly.
@@ -1657,6 +1676,54 @@ def check_policy_audit_log() -> int:
         all(entry.get("is_error") for entry in denials),
         "denied calls are flagged as errors",
     )
+
+    return failures
+
+
+def check_approval_question(questions: list[str]) -> int:
+    """The human must see what they are approving, minus the secret in it.
+
+    Checked on the wire, as the client receives it: the rule's own prompt, then
+    the arguments as one line of JSON, the path whole and the key redacted. The
+    content has a newline in it, so a JSON parse of the last line also proves
+    the value could not break out onto a line of its own.
+    """
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    if len(questions) != 1:
+        expect(False, f"the declined call asked exactly once (asked {len(questions)})")
+        return failures
+
+    question = questions[0]
+    lines = question.split("\n")
+
+    try:
+        shown = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        shown = {}
+
+    expect(
+        question.startswith("Allow the agent to write a file in the sandbox?\n"),
+        "the approval question still leads with the rule's own prompt",
+    )
+    expect(
+        isinstance(shown, dict) and shown.get("path") == APPROVAL_REFUSED,
+        "the approval question shows the path, as JSON on its own line",
+    )
+    expect(
+        isinstance(shown, dict) and AWS_MARKER in str(shown.get("content", "")),
+        "the approval question shows the content with the key redacted",
+    )
+    expect(AWS_KEY not in question, "the raw key never reaches the approver")
+
+    if failures:
+        print(question[:700])
 
     return failures
 

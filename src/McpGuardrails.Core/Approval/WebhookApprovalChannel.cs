@@ -2,7 +2,6 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
-using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Serialization;
 
 namespace McpGuardrails.Core.Approval;
@@ -34,14 +33,6 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
 
     /// <summary>Header repeating the body's <c>request_id</c>, for receivers' logs.</summary>
     public const string RequestIdHeader = "X-Guardrails-Request-Id";
-
-    /// <summary>Longest argument value sent in full; longer ones are cut.</summary>
-    /// <remarks>
-    /// An approver needs to see which path or which customer, not the 40 KB of
-    /// file content being written - and every byte sent is a byte disclosed to
-    /// one more system.
-    /// </remarks>
-    internal const int MaxArgumentLength = 256;
 
     /// <summary>Largest answer the channel will read.</summary>
     /// <remarks>
@@ -166,54 +157,6 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
     internal string Sign(byte[] body) =>
         "sha256=" + Convert.ToHexStringLower(HMACSHA256.HashData(_secret, body));
 
-    /// <summary>Shortens arguments to what an approver needs to see.</summary>
-    /// <remarks>
-    /// Secrets are redacted whatever <c>scanners.secrets</c> says, because the
-    /// endpoint is one more system outside the proxy and an approver decides on
-    /// the path and the shape of a call, never on a key's value. Redacted before
-    /// the cut, so truncation cannot leave half a key the detectors no longer
-    /// recognise. PII is left alone: "which customer" is often the question.
-    /// </remarks>
-    internal static IReadOnlyDictionary<string, string>? Summarize(
-        IReadOnlyDictionary<string, JsonElement>? arguments)
-    {
-        if (arguments is null)
-        {
-            return null;
-        }
-
-        var summary = new Dictionary<string, string>(arguments.Count, StringComparer.Ordinal);
-
-        foreach (var (name, value) in arguments)
-        {
-            // Strings unquoted, so a path reads as a path; anything else as the
-            // JSON the model sent, so an object or a number is not misrepresented.
-            var text = value.ValueKind is JsonValueKind.String
-                ? value.GetString()!
-                : value.GetRawText();
-
-            summary[name] = Truncate(SecretScanner.Redact(text, includePii: false).Text);
-        }
-
-        return summary;
-    }
-
-    private static string Truncate(string text)
-    {
-        if (text.Length <= MaxArgumentLength)
-        {
-            return text;
-        }
-
-        // Never split a surrogate pair: half of one is not a character, and the
-        // receiver would get a replacement glyph or a decoding error instead.
-        var cut = char.IsHighSurrogate(text[MaxArgumentLength - 1])
-            ? MaxArgumentLength - 1
-            : MaxArgumentLength;
-
-        return $"{text[..cut]}... ({text.Length - cut} more characters)";
-    }
-
     private static WebhookApprovalPayload Payload(ApprovalRequest request) => new()
     {
         RequestId = request.RequestId,
@@ -221,7 +164,9 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
         Server = request.Server,
         Rule = request.RuleName,
         Question = request.Question,
-        Arguments = Summarize(request.Arguments),
+        // Shared with the in-band question, so the two channels redact and cut
+        // identically; see ApprovalArguments for what is withheld and why.
+        Arguments = ApprovalArguments.Summarize(request.Arguments),
         SentAt = DateTimeOffset.UtcNow,
         Deadline = request.Deadline,
     };

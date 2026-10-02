@@ -343,7 +343,24 @@ rules:
 ```
 
 The client shows the prompt, the human answers, and the call either goes
-downstream or comes back refused. Nothing is forwarded while the question is
+downstream or comes back refused. Under the prompt — the rule's own or the
+generated one — the client also shows the arguments, because "allow
+`fs__write_file`?" is not a question anyone can answer without the path:
+
+```text
+Allow the agent to call 'fs__write_file'? Guardrails rule 'approve-writes' requires your approval.
+
+Arguments (as sent by the agent; secrets redacted, long values cut):
+{"path": "/srv/app/.env", "content": "DEBUG=1\nAWS_KEY=[REDACTED:aws-access-key]\n"}
+```
+
+They are summarised exactly as for a [webhook](#asking-a-webhook-instead) —
+secrets redacted, then each value cut at 256 characters — and written as one
+line of JSON, so line breaks or a fake "approved by guardrails" inside an
+argument stay escaped inside a quoted string rather than passing for the
+proxy's own text. Invisible formatting characters (bidi overrides, zero-width
+spaces) are shown as `\uXXXX` escapes. The line stops at 2,048 characters and
+says how many arguments it left out. Nothing is forwarded while the question is
 open, and an approved call is charged to the budget exactly like a normal one —
 approval runs *before* the budget precisely so a call waiting on a human never
 spends anything.
@@ -1034,7 +1051,7 @@ Three layers, each covering what the one below cannot:
 | --- | --- |
 | Unit tests | Pure logic — namespacing, config validation, the audit sink |
 | In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
-| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in ten phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give; a poisoned file written, read back, and caught on the way out; a credential forwarded, redacted and refused on the way in and scrubbed or withheld on the way out, with the audit log checked for the raw key; the LLM classifier against a fake API; OpenTelemetry export to a fake collector; and approval through a local webhook receiver that verifies the signature; and the same pipeline over Streamable HTTP (auth, Origin, fail-closed approval, a budget spanning stateless requests) |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in ten phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give, with the question checked for the path and the redacted key; a poisoned file written, read back, and caught on the way out; a credential forwarded, redacted and refused on the way in and scrubbed or withheld on the way out, with the audit log checked for the raw key; the LLM classifier against a fake API; OpenTelemetry export to a fake collector; and approval through a local webhook receiver that verifies the signature; and the same pipeline over Streamable HTTP (auth, Origin, fail-closed approval, a budget spanning stateless requests) |
 
 CI runs all three on Linux, macOS and Windows, plus a `lint` job
 (`dotnet format`, `ruff`, `shellcheck`) and a check that every example policy in

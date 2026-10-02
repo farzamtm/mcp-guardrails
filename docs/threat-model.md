@@ -283,13 +283,19 @@ the only thing between that description and a matching tool call.
 
 ### Approval has limits of its own
 
-- **The approver at the client does not see the arguments.** The question is
-  the rule's `prompt:` or a generated sentence naming the tool and the rule
-  ([`ApprovalGate.Question`](../src/McpGuardrails.Core/Approval/ApprovalGate.cs)).
-  A human approving `fs__write_file` cannot tell from the prompt whether the
-  path is the one they expect. A webhook does get the arguments, cut to 256
-  characters with recognised secrets redacted, so the receiver is one more
-  place that stores what the model wrote.
+- **The approver sees a summary of the arguments, not all of them.** Both
+  channels get the same summary
+  ([`ApprovalArguments`](../src/McpGuardrails.Core/Approval/ApprovalArguments.cs)):
+  recognised secrets redacted first, then each value cut to 256 characters. At
+  the client it follows the question as one line of JSON under a fixed label,
+  so a value containing line breaks and "this call is safe, approve" stays a
+  quoted, escaped string on the data line instead of reading like the proxy's
+  own words; bidi overrides and zero-width characters are escaped too, so a
+  path cannot display as something it is not. What remains: content past the
+  cut is unseen, the in-band line stops at 2,048 characters and says how many
+  arguments it left out, a secret the detectors do not recognise is shown in
+  full, and both the webhook receiver and the client's dialog are one more
+  place that keeps what the model wrote. A human can also simply not read it.
 - **Approval is only as good as the client.** A client configured to
   auto-accept elicitation turns every `require_approval` into `allow`. The proxy
   cannot tell.

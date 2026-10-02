@@ -54,7 +54,10 @@ internal sealed class ElicitationApprovalChannel : IApprovalChannel
             result = await _server.ElicitAsync(
                 new ElicitRequestParams
                 {
-                    Message = request.Question,
+                    // The question plus the call's arguments: the person at the
+                    // client is otherwise approving a tool name, unable to see
+                    // which path or what content they are saying yes to.
+                    Message = ApprovalArguments.Describe(request),
                     RequestedSchema = new ElicitRequestParams.RequestSchema
                     {
                         Properties =
