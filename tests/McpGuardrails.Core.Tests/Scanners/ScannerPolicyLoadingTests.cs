@@ -100,18 +100,94 @@ public sealed class ScannerPolicyLoadingTests
     }
 
     [Fact]
-    public void AskingForSecretRedaction_IsAnErrorRatherThanASilentNoOp()
+    public void SecretRedaction_IsOnWithNoPolicyFile()
     {
-        // Same honesty as 'budgets.daily' and 'approval.mode: slack'. Nothing
-        // redacts anything yet, and an operator who believes their API keys are
-        // being scrubbed is worse off than one who gets an error at startup.
-        var error = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+        // Arguments reach the server but not the log; results are scrubbed before
+        // the model sees them; personal data is left alone until asked for.
+        var secrets = PolicyDocument.Empty.EffectiveScanners.EffectiveSecrets;
+
+        Assert.Equal(SecretArgumentAction.RedactAudit, secrets.EffectiveArguments);
+        Assert.Equal(SecretResultAction.Redact, secrets.EffectiveResults);
+        Assert.False(secrets.IncludePii);
+    }
+
+    [Fact]
+    public void SecretRedaction_IsConfiguredPerDirection()
+    {
+        var document = PolicyLoader.Parse("""
             scanners:
               secrets:
-                action: block
-            """));
+                arguments: block
+                results: redact
+                pii: true
+            """);
 
-        Assert.Contains("'scanners.secrets' is not implemented yet", error.Message, StringComparison.Ordinal);
+        var secrets = document.EffectiveScanners.EffectiveSecrets;
+
+        Assert.Equal(SecretArgumentAction.Block, secrets.EffectiveArguments);
+        Assert.Equal(SecretResultAction.Redact, secrets.EffectiveResults);
+        Assert.True(secrets.IncludePii);
+    }
+
+    [Theory]
+    [InlineData("redact_audit", SecretArgumentAction.RedactAudit)]
+    [InlineData("redact", SecretArgumentAction.Redact)]
+    [InlineData("off", SecretArgumentAction.Off)]
+    public void SecretArgumentActions_UseTheirSnakeCaseNames(string yaml, SecretArgumentAction expected)
+    {
+        var document = PolicyLoader.Parse($"""
+            scanners:
+              secrets:
+                arguments: {yaml}
+                results: off
+            """);
+
+        Assert.Equal(expected, document.EffectiveScanners.EffectiveSecrets.EffectiveArguments);
+        Assert.Equal(SecretResultAction.Off, document.EffectiveScanners.EffectiveSecrets.EffectiveResults);
+    }
+
+    [Fact]
+    public void AnEmptySecretsBlock_KeepsTheDefaults()
+    {
+        var document = PolicyLoader.Parse("""
+            scanners:
+              secrets: {}
+            """);
+
+        Assert.NotNull(document.Scanners?.Secrets);
+        Assert.Equal(SecretArgumentAction.RedactAudit, document.EffectiveScanners.EffectiveSecrets.EffectiveArguments);
+    }
+
+    [Fact]
+    public void AnUnknownSecretAction_IsRejectedWhenTheFileLoads()
+    {
+        Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            scanners:
+              secrets:
+                results: shout
+            """));
+    }
+
+    [Fact]
+    public void AnUnknownSecretActionReachingValidation_NamesTheChoices()
+    {
+        var arguments = new ScannerPolicy
+        {
+            Secrets = new SecretScannerSettings { Arguments = (SecretArgumentAction)99 },
+        };
+        var results = new ScannerPolicy
+        {
+            Secrets = new SecretScannerSettings { Results = (SecretResultAction)99 },
+        };
+
+        Assert.Contains(
+            "redact_audit, redact, block or off",
+            Assert.Throws<PolicyException>(arguments.Validate).Message,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "'scanners.secrets.results'",
+            Assert.Throws<PolicyException>(results.Validate).Message,
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -120,5 +196,7 @@ public sealed class ScannerPolicyLoadingTests
         Assert.Equal(ScanAction.Annotate, ScannerPolicy.Default.EffectiveInjection.EffectiveAction);
         Assert.False(ScannerSettings.Default.IsOff);
         Assert.True(ScannerSettings.Disabled.IsOff);
+        Assert.Equal(SecretArgumentAction.Off, SecretScannerSettings.Disabled.EffectiveArguments);
+        Assert.Equal(SecretResultAction.Off, SecretScannerSettings.Disabled.EffectiveResults);
     }
 }

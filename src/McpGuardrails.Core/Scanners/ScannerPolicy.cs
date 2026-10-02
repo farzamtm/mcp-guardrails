@@ -45,6 +45,11 @@ public enum ScanAction
 /// sibling of <c>rules:</c> rather than a field on one: a rule identifies a call,
 /// and the content a server returns is not something the call's name, annotations
 /// or arguments can predict.
+///
+/// Secret redaction lives here too even though half of it reads arguments on the
+/// way out. It is still content inspection rather than call identification: a
+/// rule can say "this tool, with this path", but not "any string, anywhere in
+/// the call, that happens to be an access key".
 /// </remarks>
 public sealed record ScannerPolicy
 {
@@ -52,14 +57,14 @@ public sealed record ScannerPolicy
     [JsonPropertyName("injection")]
     public ScannerSettings? Injection { get; init; }
 
-    /// <summary>
-    /// Secret and PII redaction. Parsed only so it can be rejected - see
-    /// <see cref="Validate"/>.
-    /// </summary>
+    /// <summary>Secret and PII redaction of arguments and results.</summary>
     [JsonPropertyName("secrets")]
-    public ScannerSettings? Secrets { get; init; }
+    public SecretScannerSettings? Secrets { get; init; }
 
-    /// <summary>The defaults: injection scanning on, annotating what it finds.</summary>
+    /// <summary>
+    /// The defaults: injection scanning annotating what it finds, and secrets
+    /// redacted from the audit log and from results.
+    /// </summary>
     public static ScannerPolicy Default { get; } = new();
 
     /// <summary>The injection settings, or the defaults when the file omits them.</summary>
@@ -71,23 +76,15 @@ public sealed record ScannerPolicy
     [JsonIgnore]
     public ScannerSettings EffectiveInjection => Injection ?? ScannerSettings.Default;
 
+    /// <summary>The secret settings, or the defaults when the file omits them.</summary>
+    [JsonIgnore]
+    public SecretScannerSettings EffectiveSecrets => Secrets ?? SecretScannerSettings.Default;
+
     /// <summary>Validates the section, throwing with a message naming the problem.</summary>
     public void Validate()
     {
         EffectiveInjection.Validate("injection");
-
-        // The same honesty the budgets section applies to `daily:` and approval
-        // applies to `mode: slack`. Redaction is the next piece of work and the
-        // key is already reserved; accepting it now would leave an operator
-        // believing their API keys were being scrubbed out of the audit log when
-        // nothing was scrubbing them.
-        if (Secrets is not null)
-        {
-            throw new PolicyException(
-                "'scanners.secrets' is not implemented yet: nothing redacts secrets from " +
-                "arguments, results or the audit log in this build. Remove the section " +
-                "rather than relying on a scrubber that does nothing.");
-        }
+        EffectiveSecrets.Validate();
     }
 }
 
@@ -166,5 +163,143 @@ public sealed record ScannerSettings
         }
 
         Classifier.Validate();
+    }
+}
+
+/// <summary>
+/// What to do with tool-call arguments that contain a secret.
+/// </summary>
+/// <remarks>
+/// A separate enum from <see cref="SecretResultAction"/> because arguments have
+/// a choice results do not: the secret can go to the server while staying out of
+/// the proxy's own log. A result has only one reader, the model, so there is
+/// nothing to split.
+/// </remarks>
+[JsonConverter(typeof(JsonStringEnumConverter<SecretArgumentAction>))]
+public enum SecretArgumentAction
+{
+    /// <summary>
+    /// Forward the arguments unchanged, and redact them in the audit log.
+    /// </summary>
+    /// <remarks>
+    /// The zero value and the default, because it is the one setting that cannot
+    /// break a call: the server receives exactly what the model sent. What it
+    /// removes is the proxy's own liability - a log of every argument ever sent is
+    /// otherwise a file full of API keys that nobody thinks of as sensitive.
+    /// </remarks>
+    [JsonStringEnumMemberName("redact_audit")]
+    RedactAudit,
+
+    /// <summary>Replace secrets with markers in the call that is forwarded, too.</summary>
+    [JsonStringEnumMemberName("redact")]
+    Redact,
+
+    /// <summary>Refuse the call. Nothing is forwarded.</summary>
+    [JsonStringEnumMemberName("block")]
+    Block,
+
+    /// <summary>Do not scan arguments; log them verbatim.</summary>
+    [JsonStringEnumMemberName("off")]
+    Off,
+}
+
+/// <summary>
+/// What to do with a tool result that contains a secret.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter<SecretResultAction>))]
+public enum SecretResultAction
+{
+    /// <summary>Replace each secret with a marker naming what was removed.</summary>
+    [JsonStringEnumMemberName("redact")]
+    Redact,
+
+    /// <summary>Withhold the whole result and return a tool error.</summary>
+    [JsonStringEnumMemberName("block")]
+    Block,
+
+    /// <summary>Do not scan results.</summary>
+    [JsonStringEnumMemberName("off")]
+    Off,
+}
+
+/// <summary>
+/// The <c>scanners.secrets</c> section: redaction of credentials and personal data.
+/// </summary>
+/// <remarks>
+/// Its own shape rather than a <see cref="ScannerSettings"/>, because the two
+/// directions want different answers. An argument is the model sending a secret
+/// OUT to a server; a result is a server handing one IN to the model, and from
+/// there to the model provider and every transcript. One <c>action:</c> for both
+/// would force an operator to pick the same trade-off for two different risks.
+/// </remarks>
+public sealed record SecretScannerSettings
+{
+    /// <summary>The settings used when the policy file says nothing.</summary>
+    public static SecretScannerSettings Default { get; } = new();
+
+    /// <summary>Both directions off.</summary>
+    public static SecretScannerSettings Disabled { get; } = new()
+    {
+        Arguments = SecretArgumentAction.Off,
+        Results = SecretResultAction.Off,
+    };
+
+    /// <summary>
+    /// What to do with secrets in arguments: <c>redact_audit</c>, <c>redact</c>,
+    /// <c>block</c> or <c>off</c>.
+    /// </summary>
+    [JsonPropertyName("arguments")]
+    public SecretArgumentAction? Arguments { get; init; }
+
+    /// <inheritdoc cref="Arguments" />
+    [JsonIgnore]
+    public SecretArgumentAction EffectiveArguments => Arguments ?? SecretArgumentAction.RedactAudit;
+
+    /// <summary>What to do with secrets in results: <c>redact</c>, <c>block</c> or <c>off</c>.</summary>
+    /// <remarks>
+    /// Defaults to redact, which - like injection scanning - means it is on with
+    /// no policy file at all. The costs are lopsided in the same direction: a key
+    /// the model has read has already been sent to the model provider and cannot
+    /// be unsent, while a false positive costs a marker where a token-shaped
+    /// string used to be. The trailer the gate appends tells the model the markers
+    /// are not the real values, which is what should stop one being written back
+    /// into the file it came from.
+    /// </remarks>
+    [JsonPropertyName("results")]
+    public SecretResultAction? Results { get; init; }
+
+    /// <inheritdoc cref="Results" />
+    [JsonIgnore]
+    public SecretResultAction EffectiveResults => Results ?? SecretResultAction.Redact;
+
+    /// <summary>Also redact personal data: email addresses and card numbers.</summary>
+    /// <remarks>
+    /// Off by default, the opposite call to the one made for credentials. An
+    /// access key in a tool result is almost never the point of the call; an
+    /// email address very often is - a git log, a contact lookup, a ticket
+    /// assignee. Redacting those by default would break ordinary work to protect
+    /// data the user usually asked for.
+    /// </remarks>
+    [JsonPropertyName("pii")]
+    public bool? Pii { get; init; }
+
+    /// <inheritdoc cref="Pii" />
+    [JsonIgnore]
+    public bool IncludePii => Pii ?? false;
+
+    internal void Validate()
+    {
+        if (!Enum.IsDefined(EffectiveArguments))
+        {
+            throw new PolicyException(
+                "'scanners.secrets.arguments' is not a known action. " +
+                "Use redact_audit, redact, block or off.");
+        }
+
+        if (!Enum.IsDefined(EffectiveResults))
+        {
+            throw new PolicyException(
+                "'scanners.secrets.results' is not a known action. Use redact, block or off.");
+        }
     }
 }

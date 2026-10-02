@@ -44,9 +44,9 @@ public sealed record AuditRecord
     /// Arguments the client supplied.
     /// </summary>
     /// <remarks>
-    /// Logged verbatim today. Secret/PII redaction is the next piece of work and
-    /// this is the field it has to scrub - an audit log that quietly records API
-    /// keys is a liability rather than a safety feature.
+    /// Secrets are replaced with markers before they get here, unless
+    /// <c>scanners.secrets.arguments</c> is <c>off</c>. An audit log that quietly
+    /// records API keys is a liability rather than a safety feature.
     /// </remarks>
     [JsonPropertyName("arguments")]
     public IReadOnlyDictionary<string, JsonElement>? Arguments { get; init; }
@@ -116,6 +116,26 @@ public sealed record AuditRecord
     /// <summary>Why the classifier failed, when it did: an HTTP status, a timeout, a bad reply.</summary>
     [JsonPropertyName("classifier_error")]
     public string? ClassifierError { get; init; }
+
+    /// <summary>Detectors that found a secret in the arguments, e.g. aws-access-key.</summary>
+    /// <remarks>
+    /// Names only, for the same reason as <see cref="ScannerHits"/> and with
+    /// higher stakes: the evidence here IS the secret.
+    /// </remarks>
+    [JsonPropertyName("argument_secrets")]
+    public IReadOnlyList<string>? ArgumentSecrets { get; init; }
+
+    /// <summary>What became of them: forwarded, redacted or blocked.</summary>
+    [JsonPropertyName("argument_secrets_action")]
+    public string? ArgumentSecretsAction { get; init; }
+
+    /// <summary>Detectors that found a secret in the result.</summary>
+    [JsonPropertyName("result_secrets")]
+    public IReadOnlyList<string>? ResultSecrets { get; init; }
+
+    /// <summary>What the proxy did about them: redacted or blocked.</summary>
+    [JsonPropertyName("result_secrets_action")]
+    public string? ResultSecretsAction { get; init; }
 
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }

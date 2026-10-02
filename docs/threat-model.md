@@ -23,7 +23,7 @@ This is the long version.
 | **The human approver's attention** | `require_approval` is only worth something if the person asked actually understands what they are approving. |
 | **The audit log** | The record of what the agent did. Useless if it can silently lose lines or be rewritten. |
 | **The policy file** | Defines every decision. Whoever controls it controls the proxy. |
-| **Secrets in arguments and in the environment** | API keys passed as tool arguments land in the audit log; the proxy's environment is inherited by every server it spawns. |
+| **Secrets in arguments, results and the environment** | An API key a tool returns is read by the model and sent to its provider; one passed as an argument reaches the server and the audit log; the proxy's environment is inherited by every server it spawns. |
 | **Budget** | Calls and per-rule cost — the bound on a looping agent. |
 
 ## Components and trust boundaries
@@ -154,7 +154,7 @@ the fastest route to "clean up the repo" is `rm`.
     start** rather than falling back to passthrough
     ([`PolicyLoader`](../src/McpGuardrails.Core/Policy/PolicyLoader.cs));
   - configuration the build cannot honour — `budgets.daily`, `mode: slack` /
-    `webhook`, `scanners.secrets` — is a load-time error, not a silent no-op.
+    `webhook` — is a load-time error, not a silent no-op.
 - **The arguments policy sees are the arguments the server gets.** The call
   handler forwards the same parsed argument dictionary the policy evaluated, so
   there is no second parse for a duplicate key or encoding trick to exploit.
@@ -195,8 +195,10 @@ already won. Concretely, so nobody mistakes this for a defended boundary:
   becomes a passthrough on next start, because a missing file means "no policy"
   by design. **Set `GUARDRAILS_POLICY`** in the client's config → point it
   anywhere.
-- **Read the audit log** → see every argument the agent ever sent, verbatim,
-  including any secret passed as an argument.
+- **Read the audit log** → see every argument the agent ever sent. Secrets the
+  detectors recognise are markers (unless `scanners.secrets.arguments: off`);
+  anything else, including a credential in a shape they do not know, is there
+  verbatim.
 - **Write to the audit log** → append, edit or truncate it. There is no hash
   chain, signature or other tamper evidence, and the proxy never reads the file
   back, so it would not notice.
@@ -255,7 +257,9 @@ match the *shape* of an injection, so:
   (`scanners.injection.classifier`, off by default) can soften a `block` to an
   annotation on a false positive, but it reads the same attacker-controlled text,
   so it is never trusted to remove a warning; when it fails or times out the
-  heuristic verdict stands. Turning it on sends tool output to Anthropic.
+  heuristic verdict stands. Turning it on sends tool output to Anthropic, with
+  recognised secrets redacted first — even when `scanners.secrets.results` is
+  `off`, because the classifier runs before the result is redacted for the model.
 
 ### Tool metadata is not inspected
 
@@ -316,8 +320,13 @@ Resources and prompts are not proxied at all.
 
 ### The audit log is evidence, not proof
 
-- **Arguments are logged verbatim** until secret redaction lands. A token passed
-  as an argument is in the log in plain text. The arguments are also
+- **Redaction is pattern matching.** Secrets in a known shape are replaced with
+  `[REDACTED:<kind>]` markers in the log and, by default, in results. A
+  human-chosen password outside a recognisable assignment, or a key format the
+  detectors have not heard of, is logged and returned in plain text. The
+  default `arguments: redact_audit` still forwards the real value to the
+  server; the log records `argument_secrets_action: "forwarded"` when it does.
+  The arguments are also
   model-written, so they can carry injected text of their own — the scanner's
   "names only" rule covers results, not arguments. Do not pipe the log into
   another model unfiltered.
@@ -365,7 +374,6 @@ loader **rejects** it rather than accepting a setting that does nothing.
 
 | Planned | Today |
 | --- | --- |
-| Secret / PII redaction of arguments, results and the audit log (`scanners.secrets`) | Rejected at load; arguments logged verbatim |
 | Out-of-band approval: webhook and Slack (`approval.mode`) | Rejected at load; only `in_band` elicitation |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
 | Persistent budgets and daily caps (SQLite store, `budgets.daily`) | Rejected at load; in-memory session counters |

@@ -160,6 +160,7 @@ using var classifierHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan }
 PolicyEvaluator policy;
 BudgetGate budget;
 InjectionGate scanner;
+SecretGate secrets;
 try
 {
     var document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
@@ -175,17 +176,26 @@ try
         injection = injection with { Classifier = ClassifierSettings.Default };
     }
 
+    // Also on by default. Out of the box it changes no call - arguments are
+    // forwarded as sent and only the audit log is scrubbed - but it does redact
+    // secrets from results, because a key the model has read cannot be unread.
+    var secretSettings = document.EffectiveScanners.EffectiveSecrets;
+    secrets = new SecretGate(secretSettings);
+
     // The classifier is opt-in and off by default: it sends tool output to a
     // third party and costs money per call. A missing API key is a startup
     // error (PolicyException, caught below) rather than a classifier that
-    // silently fails on every call.
+    // silently fails on every call. It runs inside the secret gate, so it
+    // redacts for itself before anything leaves the process.
     scanner = injection.UsesClassifier
         ? new InjectionGate(
             injection,
-            AnthropicInjectionClassifier.Create(
-                injection.Classifier!,
-                classifierHttp,
-                Environment.GetEnvironmentVariable))
+            new RedactingInjectionClassifier(
+                AnthropicInjectionClassifier.Create(
+                    injection.Classifier!,
+                    classifierHttp,
+                    Environment.GetEnvironmentVariable),
+                secretSettings.IncludePii))
         : new InjectionGate(injection);
 
     // No `budgets:` section means an unlimited gate rather than no gate: the
@@ -234,8 +244,8 @@ const string UnnamedTool = "(missing)";
 //                          names rewritten into the proxy's namespace
 //   WithCallToolHandler  - routes an incoming call to the owning server
 //
-// Right now both are pure pass-through. Every guardrail in the spec - policy,
-// budget, approval, redaction - becomes a filter wrapped around these.
+// Both are pure pass-through. Every guardrail in the spec - policy, budget,
+// approval, scanning, redaction - is a filter wrapped around these.
 // ---------------------------------------------------------------------------
 builder.Services
     .AddMcpServer(options =>
@@ -294,6 +304,13 @@ builder.Services
                 resolved ? connection.Name : null,
                 resolved ? downstreamName : null);
 
+            // Scanned here, before anything runs, rather than taken from the
+            // filters inside: a call the policy refuses never reaches them, and
+            // its arguments are exactly as likely to hold a key. Before `next`,
+            // too, because the redaction filter may rewrite the arguments in
+            // place and this must see what the model actually sent.
+            var arguments = secrets.ScanArguments(request.Params?.Arguments);
+
             // Stopwatch timestamps rather than DateTime subtraction: this reads a
             // monotonic clock, so an NTP correction mid-call cannot produce a
             // negative duration.
@@ -327,7 +344,7 @@ builder.Services
                     Tool = toolName,
                     Server = resolved ? connection.Name : null,
                     DownstreamTool = resolved ? downstreamName : null,
-                    Arguments = request.Params?.Arguments?.AsReadOnly(),
+                    Arguments = arguments.Redacted,
                     Decision = decision?.Verdict.ToString().ToLowerInvariant(),
                     Rule = decision?.RuleName,
                     DecisionReason = decision?.Reason,
@@ -342,6 +359,12 @@ builder.Services
                     Classifier = scope.Scan?.Classifier?.Describe(),
                     ClassifierTruncated = scope.Scan?.Classifier is { Truncated: true } ? true : null,
                     ClassifierError = scope.Scan?.Classifier?.Error,
+                    ArgumentSecrets = arguments.Report.IsClean ? null : arguments.Report.Detectors,
+                    ArgumentSecretsAction = secrets.DescribeArguments(arguments, decision),
+                    ResultSecrets = scope.Redaction is { Effect: not RedactionEffect.None } redaction
+                        ? redaction.Report.Detectors
+                        : null,
+                    ResultSecretsAction = scope.Redaction?.Describe(),
                     DurationMs = elapsed.TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
@@ -377,15 +400,21 @@ builder.Services
 
             var facts = PolicyFacts.ForCall(toolName, request.Params, tool);
 
-            // Three gates, in this order, and the order is the design.
+            // Four gates, in this order, and the order is the design.
             //
-            // The policy decides whether the call is permitted at all. Approval
+            // The policy decides whether the call is permitted at all. The secret
+            // scanner, under `arguments: block`, refuses a call carrying a
+            // credential - before approval, so nobody is asked to approve a call
+            // that will be refused, and so a human who approves a harmless-looking
+            // write is not also approving the key buried in its content. Approval
             // turns a 'require_approval' verdict into a real answer from a real
             // human - which can only happen before the budget runs, because a
             // call waiting on a person has not been forwarded and must not be
             // charged. Budget then decides whether there is anything left to
             // spend on the call that is finally going out.
             var decision = policy.Evaluate(facts, explain);
+
+            decision = secrets.Apply(decision, request.Params?.Arguments);
 
             decision = await ApprovalGate.ApplyAsync(
                 decision,
@@ -419,6 +448,33 @@ builder.Services
                 IsError = true,
                 Content = [new TextContentBlock { Text = text }],
             };
+        });
+
+        // -------------------------------------------------------------------
+        // SECRET REDACTION - registered after the gates and before the result
+        // scanner, which puts both of its halves where the spec puts them.
+        //
+        // On the way in it runs after every gate has said yes, so the policy
+        // judged the real arguments and only the copy that leaves is redacted.
+        // On the way back it runs after the injection scanner, so it is the last
+        // thing to touch a result before the model reads it - and, like that
+        // scanner, it never sees the proxy's own refusals.
+        // -------------------------------------------------------------------
+        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
+        {
+            if (request.Params is { } parameters &&
+                secrets.RedactForwarded(parameters.Arguments) is { } redacted)
+            {
+                parameters.Arguments = redacted;
+            }
+
+            var result = await next(request, cancellationToken);
+
+            var outcome = secrets.Inspect(result, request.Params?.Name ?? UnnamedTool);
+
+            GuardrailsCallScope.RecordRedaction(outcome);
+
+            return outcome.Result;
         });
 
         // -------------------------------------------------------------------
