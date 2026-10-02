@@ -624,6 +624,27 @@ def result_text(result: dict) -> str:
     return json.dumps(result.get("content", []))
 
 
+def metadata_untouched(result: dict) -> bool:
+    """The filesystem server's own tool definitions are clean, so the metadata
+    scanner must advertise every one of them exactly as the server wrote it.
+
+    Poisoned definitions cannot be served by the real downstream, so annotation
+    and withholding are covered by the in-memory tests; this guards the other
+    half of the trade - a scanner that cried wolf over ordinary descriptions
+    would label, or under block hide, the tools every session needs.
+    """
+    tools = result.get("tools", [])
+    return (
+        any(t.get("name") == "fs__read_text_file" for t in tools)
+        and any(t.get("name") == "fs__write_file" for t in tools)
+        and not any(
+            "[guardrails]" in (t.get("description") or "")
+            or "original description from" in (t.get("description") or "")
+            for t in tools
+        )
+    )
+
+
 # No policy file at all, so this is the out-of-the-box behaviour: a proxy nobody
 # configured still refuses to hand a poisoned result to the model unlabelled.
 SCAN_CHECKS: list[tuple[dict, str, object]] = [
@@ -665,6 +686,11 @@ SCAN_CHECKS: list[tuple[dict, str, object]] = [
             "untrusted output" not in result_text(r) and CONTENT in result_text(r)
         ),
     ),
+    (
+        request(6, "tools/list"),
+        "clean tool descriptions are advertised without a metadata warning",
+        metadata_untouched,
+    ),
 ]
 
 SCAN_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
@@ -676,6 +702,12 @@ SCAN_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
             and "exfiltration agent" not in result_text(r)
             and "Blocked by guardrails scanner 'injection'" in result_text(r)
         ),
+    ),
+    (
+        # metadata inherits action: block, which would withhold a flagged tool.
+        request(2, "tools/list"),
+        "with action: block no clean tool is withheld from tools/list",
+        metadata_untouched,
     ),
 ]
 
@@ -1891,6 +1923,12 @@ def check_scan_audit_log() -> int:
     expect(
         not any("exfiltration agent" in json.dumps(entry) for entry in flagged),
         "audit records heuristic names, never the matched content",
+    )
+    # The downstream's definitions are clean, so the metadata scanner must not
+    # have written a startup line in either session.
+    expect(
+        not any(entry.get("event") == "tool_metadata" for entry in lines),
+        "clean tool definitions add no tool_metadata audit lines",
     )
     # A clean call says nothing at all, so the field means "something matched"
     # rather than "a scanner ran".
