@@ -18,10 +18,12 @@ public sealed record BudgetPolicy
     [JsonPropertyName("session")]
     public BudgetLimits? Session { get; init; }
 
-    /// <summary>
-    /// Caps per calendar day. Parsed only so it can be rejected - see
-    /// <see cref="Validate"/>.
-    /// </summary>
+    /// <summary>Caps per UTC calendar day, across every session and restart.</summary>
+    /// <remarks>
+    /// Enforced by <see cref="SqliteBudgetStore"/>, because a day outlives the
+    /// proxy process: a daily cap kept in memory would reset whenever the client
+    /// reconnected, which is a limit an agent defeats by being restarted.
+    /// </remarks>
     [JsonPropertyName("daily")]
     public BudgetLimits? Daily { get; init; }
 
@@ -35,22 +37,8 @@ public sealed record BudgetPolicy
     /// <summary>Validates the section, throwing with a message naming the problem.</summary>
     public void Validate()
     {
-        Session?.Validate("session");
-
-        // Deliberately an error rather than a silent no-op. A daily cap needs
-        // state that outlives the process, and this proxy is spawned per session
-        // and keeps its counters in memory - so a `daily:` block here would look
-        // like a limit and enforce nothing. Accepting configuration we do not
-        // honour is how a security tool ends up lying to its operator; an error
-        // at startup is the honest version.
-        if (Daily is not null)
-        {
-            throw new PolicyException(
-                "'budgets.daily' is not enforced yet: daily caps need a store that " +
-                "survives process exit, and this build keeps budget counters in " +
-                "memory. Remove the section rather than relying on a cap that does " +
-                "nothing.");
-        }
+        Session?.Validate(BudgetGate.SessionScope);
+        Daily?.Validate(BudgetGate.DailyScope);
     }
 }
 

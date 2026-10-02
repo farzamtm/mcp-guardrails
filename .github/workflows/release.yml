@@ -86,18 +86,11 @@ jobs:
           -p:Version="$VERSION"
           --output "artifacts/publish/$RID"
 
-      # The artefact users download is what gets tested, not the build tree.
-      # Windows is skipped only because smoke.py has never been run there.
-      - name: Smoke test the native binary
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          RID: ${{ matrix.rid }}
-        run: python3 scripts/smoke.py "artifacts/publish/$RID/McpGuardrails.Cli"
-
       # The binary is renamed to the same command the dotnet tool installs, so
       # instructions do not depend on how someone installed it. Debug symbols
-      # (.dbg, .dSYM, .pdb) stay out of the archive to keep it small.
+      # (.dbg, .dSYM, .pdb) stay out of the archive to keep it small. SQLite,
+      # used by daily budgets, is a native library AOT does not link in, so it
+      # ships beside the binary.
       - name: Archive
         id: archive
         shell: bash
@@ -112,12 +105,25 @@ jobs:
           cp README.md LICENSE NOTICE "$stage/"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp "artifacts/publish/$RID/McpGuardrails.Cli.exe" "$stage/mcp-guardrails.exe"
+            cp "artifacts/publish/$RID/e_sqlite3.dll" "$stage/"
             (cd artifacts/stage && 7z a -tzip "../dist/$name.zip" "$name" > /dev/null)
           else
             cp "artifacts/publish/$RID/McpGuardrails.Cli" "$stage/mcp-guardrails"
+            cp artifacts/publish/"$RID"/libe_sqlite3.* "$stage/"
             tar -C artifacts/stage -czf "artifacts/dist/$name.tar.gz" "$name"
           fi
           ls -l artifacts/dist
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+
+      # The staged directory - what goes into the archive users download - is
+      # what gets tested, not the build tree, so a file the archive forgot fails
+      # here. Windows is skipped only because smoke.py has never been run there.
+      - name: Smoke test the native binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          STAGE: ${{ steps.archive.outputs.stage }}
+        run: python3 scripts/smoke.py "$STAGE/mcp-guardrails"
 
       - name: Upload archive
         # actions/upload-artifact v5

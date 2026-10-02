@@ -24,19 +24,24 @@ public sealed class BudgetPolicyTests
     }
 
     [Fact]
-    public void ADailySection_IsRejectedRatherThanIgnored()
+    public void ADailySection_IsNotEmptyAndValid()
     {
-        // The honest failure. Daily caps need a store that outlives the process,
-        // and this build keeps counters in memory - so accepting the config would
-        // show the operator a limit that enforces nothing.
         var budgets = new BudgetPolicy { Daily = new BudgetLimits { MaxCalls = 5 } };
 
         Assert.False(budgets.IsEmpty);
 
+        budgets.Validate();
+    }
+
+    [Fact]
+    public void ADailySection_IsValidatedLikeASessionOne()
+    {
+        var budgets = new BudgetPolicy { Daily = new BudgetLimits { MaxCost = -1 } };
+
         var error = Assert.Throws<PolicyException>(budgets.Validate);
 
-        Assert.Contains("budgets.daily", error.Message, StringComparison.Ordinal);
-        Assert.Contains("not enforced yet", error.Message, StringComparison.Ordinal);
+        // Named by its own path, so the operator edits the right block.
+        Assert.Contains("budgets.daily.max_cost", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
