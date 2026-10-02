@@ -10,6 +10,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Protocol;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 // ---------------------------------------------------------------------------
 // STEP 3 - the pass-through proxy.
@@ -30,6 +33,19 @@ var listOnly = args.Contains("list-upstream", StringComparer.Ordinal);
 // blocked?" is answerable without reading the rules. Off by default: building
 // the trail allocates on a path that runs for every single tool call.
 var explain = args.Contains("--explain", StringComparer.Ordinal);
+
+// OpenTelemetry export is opt-in. Setting the standard OTLP endpoint variable is
+// itself the opt-in, so the proxy behaves like any other OTel-instrumented
+// process; --otel means "export to the default collector on localhost". Off by
+// default because a security tool should not open network connections nobody
+// asked for.
+var otel = args.Contains("--otel", StringComparer.Ordinal)
+           || !string.IsNullOrWhiteSpace(
+               Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT"));
+
+// Reported as the MCP server version and as the OTel service.version, so a
+// trace and a client's server list agree on what was running.
+const string ProxyVersion = "0.1.0";
 
 // Where the sandboxed filesystem server is allowed to operate.
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
@@ -59,6 +75,38 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 builder.Logging.SetMinimumLevel(listOnly ? LogLevel.Warning : LogLevel.Information);
+
+// Created unconditionally: with no exporter attached the span and instruments
+// are inert, and the audit filter does not need a second code path.
+using var telemetry = new ToolCallTelemetry();
+
+if (otel)
+{
+    // Traces and metrics only, not logs. The proxy's log lines are for the
+    // operator's terminal; exporting them would be a second, unreviewed channel
+    // out of the process.
+    //
+    // "Experimental.ModelContextProtocol" is the MCP SDK's own source and meter.
+    // Subscribing to it adds the semconv tools/call server span above ours and a
+    // client span per downstream call beneath it, so one trace shows the whole
+    // hop: client -> guardrails -> downstream server.
+    //
+    // Endpoint, protocol, headers, export intervals and OTEL_SDK_DISABLED come
+    // from the standard OTEL_* environment variables, read by the SDK. The
+    // exporter writes to the network, never to stdout, so the JSON-RPC wire is
+    // not at risk.
+    const string McpSdkSource = "Experimental.ModelContextProtocol";
+
+    builder.Services.AddOpenTelemetry()
+        .ConfigureResource(resource =>
+            resource.AddService("mcp-guardrails", serviceVersion: ProxyVersion))
+        .WithTracing(tracing => tracing
+            .AddSource(ToolCallTelemetry.SourceName, McpSdkSource)
+            .AddOtlpExporter())
+        .WithMetrics(metrics => metrics
+            .AddMeter(ToolCallTelemetry.SourceName, McpSdkSource)
+            .AddOtlpExporter());
+}
 
 using var loggerFactory = LoggerFactory.Create(logging =>
 {
@@ -155,7 +203,7 @@ const string UnnamedTool = "(missing)";
 builder.Services
     .AddMcpServer(options =>
     {
-        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = "0.1.0" };
+        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = ProxyVersion };
 
         // -------------------------------------------------------------------
         // THE INTERCEPTOR PIPELINE.
@@ -201,13 +249,21 @@ builder.Services
             // coupling the two concerns together.
             var resolved = upstream.TryResolve(toolName, out var connection, out var downstreamName);
 
+            // Opened before `next` so policy, approval and the downstream call
+            // all run inside the span, and the SDK's client span for the forward
+            // nests under it rather than becoming a sibling.
+            using var span = telemetry.Start(
+                toolName,
+                resolved ? connection.Name : null,
+                resolved ? downstreamName : null);
+
             // Stopwatch timestamps rather than DateTime subtraction: this reads a
             // monotonic clock, so an NTP correction mid-call cannot produce a
             // negative duration.
             var startedAt = Stopwatch.GetTimestamp();
 
             CallToolResult? result = null;
-            string? failure = null;
+            Exception? thrown = null;
 
             try
             {
@@ -218,12 +274,14 @@ builder.Services
             {
                 // Record the failure, then rethrow. The audit sink observes; it
                 // must never change the outcome of a call.
-                failure = $"{ex.GetType().Name}: {ex.Message}";
+                thrown = ex;
                 throw;
             }
             finally
             {
                 var decision = scope.Decision;
+                var elapsed = Stopwatch.GetElapsedTime(startedAt);
+                var failure = thrown is null ? null : $"{thrown.GetType().Name}: {thrown.Message}";
 
                 var record = new AuditRecord
                 {
@@ -237,10 +295,14 @@ builder.Services
                     Rule = decision?.RuleName,
                     DecisionReason = decision?.Reason,
                     Approval = Describe(decision?.ApprovalResult),
-                    DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    DurationMs = elapsed.TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
                 };
+
+                // Same duration and decision as the record, so a dashboard and
+                // the log never disagree about the same call.
+                span.Complete(decision, elapsed, result?.IsError is true, thrown);
 
                 // CancellationToken.None on purpose: if the caller cancelled, we
                 // still want the record. Losing the evidence of an aborted call
