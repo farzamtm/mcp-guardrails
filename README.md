@@ -66,10 +66,14 @@ tar -xzf "mcp-guardrails-$VERSION-$RID.tar.gz"
 ./mcp-guardrails-$VERSION-$RID/mcp-guardrails list-upstream
 ```
 
+The archive also holds the SQLite library daily budgets use (`libe_sqlite3`,
+or `e_sqlite3.dll` on Windows); keep it beside the binary, or a policy with a
+`daily:` cap will fail at startup.
+
 The binaries are not code-signed yet, so macOS Gatekeeper will refuse a
 downloaded one until you clear the quarantine flag:
-`xattr -d com.apple.quarantine mcp-guardrails`. Windows gets a `.zip` with
-`mcp-guardrails.exe`.
+`xattr -dr com.apple.quarantine mcp-guardrails-$VERSION-$RID`. Windows gets a
+`.zip` with `mcp-guardrails.exe`.
 
 Building one yourself is a single command; naming a runtime is what switches
 the build to Native AOT:
@@ -106,7 +110,7 @@ live in the same container, so build on top of it rather than running it bare
 FROM mcp-guardrails AS guardrails
 
 FROM node:22-bookworm-slim
-COPY --from=guardrails /usr/local/bin/mcp-guardrails /usr/local/bin/mcp-guardrails
+COPY --from=guardrails /usr/local/bin/mcp-guardrails /usr/local/bin/libe_sqlite3.so /usr/local/bin/
 USER node
 ENTRYPOINT ["/usr/local/bin/mcp-guardrails"]
 ```
