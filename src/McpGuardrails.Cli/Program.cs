@@ -79,7 +79,8 @@ await using var upstream = await UpstreamRegistry.ConnectAsync(
 // Declared after the registry so it is disposed BEFORE it: `await using` unwinds
 // in reverse order, so the sink drains its queue while the tool calls that feed
 // it are already finished.
-await using var audit = new JsonlAuditSink(auditPath);
+await using var audit = new JsonlAuditSink(
+    auditPath, logger: loggerFactory.CreateLogger<JsonlAuditSink>());
 
 // ---------------------------------------------------------------------------
 // Load the policy.
@@ -178,6 +179,22 @@ builder.Services
             using var scope = GuardrailsCallScope.Begin();
 
             var toolName = request.Params?.Name ?? UnnamedTool;
+
+            // Fail closed: with the log broken, a forwarded call would leave no
+            // evidence at all. Refuse BEFORE forwarding - the sink would throw
+            // afterwards anyway, but only once the downstream action had run.
+            if (audit.IsFaulted)
+            {
+                return new CallToolResult
+                {
+                    IsError = true,
+                    Content = [new TextContentBlock
+                    {
+                        Text = $"Refused '{toolName}': the guardrails audit log cannot be written, " +
+                               "so no tool calls are being forwarded. This needs an operator.",
+                    }],
+                };
+            }
 
             // Resolve purely to enrich the log. The call handler resolves again
             // to actually route; duplicating a dictionary lookup is cheaper than
