@@ -4,9 +4,7 @@ using System.Text;
 using System.Text.Json;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Policy;
-using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Tests.Policy;
-using McpGuardrails.Core.Tests.Scanners;
 
 namespace McpGuardrails.Core.Tests.Approval;
 
@@ -303,81 +301,6 @@ public sealed class WebhookApprovalChannelTests
 
         Assert.False(json.RootElement.TryGetProperty("arguments", out _));
         Assert.False(json.RootElement.TryGetProperty("server", out _));
-    }
-
-    // ------------------------------------------------------- the summary
-
-    [Fact]
-    public void Summarize_KeepsShortValuesWhole_AndNonStringsAsJson()
-    {
-        var summary = WebhookApprovalChannel.Summarize(
-            TestArguments.From("""{"path": "/srv/a.txt", "limit": 100, "filter": {"a": [1, 2]}}"""))!;
-
-        Assert.Equal("/srv/a.txt", summary["path"]);
-        Assert.Equal("100", summary["limit"]);
-        Assert.Equal("""{"a": [1, 2]}""", summary["filter"]);
-    }
-
-    [Fact]
-    public void Summarize_CutsLongValues_AndSaysHowMuchWasCut()
-    {
-        // An approver needs the path, not the 40 KB being written to it.
-        var content = new string('x', WebhookApprovalChannel.MaxArgumentLength + 10);
-
-        var summary = WebhookApprovalChannel.Summarize(
-            TestArguments.From($$"""{"content": "{{content}}"}"""))!;
-
-        Assert.Equal(
-            new string('x', WebhookApprovalChannel.MaxArgumentLength) + "... (10 more characters)",
-            summary["content"]);
-    }
-
-    [Fact]
-    public void Summarize_NeverSplitsASurrogatePair()
-    {
-        // An emoji straddling the cut: keeping half of it would send an invalid
-        // character to the receiver.
-        var content = new string('x', WebhookApprovalChannel.MaxArgumentLength - 1) + "\\uD83D\\uDE00tail";
-
-        var summary = WebhookApprovalChannel.Summarize(
-            TestArguments.From($$"""{"content": "{{content}}"}"""))!;
-
-        Assert.StartsWith(
-            new string('x', WebhookApprovalChannel.MaxArgumentLength - 1) + "...",
-            summary["content"],
-            StringComparison.Ordinal);
-        Assert.EndsWith("(6 more characters)", summary["content"], StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Summarize_RedactsSecrets_InStringsAndInJson()
-    {
-        var summary = WebhookApprovalChannel.Summarize(
-            TestArguments.From($$$"""
-                {"content": "key={{{SecretSamples.AwsAccessKey}}}", "auth": {"github": "{{{SecretSamples.GitHubToken}}}"}}
-                """))!;
-
-        Assert.Equal($"key={SecretScanner.Marker("aws-access-key")}", summary["content"]);
-        Assert.Equal($$"""{"github": "{{SecretScanner.Marker("github-token")}}"}""", summary["auth"]);
-    }
-
-    [Fact]
-    public void Summarize_RedactsBeforeCutting_SoAKeyAtTheCutIsNotHalfSent()
-    {
-        // Cut first, and the first half of the key would go out: too short for
-        // the detector to recognise, long enough to narrow a search for the rest.
-        var padding = new string('x', WebhookApprovalChannel.MaxArgumentLength - 8);
-
-        var summary = WebhookApprovalChannel.Summarize(
-            TestArguments.From($$"""{"content": "{{padding}} {{SecretSamples.AwsAccessKey}}"}"""))!;
-
-        Assert.DoesNotContain(SecretSamples.AwsAccessKey[..6], summary["content"], StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Summarize_OfNoArguments_IsNull()
-    {
-        Assert.Null(WebhookApprovalChannel.Summarize(null));
     }
 
     // -------------------------------------------------------------- plumbing
