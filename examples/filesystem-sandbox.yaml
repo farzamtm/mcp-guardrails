@@ -61,6 +61,9 @@ budgets:
 scanners:
   injection:
     action: annotate
+    # Tool definitions from tools/list get the same heuristics at startup.
+    # Defaults to 'action'; 'block' hides a flagged tool and refuses calls to it.
+    # metadata: block
   secrets:
     arguments: redact_audit
     results: redact
