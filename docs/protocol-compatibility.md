@@ -18,11 +18,11 @@ marked **(unverified)**.
 | --- | --- |
 | SDK | [`ModelContextProtocol` 2.2.0](../src/McpGuardrails.Core/McpGuardrails.Core.csproj) |
 | Protocol revisions | 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28 — the full set the SDK supports, on both sides |
-| Transport to the client | stdio only |
+| Transport to the client | stdio, or stateless Streamable HTTP with `--transport http` (no `Mcp-Session-Id`, no GET/SSE stream, so no server-to-client requests) |
 | Transport to upstream servers | stdio only (spawned child processes) |
 | Features proxied | Tools: `tools/list`, `tools/call` |
 | Not proxied | Resources, prompts, completions, logging, subscriptions, `listChanged` notifications, progress |
-| Approval mechanism | Elicitation (`elicitation/create`), form mode, held open until answered |
+| Approval mechanism | Elicitation (`elicitation/create`), form mode, held open until answered — stdio only; or a signed webhook on either transport |
 | Tasks extension / MRTR approval | **Not implemented** |
 | Tested end to end | Initialize handshake at 2025-06-18 with and without the elicitation capability, and a client that sends no handshake at all ([`scripts/smoke.py`](../scripts/smoke.py)) |
 
@@ -124,6 +124,7 @@ operator writes on purpose.
 | Declares elicitation with **URL mode only** (2025-11-25) | The proxy sends a form-mode request; the SDK refuses to send form mode to a client that did not declare it and throws, and the gate turns that into a refusal. | `failed` **(unverified)** | No |
 | Client gives up first (its own request timeout, or the user cancels) | The cancellation propagates; nothing is forwarded. The audit line records the error and **no decision**, because none was reached. | *(absent)* | By reading the code |
 | 2026-07-28 client, over stdio | See below. | **(unverified)** | No |
+| Any client, over Streamable HTTP | Stateless HTTP has no channel for a server-to-client request, so the proxy does not try: refused immediately, whatever the client declared. A `mode: webhook` rule is unaffected. | `unavailable` | Yes — smoke test |
 | Tasks-capable client | Tasks are not implemented or advertised; the call is handled exactly as for its protocol revision. A task-augmented `tools/call` is **(unverified)**. | — | No |
 
 ### Why "held open" is the down-level path, and what it costs

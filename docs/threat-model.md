@@ -43,7 +43,7 @@ This is the long version.
 
 | Boundary | What crosses it | Trust |
 | --- | --- | --- |
-| **Client ↔ proxy** | `tools/list`, `tools/call`, and (proxy → client) `elicitation/create` for approvals | The client process is trusted — it spawned the proxy and owns its stdio. The **model** driving it is not trusted to stay on task: the whole premise is that it can be talked into calling the wrong tool. The **human** at the client is trusted to answer approvals honestly. |
+| **Client ↔ proxy** | `tools/list`, `tools/call`, and (proxy → client) `elicitation/create` for approvals | Over stdio the client process is trusted — it spawned the proxy and owns its stdio. Over Streamable HTTP the client is whoever can reach the port and, if one is set, holds the shared bearer token; see [gaps](#nothing-is-authenticated). The **model** driving it is not trusted to stay on task: the whole premise is that it can be talked into calling the wrong tool. The **human** at the client is trusted to answer approvals honestly. |
 | **Proxy ↔ downstream server** | `tools/list` once at startup, `tools/call` per call, results back | Semi-trusted. The proxy spawns the server, so it starts it, but does not sandbox it; it gates what is *asked* of the server and labels what comes back. |
 | **Tool results** | Text, structured content, embedded resources | **Untrusted.** Anything a server returns may have been written by a third party — a README, a database row, a fetched page. This is the primary attack the project targets. |
 | **Tool metadata** | Names, descriptions, input schemas, annotations from `tools/list` | Untrusted in principle; **forwarded verbatim** in practice. See [gaps](#not-defended--known-gaps). |
@@ -217,8 +217,16 @@ question, and it is the operator's.
 
 ### Nothing is authenticated
 
-- The proxy speaks stdio only. Whoever spawns the process *is* the client; there
-  is no identity, token or user attribution in the protocol path or the log.
+- Over stdio, whoever spawns the process *is* the client; there is no identity,
+  token or user attribution in the protocol path or the log.
+- Over Streamable HTTP (`--transport http`) there is at most one shared bearer
+  token (`GUARDRAILS_HTTP_TOKEN`), no per-client identity, and no TLS. It binds
+  loopback by default and refuses a wider bind without a token; a non-loopback
+  `Origin` is refused so a web page cannot drive it through the user's browser.
+  Anything that gets past those calls every tool the policy allows. Elicitation
+  has no channel back over stateless HTTP, so in-band approval fails closed
+  (`unavailable`), and the session budget is per process — shared by every
+  client — rather than per session.
 - The proxy does not authenticate the servers it spawns either, and the approval
   prompt carries no proof of where it came from beyond the client's own UI.
 
@@ -383,7 +391,6 @@ loader **rejects** it rather than accepting a setting that does nothing.
 | --- | --- |
 | Slack approval (`approval.mode: slack`) | Rejected at load; `in_band` elicitation or a signed webhook |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
-| Streamable HTTP host | stdio only |
 | Configurable upstream servers | One hard-coded filesystem server ([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)) |
 | Policy reload without restart | Read once at startup |
 

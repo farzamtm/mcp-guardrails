@@ -15,7 +15,7 @@ your agent actually does.
 > enforces **session and daily budgets** with per-rule costs, can **hold a call
 > until a human approves it** at the client or through a signed webhook, **scans
 > what comes back** for prompt injection, and **redacts secrets** in both
-> directions. The Streamable HTTP host is next.
+> directions. It serves clients over **stdio or Streamable HTTP**.
 > See [the spec](mcp-guardrails-dotnet-spec.md).
 
 ## What works today
@@ -33,6 +33,8 @@ your agent actually does.
 - **Asks a human** — `require_approval` puts the question to the person at the
   MCP client, or POSTs it to a signed webhook, and waits for an answer, with a
   configurable deadline
+- **Serves stdio or Streamable HTTP** — the same guardrails on both; HTTP is
+  stateless, loopback-only by default, with an optional bearer token
 - **Scans what comes back** — tool results are checked for prompt-injection
   attempts and fenced as untrusted data before the model reads them, on by
   default, with an optional LLM classifier as a second opinion
@@ -369,6 +371,14 @@ jq 'select(.approval == "timed_out" and .decision == "allow")' ~/.mcp-guardrails
 
 `approval` is one of `approved`, `declined`, `timed_out`, `unavailable` or
 `failed`.
+
+**Over Streamable HTTP, in-band approval is always `unavailable`.** Elicitation is a
+request from the server back to the client, and stateless HTTP has no channel to
+send it on — the SDK disables it outright. So under `--transport http` every
+`require_approval` call is refused immediately, with a message that says why;
+it never hangs until the deadline and it never falls through to `allow`. For
+rules that need a human, use `mode: webhook` (below), which does not go through
+the client, or stdio, until the Tasks/MRTR channel lands.
 
 ### Asking a webhook instead
 
@@ -758,6 +768,43 @@ jq 'select(.argument_secrets_action == "forwarded")' ~/.mcp-guardrails/audit.jso
 jq 'select(.result_secrets)' ~/.mcp-guardrails/audit.jsonl
 ```
 
+## Streamable HTTP
+
+stdio is the default. To serve over HTTP instead:
+
+```bash
+McpGuardrails.Cli --transport http                # http://127.0.0.1:7300/mcp
+McpGuardrails.Cli --transport http --port 0       # any free port; logged on start
+```
+
+The endpoint is `/mcp`, stateless (no `Mcp-Session-Id`, no GET/SSE stream). It
+is the same server as over stdio — one registration of the handlers and every
+filter, with only the listener swapped — so audit, policy, budget and approval
+apply identically, with two differences worth knowing:
+
+- **Approval cannot ask anyone** (see [Approval](#approval)): it fails closed.
+- **The session budget is per process**, shared by every request and client:
+  stateless HTTP has no session, so "session" means "since the proxy started".
+
+**There is no user authentication. Do not expose it.** Out of the box it binds
+`127.0.0.1` only, and anything that can reach the port can call every
+downstream tool the policy allows. Three defences are built in:
+
+| | |
+| --- | --- |
+| Loopback by default | `--bind <ip>` is the only way to listen elsewhere, and a non-loopback address is **refused** unless a token is set |
+| Bearer token | `GUARDRAILS_HTTP_TOKEN` (env var, not a flag, so it stays out of `ps`); at least 16 characters; compared in constant time. Clients send `Authorization: Bearer <token>` |
+| Origin check | A request carrying a non-loopback `Origin` is refused with 403. A loopback bind does not stop a malicious web page from making your browser POST to it (DNS rebinding); this does. Non-browser clients send no `Origin` and are unaffected |
+
+```bash
+export GUARDRAILS_HTTP_TOKEN="$(openssl rand -hex 32)"
+McpGuardrails.Cli --transport http --bind 0.0.0.0 --port 7300   # still: put TLS in front
+```
+
+Bad combinations are startup errors (exit code 2), not guesses: `--port` without
+`--transport http`, a repeated flag, a host name instead of an IP, a token that is
+set but too short.
+
 ## The audit log
 
 With no policy configured the proxy is a pure passthrough that tells you what your
@@ -951,7 +998,8 @@ Claude Desktop  ──thinks it's talking to a server──►  GUARDRAILS  ─�
 ```
 
 - **Server half** — `src/McpGuardrails.Cli/Program.cs` registers `WithListToolsHandler`
-  and `WithCallToolHandler` instead of tools of its own.
+  and `WithCallToolHandler` instead of tools of its own, then attaches either the
+  stdio transport or, via `src/McpGuardrails.Cli/HttpHost.cs`, Kestrel + `MapMcp()`.
 - **Client half** — `src/McpGuardrails.Core/Upstream/UpstreamRegistry.cs` owns one
   `McpClient` per downstream server and resolves a qualified tool name to its owner.
 
@@ -968,7 +1016,9 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | `src/McpGuardrails.Core/Scanners/` | Injection scanning and secret redaction: detectors, settings, the gates |
 | `src/McpGuardrails.Core/Audit/` | Audit record, channel-backed JSONL sink, OTel span and metrics (BCL APIs only) |
 | `src/McpGuardrails.Core/Serialization/` | Source-generated JSON (AOT-safe) |
+| `src/McpGuardrails.Core/Hosting/` | Transport options and the HTTP access check, unit-tested |
 | `src/McpGuardrails.Cli/Program.cs` | Host wiring; the server half of the proxy |
+| `src/McpGuardrails.Cli/HttpHost.cs` | Kestrel listener, access guard, `MapMcp()` |
 | `tests/McpGuardrails.Core.Tests/` | xUnit tests, 100% line and branch on Core |
 | `scripts/smoke.py` | Dependency-free MCP driver for end-to-end checks |
 | `scripts/coverage.sh` | Coverage run + threshold gate, same in CI and locally |
@@ -984,7 +1034,7 @@ Three layers, each covering what the one below cannot:
 | --- | --- |
 | Unit tests | Pure logic — namespacing, config validation, the audit sink |
 | In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
-| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in nine phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give; a poisoned file written, read back, and caught on the way out; a credential forwarded, redacted and refused on the way in and scrubbed or withheld on the way out, with the audit log checked for the raw key; the LLM classifier against a fake API; OpenTelemetry export to a fake collector; and approval through a local webhook receiver that verifies the signature |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in ten phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give; a poisoned file written, read back, and caught on the way out; a credential forwarded, redacted and refused on the way in and scrubbed or withheld on the way out, with the audit log checked for the raw key; the LLM classifier against a fake API; OpenTelemetry export to a fake collector; and approval through a local webhook receiver that verifies the signature; and the same pipeline over Streamable HTTP (auth, Origin, fail-closed approval, a budget spanning stateless requests) |
 
 CI runs all three on Linux, macOS and Windows, plus a `lint` job
 (`dotnet format`, `ruff`, `shellcheck`) and a check that every example policy in

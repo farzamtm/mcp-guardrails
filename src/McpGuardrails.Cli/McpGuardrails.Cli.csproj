@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
 
     <!-- OpenTelemetry SDK + OTLP exporter, CLI only. Core emits through the
          BCL's ActivitySource/Meter and never sees these; they are wired up only
