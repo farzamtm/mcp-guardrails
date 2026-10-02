@@ -157,6 +157,28 @@ public sealed class JsonlAuditSinkTests : IDisposable
     }
 
     [Fact]
+    public async Task RecordsWhatSecretRedactionFound()
+    {
+        await using (var sink = new JsonlAuditSink(LogPath))
+        {
+            await sink.WriteAsync(Record("fs__write_file") with
+            {
+                ArgumentSecrets = ["aws-access-key"],
+                ArgumentSecretsAction = "forwarded",
+                ResultSecrets = ["jwt"],
+                ResultSecretsAction = "redacted",
+            });
+        }
+
+        var entry = (await ReadLogAsync())[0];
+
+        Assert.Equal("aws-access-key", entry.GetProperty("argument_secrets")[0].GetString());
+        Assert.Equal("forwarded", entry.GetProperty("argument_secrets_action").GetString());
+        Assert.Equal("jwt", entry.GetProperty("result_secrets")[0].GetString());
+        Assert.Equal("redacted", entry.GetProperty("result_secrets_action").GetString());
+    }
+
+    [Fact]
     public async Task ACleanResultAddsNoScannerFields()
     {
         await using (var sink = new JsonlAuditSink(LogPath))
@@ -168,6 +190,8 @@ public sealed class JsonlAuditSinkTests : IDisposable
 
         Assert.False(entry.TryGetProperty("scanner_hits", out _));
         Assert.False(entry.TryGetProperty("scanner_action", out _));
+        Assert.False(entry.TryGetProperty("argument_secrets", out _));
+        Assert.False(entry.TryGetProperty("result_secrets", out _));
     }
 
     [Fact]

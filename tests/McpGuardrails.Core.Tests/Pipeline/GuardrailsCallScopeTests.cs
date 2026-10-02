@@ -96,6 +96,37 @@ public sealed class GuardrailsCallScopeTests
         Assert.Throws<ArgumentNullException>(() => GuardrailsCallScope.RecordScan(null!));
     }
 
+    // -------------------------------------------------------- secret redaction
+
+    [Fact]
+    public void RecordRedaction_IsVisibleOnTheScope()
+    {
+        using var scope = GuardrailsCallScope.Begin();
+        var outcome = new RedactionOutcome(
+            new CallToolResult(),
+            new SecretReport([SecretScanner.Jwt], 1),
+            RedactionEffect.Redacted);
+
+        GuardrailsCallScope.RecordRedaction(outcome);
+
+        Assert.Same(outcome, scope.Redaction);
+    }
+
+    [Fact]
+    public void RecordRedaction_WithoutAScope_IsANoOp()
+    {
+        GuardrailsCallScope.RecordRedaction(
+            new RedactionOutcome(new CallToolResult(), SecretReport.Clean, RedactionEffect.None));
+
+        Assert.Null(GuardrailsCallScope.Current);
+    }
+
+    [Fact]
+    public void RecordRedaction_RejectsNull()
+    {
+        Assert.Throws<ArgumentNullException>(() => GuardrailsCallScope.RecordRedaction(null!));
+    }
+
     [Fact]
     public void ScanIsNullOnACallThatNeverReturnedAResult()
     {
