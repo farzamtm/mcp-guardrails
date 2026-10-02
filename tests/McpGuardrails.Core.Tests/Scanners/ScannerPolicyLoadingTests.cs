@@ -100,6 +100,72 @@ public sealed class ScannerPolicyLoadingTests
     }
 
     [Fact]
+    public void MetadataScanning_InheritsTheActionByDefault()
+    {
+        var document = PolicyLoader.Parse("""
+            scanners:
+              injection:
+                action: block
+            """);
+
+        var injection = document.EffectiveScanners.EffectiveInjection;
+
+        Assert.Null(injection.Metadata);
+        Assert.Equal(ScanAction.Block, injection.EffectiveMetadataAction);
+        Assert.Equal(ScanAction.Annotate, ScannerSettings.Default.EffectiveMetadataAction);
+    }
+
+    [Theory]
+    [InlineData("annotate", ScanAction.Annotate)]
+    [InlineData("block", ScanAction.Block)]
+    [InlineData("off", ScanAction.Off)]
+    public void MetadataScanning_CanBeSetOnItsOwn(string yaml, ScanAction expected)
+    {
+        var document = PolicyLoader.Parse($"""
+            scanners:
+              injection:
+                action: off
+                metadata: {yaml}
+            """);
+
+        var injection = document.EffectiveScanners.EffectiveInjection;
+
+        Assert.True(injection.IsOff);
+        Assert.Equal(expected, injection.EffectiveMetadataAction);
+    }
+
+    [Fact]
+    public void AnUnknownMetadataAction_IsRejectedWhenTheFileLoads()
+    {
+        Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            scanners:
+              injection:
+                metadata: shout
+            """));
+    }
+
+    [Fact]
+    public void AnUnknownMetadataActionReachingValidation_NamesTheChoices()
+    {
+        var policy = new ScannerPolicy { Injection = new ScannerSettings { Metadata = (ScanAction)99 } };
+
+        var error = Assert.Throws<PolicyException>(policy.Validate);
+
+        Assert.Contains("'scanners.injection.metadata'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("annotate, block or off", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MetadataOutsideTheInjectionScanner_IsRejected()
+    {
+        var settings = new ScannerSettings { Metadata = ScanAction.Block };
+
+        var error = Assert.Throws<PolicyException>(() => settings.Validate("secrets"));
+
+        Assert.Contains("'scanners.secrets.metadata' is not supported", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SecretRedaction_IsOnWithNoPolicyFile()
     {
         // Arguments reach the server but not the log; results are scrubbed before

@@ -125,6 +125,33 @@ public sealed record ScannerSettings
     public bool IsOff => EffectiveAction is ScanAction.Off;
 
     /// <summary>
+    /// What to do with a tool whose metadata matches: <c>annotate</c>, <c>block</c>
+    /// or <c>off</c>. Absent means the same as <see cref="Action"/>.
+    /// </summary>
+    /// <remarks>
+    /// Tool descriptions and schemas from <c>tools/list</c> are text the model
+    /// reads as part of its instructions, so they get the same heuristics as a
+    /// result. They get their own setting because the trade-off differs. A
+    /// result is fresh on every call; metadata is read once at startup and does
+    /// not change, so a false positive is deterministic, shows up in the log
+    /// before the first call, and stays. <c>block</c> here hides a tool for the
+    /// life of the process - stricter than refusing one result, and more
+    /// predictable. An operator can therefore want <c>block</c> for metadata and
+    /// <c>annotate</c> for results, or the reverse to keep a falsely flagged tool
+    /// usable without weakening result scanning.
+    ///
+    /// Explicit beats inherited, including against <c>action: off</c>: a value
+    /// written here is a statement about metadata, and silently ignoring it
+    /// because the result scanner is off would be the surprising reading.
+    /// </remarks>
+    [JsonPropertyName("metadata")]
+    public ScanAction? Metadata { get; init; }
+
+    /// <inheritdoc cref="Metadata" />
+    [JsonIgnore]
+    public ScanAction EffectiveMetadataAction => Metadata ?? EffectiveAction;
+
+    /// <summary>
     /// The optional LLM second stage. Absent means no classifier: the heuristics
     /// alone decide, and nothing leaves the machine.
     /// </summary>
@@ -146,6 +173,25 @@ public sealed record ScannerSettings
             throw new PolicyException(
                 $"'scanners.{scanner}.action' is not a known action. " +
                 "Use annotate, block or off.");
+        }
+
+        if (Metadata is { } metadata)
+        {
+            // Tool metadata is scanned for injection, not for secrets; the key
+            // anywhere else would read like protection and be none.
+            if (scanner != "injection")
+            {
+                throw new PolicyException(
+                    $"'scanners.{scanner}.metadata' is not supported. Only the injection scanner " +
+                    "inspects tool metadata.");
+            }
+
+            if (!Enum.IsDefined(metadata))
+            {
+                throw new PolicyException(
+                    $"'scanners.{scanner}.metadata' is not a known action. " +
+                    "Use annotate, block or off.");
+            }
         }
 
         if (Classifier is null)

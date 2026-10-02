@@ -447,7 +447,7 @@ public sealed class InjectionGate
     /// "1 prompt-injection heuristic" reads as a mistake if it says heuristics,
     /// and this string is shown to a human as often as to a model.
     /// </remarks>
-    private static string Count(InjectionReport report) =>
+    internal static string Count(InjectionReport report) =>
         report.Heuristics.Count == 1
             ? "1 prompt-injection heuristic"
             : $"{report.Heuristics.Count.ToString(CultureInfo.InvariantCulture)} prompt-injection heuristics";

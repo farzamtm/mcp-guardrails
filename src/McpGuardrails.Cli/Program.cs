@@ -198,6 +198,7 @@ PolicyDocument document;
 BudgetPolicy budgets;
 InjectionGate scanner;
 SecretGate secrets;
+ScannerSettings injection;
 try
 {
     document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
@@ -207,7 +208,7 @@ try
 
     // On by default, including with no policy file at all: a result scanner that
     // has to be switched on protects nobody, and annotating cannot break a call.
-    var injection = document.EffectiveScanners.EffectiveInjection;
+    injection = document.EffectiveScanners.EffectiveInjection;
 
     if (classifierFlag && injection.Classifier is null)
     {
@@ -241,6 +242,38 @@ catch (PolicyException ex)
     // Console.Error, not stdout: stdout is the JSON-RPC wire.
     await Console.Error.WriteLineAsync($"Invalid policy file '{policyPath}': {ex.Message}");
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Scan the tool definitions, once.
+//
+// Descriptions and schemas from tools/list are read by the model as if they
+// were instructions, before any call has happened - "tool poisoning" - and the
+// result scanner never sees them. The registry fetched them once at connect
+// time, so they are scanned once here and the outcome is what tools/list serves
+// and what the policy filter consults for every call. Heuristics only; see
+// ToolMetadataGate for why the classifier is not asked.
+// ---------------------------------------------------------------------------
+var toolMetadata = ToolMetadataGate.Build(
+    injection,
+    upstream.Connections.SelectMany(connection =>
+        connection.Tools.Select(tool => (connection.Name, tool.ProtocolTool))));
+
+// Logged in list-upstream mode too (its level is Warning), because that is the
+// command an operator runs to see what a server advertises - and the place a
+// false positive should be found, before it hides a tool in production.
+var metadataLog = loggerFactory.CreateLogger<ToolMetadataGate>();
+foreach (var finding in toolMetadata.Findings)
+{
+    metadataLog.LogWarning(
+        "Tool '{Tool}' from server '{Server}': its {Fields} matched prompt-injection heuristics ({Heuristics}); {Action}.",
+        finding.Tool,
+        finding.Server,
+        string.Join(", ", finding.Fields),
+        finding.Report.Summary,
+        finding.Effect is ScanEffect.Blocked
+            ? "withheld from tools/list and calls to it are refused"
+            : "its description is prefixed with a warning");
 }
 
 // Where daily budget counters persist. An environment variable like the audit
@@ -283,6 +316,16 @@ else
 }
 
 using var dailyStoreLifetime = dailyStore;
+
+// One audit line per flagged tool, written here - after list-upstream has had
+// its chance to return - so listing tools never adds lines to the operator's log.
+if (!listOnly)
+{
+    foreach (var finding in toolMetadata.Findings)
+    {
+        await audit.WriteAsync(finding.ToAuditRecord(DateTimeOffset.UtcNow), CancellationToken.None);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // STEP 2 demo: print what we discovered downstream, then exit.
@@ -514,10 +557,11 @@ var mcp = builder.Services
 
             var facts = PolicyFacts.ForCall(toolName, request.Params, tool, server);
 
-            // Four gates, in this order, and the order is the design.
+            // Five gates, in this order, and the order is the design.
             //
-            // The policy decides whether the call is permitted at all. The secret
-            // scanner, under `arguments: block`, refuses a call carrying a
+            // The policy decides whether the call is permitted at all. The
+            // metadata scanner refuses a tool it withheld from tools/list. The
+            // secret scanner, under `arguments: block`, refuses a call carrying a
             // credential - before approval, so nobody is asked to approve a call
             // that will be refused, and so a human who approves a harmless-looking
             // write is not also approving the key buried in its content. Approval
@@ -527,6 +571,10 @@ var mcp = builder.Services
             // charged. Budget then decides whether there is anything left to
             // spend on the call that is finally going out.
             var decision = policy.Evaluate(facts, explain);
+
+            // Refused, not merely left off the list: a client with a stale list,
+            // or a model that guessed the name, must not reach it.
+            decision = toolMetadata.Apply(decision, toolName);
 
             decision = secrets.Apply(decision, request.Params?.Arguments);
 
@@ -624,12 +672,11 @@ var mcp = builder.Services
     })
     .WithListToolsHandler((_, _) =>
     {
-        var tools = upstream.Connections
-            .SelectMany(connection => connection.Tools.Select(tool =>
-                // The name advertised here MUST match what the call handler below
-                // resolves, or the client sees a tool it cannot invoke.
-                ToolNamespacer.Qualify(connection.Name, tool.ProtocolTool)))
-            .ToList();
+        // Built once at startup, already qualified with the same namer the call
+        // handler resolves through - so the client never sees a tool it cannot
+        // invoke - and already scanned. A fresh list per request because the
+        // result DTO is mutable and must not be shared between clients.
+        var tools = toolMetadata.Tools.ToList();
 
         // The handler is synchronous, but the delegate returns ValueTask, so wrap
         // the finished value rather than paying for a state machine.
