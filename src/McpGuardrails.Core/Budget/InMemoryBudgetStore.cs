@@ -6,9 +6,8 @@ namespace McpGuardrails.Core.Budget;
 /// <remarks>
 /// Right for a session budget and only for a session budget: an stdio proxy is
 /// spawned per client session, so "this process" and "this session" are the same
-/// thing. A daily cap needs the persistent store that lands behind
-/// <see cref="IBudgetStore"/> in a later step; until then
-/// <see cref="BudgetPolicy.Validate"/> refuses to accept one.
+/// thing. Daily caps live in <see cref="SqliteBudgetStore"/>, because a day
+/// outlives any one process.
 /// </remarks>
 public sealed class InMemoryBudgetStore : IBudgetStore
 {
@@ -59,50 +58,41 @@ public sealed class InMemoryBudgetStore : IBudgetStore
 
         lock (_gate)
         {
-            if (_limits?.MaxCalls is { } maxCalls && _calls >= maxCalls)
+            var charge = BudgetArithmetic.Check(_limits, _calls, _cost, cost);
+
+            if (charge.Allowed)
             {
-                return new BudgetCharge(
-                    Allowed: false,
-                    Exceeded: BudgetDimension.Calls,
-                    Requested: 1,
-                    Used: _calls,
-                    Cap: maxCalls);
+                _calls++;
+                _cost = BudgetArithmetic.Saturating(_cost, cost);
             }
 
-            if (_limits?.MaxCost is { } maxCost && WouldExceed(_cost, cost, maxCost))
-            {
-                return new BudgetCharge(
-                    Allowed: false,
-                    Exceeded: BudgetDimension.Cost,
-                    Requested: cost,
-                    Used: _cost,
-                    Cap: maxCost);
-            }
-
-            _calls++;
-            _cost = Saturating(_cost, cost);
-
-            return BudgetCharge.Accepted;
+            return charge;
         }
     }
 
+    /// <summary>
+    /// Gives back one call of <paramref name="cost"/> that an earlier
+    /// <see cref="TryCharge"/> accepted.
+    /// </summary>
     /// <remarks>
-    /// Written as a subtraction rather than <c>used + cost &gt; cap</c> because the
-    /// addition can overflow, and a budget that wraps past long.MaxValue into a
-    /// negative number would report itself as freshly empty - an overflow bug that
-    /// unlocks spending is not one to leave to chance.
+    /// Exists for exactly one caller: <see cref="BudgetGate"/>, when the session
+    /// accepted a call that the daily cap then refused. The call never went out,
+    /// so the session must not pay for it.
     ///
-    /// The subtraction is safe in the other direction because nothing is ever
-    /// charged past the cap, so <c>used &lt;= cap</c> and <c>cap - used</c> cannot
-    /// go negative.
+    /// Deliberately on this class and not on <see cref="IBudgetStore"/>. Undoing
+    /// a charge is only safe on a store nobody else can see: a refund against the
+    /// shared SQLite file would be visible to other proxies in between, and
+    /// across midnight would credit a day that was never charged.
+    ///
+    /// Clamped at zero, so a refund that does not match a charge cannot turn
+    /// into extra budget.
     /// </remarks>
-    private static bool WouldExceed(long used, long cost, long cap) => cost > cap - used;
-
-    /// <remarks>
-    /// Only reachable with no cost cap configured, where the totals are a
-    /// statistic rather than a limit: clamping keeps them monotonic instead of
-    /// letting them wrap negative.
-    /// </remarks>
-    private static long Saturating(long used, long cost) =>
-        cost > long.MaxValue - used ? long.MaxValue : used + cost;
+    internal void Refund(long cost)
+    {
+        lock (_gate)
+        {
+            _calls = Math.Max(0, _calls - 1);
+            _cost = Math.Max(0, _cost - cost);
+        }
+    }
 }

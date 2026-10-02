@@ -23,10 +23,19 @@
 # 'session' is this proxy process, which for an stdio server is one client
 # session: the counters start again next time. Costs come from the matched rule
 # below, defaulting to 1, so a call cap works even with no cost: anywhere.
+#
+# 'daily' is one UTC day (00:00-24:00 UTC) across every session and restart. It
+# persists in a SQLite file - ~/.mcp-guardrails/budgets.db, or wherever
+# GUARDRAILS_BUDGET_DB points - and every proxy using that file shares the same
+# daily budget. Point a different agent at a different file to keep its budget
+# separate. A call has to fit both caps.
 budgets:
   session:
     max_calls: 500
     max_cost: 100
+  daily:
+    max_calls: 2000
+    max_cost: 400
 
 rules:
   # A glob, so every read tool the server has (or gains later) is covered

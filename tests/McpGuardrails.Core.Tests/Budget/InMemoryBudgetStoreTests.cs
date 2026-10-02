@@ -159,6 +159,34 @@ public sealed class InMemoryBudgetStoreTests
         Assert.Equal(long.MaxValue, store.Cost);
     }
 
+    // --------------------------------------------------------------- refunds
+
+    [Fact]
+    public void ARefund_GivesBackExactlyOneCharge()
+    {
+        var store = Store(maxCalls: 1);
+
+        store.TryCharge(4);
+        store.Refund(4);
+
+        Assert.Equal((0, 0), (store.Calls, store.Cost));
+        Assert.True(store.TryCharge(4).Allowed);
+    }
+
+    [Fact]
+    public void AnUnmatchedRefund_CannotCreateBudget()
+    {
+        // Clamped at zero: a refund nobody was charged for must not leave the
+        // counters negative, which would read as budget the session never had.
+        var store = Store(maxCalls: 1);
+
+        store.Refund(10);
+
+        Assert.Equal((0, 0), (store.Calls, store.Cost));
+        Assert.True(store.TryCharge(0).Allowed);
+        Assert.False(store.TryCharge(0).Allowed);
+    }
+
     // ------------------------------------------------------------- arguments
 
     [Fact]
