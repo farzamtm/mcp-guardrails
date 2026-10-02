@@ -1,0 +1,17 @@
+# Everything not needed to compile the CLI. Keeping build output out matters
+# beyond speed: a stale bin/ or obj/ from the host (a different OS and RID) would
+# otherwise be copied in and confuse restore.
+**/bin/
+**/obj/
+artifacts/
+tests/
+.git
+.github/
+.githooks/
+.claude/
+.vs/
+.vscode/
+.idea/
+*.user
+**/TestResults/
+.env
