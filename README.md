@@ -478,7 +478,8 @@ confusing parse error. This is the most common way to break an stdio MCP server.
 **Down-level servers still exist.** The official Node filesystem server does not
 implement the 2026-07-28 discovery flow; you'll see a benign
 `server/discover: Method not found` on stderr as the SDK falls back to the older
-`initialize` handshake. Supporting both eras is a real requirement, not a wart.
+`initialize` handshake. Supporting both eras is a real requirement, not a wart —
+see [protocol compatibility](docs/protocol-compatibility.md).
 
 **`McpClientTool.WithName()` is a trap for proxies.** It renames the client-side
 wrapper but not the underlying `ProtocolTool`, so `tools/list` advertises the old
@@ -539,9 +540,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching and commit conventions.
 
 ## Security
 
-The [threat model](SECURITY.md) documents what this defends against and, just as
-importantly, what it does not. Please report vulnerabilities privately rather
-than in a public issue.
+The [threat model](docs/threat-model.md) documents what this defends against
+and, just as importantly, what it does not — attacker by attacker, with a pointer
+into the code for every mitigation and a section of known gaps.
+[SECURITY.md](SECURITY.md) has the short version and how to report a
+vulnerability: privately, please, rather than in a public issue.
+
+Which MCP protocol revisions the proxy speaks on each side, and how approval
+behaves with clients that do and do not support elicitation, is in
+[protocol compatibility](docs/protocol-compatibility.md).
 
 ## Licence
 
