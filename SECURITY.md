@@ -25,6 +25,8 @@ In scope — anything that lets a caller get past the proxy's controls:
 - Secrets appearing unredacted in the audit log
 - Path or namespace confusion in tool routing (a call reaching the wrong server)
 - Crashing the proxy in a way that fails **open** rather than closed
+- Reaching the Streamable HTTP endpoint without the configured bearer token, or
+  from a browser page on another origin
 
 Out of scope:
 
@@ -62,6 +64,9 @@ is worse than none:
 - It does not protect against a compromised MCP client or a compromised host.
 - It does not encrypt or access-control the audit log. That is a filesystem
   permissions question.
+- The Streamable HTTP host serves plain HTTP, with one optional shared bearer
+  token and no per-client identity. It binds loopback by default; anything
+  wider belongs behind a TLS-terminating reverse proxy you trust.
 
 ## Supported versions
 

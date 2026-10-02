@@ -9,16 +9,23 @@ shutting down and may never flush the responses.
 
 Proves the full path:  smoke.py -> guardrails proxy -> filesystem server
 
+The last phase drives the same proxy over Streamable HTTP instead (stdlib
+urllib, still no dependencies), to prove both transports run one pipeline.
+
 Usage:
     python3 scripts/smoke.py [path-to-binary]
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 
 BIN = (
     sys.argv[1]
@@ -50,7 +57,16 @@ APPROVAL_AUDIT = f"{SANDBOX}/audit-approval.jsonl"
 APPROVAL_FILE = f"{SANDBOX}/smoke-approval.yaml"
 APPROVAL_PROBE = f"{SANDBOX}/smoke-approved.txt"
 APPROVAL_REFUSED = f"{SANDBOX}/smoke-unapproved.txt"
+HTTP_AUDIT = f"{SANDBOX}/audit-http.jsonl"
+HTTP_FILE = f"{SANDBOX}/smoke-http.yaml"
+HTTP_PROBE = f"{SANDBOX}/smoke-http.txt"
+HTTP_OVER = f"{SANDBOX}/smoke-http-over.txt"
+HTTP_UNAPPROVED = f"{SANDBOX}/smoke-http-unapproved.txt"
 CONTENT = "written through the guardrails proxy"
+
+# Long enough to pass the proxy's minimum. Not a secret: it guards a listener on
+# an ephemeral loopback port for the few seconds this phase runs.
+HTTP_TOKEN = "smoke-test-token-0123456789"
 
 # A path the sandbox rules must refuse. Never actually written: the point is
 # that the proxy stops the call before the filesystem server ever sees it.
@@ -143,6 +159,50 @@ rules:
     approval:
       timeout_s: 2
       prompt: Allow the agent to write a file in the sandbox?
+"""
+
+
+# The same guardrails, served over Streamable HTTP. One policy exercising every
+# gate at once, because the point of this phase is not the gates themselves -
+# the stdio phases prove those - but that HTTP runs the identical pipeline.
+#
+# max_calls: 3 is reached across separate HTTP requests: in stateless mode every
+# request is a fresh server, so a cap that still bites proves the budget lives in
+# the process, not in a session that no longer exists.
+HTTP_POLICY = f"""
+budgets:
+  session:
+    max_calls: 3
+
+rules:
+  - name: allow-reads
+    match:
+      tool: fs__read_*
+    decision: allow
+
+  - name: approve-unapproved
+    match:
+      tool: fs__write_*
+      args:
+        - path: $.path
+          eq: "{HTTP_UNAPPROVED}"
+    decision: require_approval
+    approval:
+      timeout_s: 30
+
+  - name: allow-sandbox-writes
+    match:
+      tool: fs__write_*
+      args:
+        - path: $.path
+          prefix: {SANDBOX}/
+    decision: allow
+
+  - name: deny-sandbox-escape
+    match:
+      tool: fs__write_*
+    decision: deny
+    message: Write inside the sandbox instead.
 """
 
 
@@ -287,6 +347,47 @@ NO_APPROVER_CHECKS: list[tuple[dict, str, object]] = [
 ]
 
 
+# Run in order against one HTTP proxy process; the budget check depends on the
+# three successful calls before it.
+HTTP_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        request(1, "tools/list"),
+        "HTTP: proxy advertises namespaced downstream tools",
+        lambda r: any(t["name"] == "fs__write_file" for t in r.get("tools", [])),
+    ),
+    (
+        call(2, "fs__write_file", {"path": HTTP_PROBE, "content": CONTENT}),
+        "HTTP: an allowed write is forwarded downstream",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(3, "fs__write_file", {"path": ESCAPE, "content": CONTENT}),
+        "HTTP: the policy denies a write outside the sandbox",
+        lambda r: denied_with(r, "Write inside the sandbox instead."),
+    ),
+    (
+        call(4, "fs__write_file", {"path": HTTP_UNAPPROVED, "content": CONTENT}),
+        "HTTP: require_approval fails closed - stateless HTTP cannot ask anyone",
+        lambda r: denied_with(r, "stateless"),
+    ),
+    (
+        call(5, "fs__read_text_file", {"path": HTTP_PROBE}),
+        "HTTP: a read returns what the write stored",
+        lambda r: CONTENT in json.dumps(r.get("content", [])),
+    ),
+    (
+        call(6, "fs__write_file", {"path": HTTP_PROBE, "content": CONTENT}),
+        "HTTP: the third forwarded call still fits the budget",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(7, "fs__write_file", {"path": HTTP_OVER, "content": CONTENT}),
+        "HTTP: the budget spans stateless requests and refuses the fourth",
+        lambda r: denied_with(r, "session.max_calls"),
+    ),
+]
+
+
 def main() -> int:
     try:
         os.makedirs(SANDBOX, exist_ok=True)
@@ -313,6 +414,10 @@ def main() -> int:
         APPROVAL_AUDIT,
         APPROVAL_PROBE,
         APPROVAL_REFUSED,
+        HTTP_AUDIT,
+        HTTP_PROBE,
+        HTTP_OVER,
+        HTTP_UNAPPROVED,
         ESCAPE,
     ):
         try:
@@ -330,6 +435,8 @@ def main() -> int:
             handle.write(BUDGET_POLICY)
         with open(APPROVAL_FILE, "w", encoding="utf-8") as handle:
             handle.write(APPROVAL_POLICY)
+        with open(HTTP_FILE, "w", encoding="utf-8") as handle:
+            handle.write(HTTP_POLICY)
     except OSError as exc:
         print(f"cannot write policy {POLICY_FILE}: {exc}", file=sys.stderr)
         return 1
@@ -393,6 +500,27 @@ def main() -> int:
 
     failures += check_approval_audit_log()
 
+    # Phase 5: the same pipeline over Streamable HTTP.
+    print("\n--- streamable http ---")
+    http_failures, http_stderr = run_http_session(
+        HTTP_CHECKS,
+        {
+            "GUARDRAILS_AUDIT": HTTP_AUDIT,
+            "GUARDRAILS_POLICY": HTTP_FILE,
+            "GUARDRAILS_HTTP_TOKEN": HTTP_TOKEN,
+        },
+    )
+    failures += http_failures
+    failures += check_http_audit_log()
+
+    for path, label in (
+        (HTTP_UNAPPROVED, "HTTP: the unapprovable write never reached the disk"),
+        (HTTP_OVER, "HTTP: the over-budget write never happened"),
+    ):
+        exists = os.path.exists(path)
+        print(f"{'FAIL' if exists else 'PASS'}  {label}")
+        failures += 1 if exists else 0
+
     unapproved = os.path.exists(APPROVAL_REFUSED)
     print(f"{'FAIL' if unapproved else 'PASS'}  no unapproved write reached the disk")
     failures += 1 if unapproved else 0
@@ -409,7 +537,13 @@ def main() -> int:
     if failures:
         print("\n--- server stderr (last 30) ---", file=sys.stderr)
         sys.stderr.writelines(
-            (stderr_lines + policy_stderr + budget_stderr + approval_stderr)[-30:]
+            (
+                stderr_lines
+                + policy_stderr
+                + budget_stderr
+                + approval_stderr
+                + http_stderr
+            )[-30:]
         )
 
     print("\nFAILED" if failures else "\nALL OK")
@@ -546,6 +680,222 @@ def run_session(
             proc.kill()
 
     return failures, stderr_lines
+
+
+def run_http_session(
+    checks: list[tuple[dict, str, object]],
+    extra_env: dict[str, str],
+) -> tuple[int, list[str]]:
+    """Drive one proxy process serving Streamable HTTP through a list of checks.
+
+    Port 0 lets the OS pick a free port, so parallel CI jobs cannot collide; the
+    proxy logs the address it actually bound, and that line is how we find it.
+    """
+    proc = subprocess.Popen(
+        [BIN, "--transport", "http", "--port", "0"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={**os.environ, "GUARDRAILS_SANDBOX": SANDBOX, **extra_env},
+    )
+    stderr = proc.stderr
+    if stderr is None:
+        raise RuntimeError("failed to open the server's stderr")
+
+    stderr_lines: list[str] = []
+    found = threading.Event()
+    endpoint: list[str] = []
+
+    def drain() -> None:
+        pattern = re.compile(r"at (http://\S+/mcp)")
+        for line in stderr:
+            stderr_lines.append(line)
+            match = pattern.search(line)
+            if match and not endpoint:
+                endpoint.append(match.group(1))
+                found.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    try:
+        # Generous: the downstream server is fetched by npx before we listen.
+        if not found.wait(timeout=120):
+            print("FAIL  HTTP: the proxy never reported a listening address")
+            return 1, stderr_lines
+
+        url = endpoint[0]
+        expect(
+            url.startswith("http://127.0.0.1:"),
+            f"HTTP: binds loopback by default ({url})",
+        )
+
+        status, _ = http_post(url, request(100, "tools/list"), token=None)
+        expect(status == 401, f"HTTP: no bearer token -> 401 (got {status})")
+
+        status, _ = http_post(url, request(101, "tools/list"), token="wrong-token")
+        expect(status == 401, f"HTTP: wrong bearer token -> 401 (got {status})")
+
+        # What a browser sends when someone else's page targets the loopback
+        # port, e.g. after DNS rebinding. The right token must not rescue it.
+        status, _ = http_post(
+            url,
+            request(102, "tools/list"),
+            token=HTTP_TOKEN,
+            origin="https://attacker.example",
+        )
+        expect(status == 403, f"HTTP: foreign Origin -> 403 (got {status})")
+
+        for req, label, predicate in checks:
+            started = time.monotonic()
+            status, msg = http_post(url, req, token=HTTP_TOKEN)
+            elapsed = time.monotonic() - started
+
+            result = msg.get("result") if msg else None
+            ok = status == 200 and result is not None
+            ok = ok and bool(predicate(result))  # type: ignore[operator]
+            # A refusal that only arrives when the 30s approval deadline expires
+            # would pass the predicate, but it is the hang this design rules out.
+            ok = ok and elapsed < 10
+            print(f"{'PASS' if ok else 'FAIL'}  {label}")
+            if not ok:
+                failures += 1
+                print(f"  status={status} elapsed={elapsed:.1f}s")
+                print(json.dumps(msg, indent=2)[:700])
+
+        # The audit sink flushes in the background. On Windows terminate() is a
+        # hard kill with no graceful shutdown to drain it, so wait for the lines
+        # rather than racing the flush.
+        calls = sum(1 for req, _, _ in checks if req["method"] == "tools/call")
+        wait_for_lines(extra_env["GUARDRAILS_AUDIT"], calls, timeout=10)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    return failures, stderr_lines
+
+
+def wait_for_lines(path: str, count: int, *, timeout: float) -> None:
+    """Return once path holds at least count lines, or when timeout runs out."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                if sum(1 for line in handle if line.strip()) >= count:
+                    return
+        except FileNotFoundError:
+            pass
+        time.sleep(0.1)
+
+
+def http_post(
+    url: str,
+    message: dict,
+    *,
+    token: str | None,
+    origin: str | None = None,
+) -> tuple[int, dict | None]:
+    """POST one JSON-RPC message; return the status and the matching reply.
+
+    Streamable HTTP may answer with plain JSON or with a short SSE stream, so
+    both are accepted - a client that only handled one would be testing the SDK's
+    choice, not the proxy.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if origin is not None:
+        headers["Origin"] = origin
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(message).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            status = response.status
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+
+    if content_type.startswith("application/json"):
+        candidates = [body]
+    else:
+        candidates = [
+            line[len("data:") :].strip()
+            for line in body.splitlines()
+            if line.startswith("data:")
+        ]
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if parsed.get("id") == message.get("id"):
+            return status, parsed
+
+    return status, None
+
+
+def check_http_audit_log() -> int:
+    """HTTP calls must be audited exactly like stdio ones."""
+    try:
+        with open(HTTP_AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  HTTP audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  HTTP audit log unreadable: {exc}")
+        return 1
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    # Six tool calls; the HTTP requests refused for auth or origin never reached
+    # the MCP server, so they are not tool calls and must not appear.
+    expect(
+        len(lines) == 6,
+        "HTTP: one audit line per tools/call, none for refused requests "
+        f"(got {len(lines)})",
+    )
+    rules = {entry.get("rule") for entry in lines if entry.get("decision") == "deny"}
+    expect(
+        rules == {"deny-sandbox-escape", "approve-unapproved", "session.max_calls"},
+        "HTTP: audit names the policy, approval and budget refusals "
+        f"(got {sorted(r or '' for r in rules)})",
+    )
+    expect(
+        any(entry.get("approval") == "unavailable" for entry in lines),
+        "HTTP: the unapprovable call is logged as approval 'unavailable'",
+    )
+
+    return failures
 
 
 def check_policy_audit_log() -> int:

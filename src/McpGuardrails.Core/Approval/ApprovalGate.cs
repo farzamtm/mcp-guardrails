@@ -118,9 +118,14 @@ public static class ApprovalGate
             ApprovalOutcome.Unavailable => Refuse(
                 decision,
                 outcome,
+                // Two causes, one message: either the client lacks elicitation,
+                // or the proxy is serving stateless HTTP, which has no channel
+                // back to the client to put a question on.
                 "this call needs human approval and your MCP client cannot ask anyone - it " +
-                "does not support elicitation. Nothing you can do will change that; tell the " +
-                "user, who can approve the action themselves or adjust the policy."),
+                "does not support elicitation, or the proxy is serving it over stateless " +
+                "HTTP, which cannot send it the question. Nothing you can do will change " +
+                "that; tell the user, who can approve the action themselves or adjust the " +
+                "policy."),
 
             _ => Refuse(
                 decision,

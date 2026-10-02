@@ -3,19 +3,24 @@ using McpGuardrails.Cli;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
+using McpGuardrails.Core.Hosting;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Upstream;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Protocol;
+using ModelContextProtocol.Server;
 
 // ---------------------------------------------------------------------------
 // STEP 3 - the pass-through proxy.
 //
 // The proxy is two things at once:
-//   - an MCP SERVER, which the client (Claude Desktop) talks to over stdio
+//   - an MCP SERVER, which the client (Claude Desktop) talks to over stdio -
+//     or, with --transport http, over Streamable HTTP
 //   - an MCP CLIENT, which talks to the real downstream servers
 //
 // This file is a "top-level program": C# allows bare statements as the entry
@@ -31,6 +36,20 @@ var listOnly = args.Contains("list-upstream", StringComparer.Ordinal);
 // the trail allocates on a path that runs for every single tool call.
 var explain = args.Contains("--explain", StringComparer.Ordinal);
 
+// Which transport the server half listens on. Parsed before anything is spawned,
+// so a bad or unsafe command line fails in milliseconds rather than after every
+// downstream server has started - and fails rather than guessing.
+ServeOptions serve;
+try
+{
+    serve = ServeOptions.Parse(args, Environment.GetEnvironmentVariable(ServeOptions.TokenVariable));
+}
+catch (ServeOptionsException ex)
+{
+    await Console.Error.WriteLineAsync(ex.Message);
+    return 2;
+}
+
 // Where the sandboxed filesystem server is allowed to operate.
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
               ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
@@ -45,7 +64,23 @@ var auditPath = Environment.GetEnvironmentVariable("GUARDRAILS_AUDIT")
                     ".mcp-guardrails",
                     "audit.jsonl");
 
-var builder = Host.CreateApplicationBuilder(args);
+// Both builders implement IHostApplicationBuilder, so everything below - logging,
+// and above all the MCP server with its guardrail filters - is configured once,
+// through the interface, for whichever transport was chosen. Only the listener
+// differs. The slim builder because it is the AOT-friendly one.
+WebApplicationBuilder? web = null;
+IHostApplicationBuilder builder;
+
+if (serve.Transport is Transport.Http)
+{
+    web = WebApplication.CreateSlimBuilder(args);
+    HttpHost.ConfigureListener(web, serve);
+    builder = web;
+}
+else
+{
+    builder = Host.CreateApplicationBuilder(args);
+}
 
 // ---------------------------------------------------------------------------
 // CRITICAL for stdio servers: stdout is the JSON-RPC wire.
@@ -139,6 +174,13 @@ if (listOnly)
 // case where someone reading the log afterwards most needs to trust it.
 const string UnnamedTool = "(missing)";
 
+// Who a require_approval call is put to. Over stdio, the human at the client via
+// elicitation. Over stateless HTTP there is no channel back to the client, so the
+// answer is "nobody", given immediately - see StatelessHttpApprovalChannel.
+Func<McpServer, IApprovalChannel> approvalChannel = serve.Transport is Transport.Http
+    ? _ => StatelessHttpApprovalChannel.Instance
+    : server => new ElicitationApprovalChannel(server);
+
 // ---------------------------------------------------------------------------
 // STEP 3: serve the aggregated tools.
 //
@@ -151,7 +193,7 @@ const string UnnamedTool = "(missing)";
 // Right now both are pure pass-through. Every guardrail in the spec - policy,
 // budget, approval, redaction - becomes a filter wrapped around these.
 // ---------------------------------------------------------------------------
-builder.Services
+var mcp = builder.Services
     .AddMcpServer(options =>
     {
         options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = "0.1.0" };
@@ -264,7 +306,7 @@ builder.Services
             decision = await ApprovalGate.ApplyAsync(
                 decision,
                 facts,
-                new ElicitationApprovalChannel(request.Server),
+                approvalChannel(request.Server),
                 cancellationToken);
 
             decision = budget.Apply(decision);
@@ -295,7 +337,6 @@ builder.Services
             };
         });
     })
-    .WithStdioServerTransport()
     .WithListToolsHandler((_, _) =>
     {
         var tools = upstream.Connections
@@ -342,7 +383,20 @@ builder.Services
             cancellationToken);
     });
 
-await builder.Build().RunAsync();
+if (web is not null)
+{
+    // Stateless is the SDK default as of the 2026-07-28 revision; spelled out
+    // because the approval behaviour above depends on it.
+    mcp.WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless);
+
+    await HttpHost.RunAsync(web.Build(), serve);
+}
+else
+{
+    mcp.WithStdioServerTransport();
+
+    await ((HostApplicationBuilder)builder).Build().RunAsync();
+}
 
 return 0;
 
