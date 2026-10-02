@@ -4,7 +4,9 @@ using System.Text;
 using System.Text.Json;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Tests.Policy;
+using McpGuardrails.Core.Tests.Scanners;
 
 namespace McpGuardrails.Core.Tests.Approval;
 
@@ -345,6 +347,31 @@ public sealed class WebhookApprovalChannelTests
             summary["content"],
             StringComparison.Ordinal);
         Assert.EndsWith("(6 more characters)", summary["content"], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Summarize_RedactsSecrets_InStringsAndInJson()
+    {
+        var summary = WebhookApprovalChannel.Summarize(
+            TestArguments.From($$$"""
+                {"content": "key={{{SecretSamples.AwsAccessKey}}}", "auth": {"github": "{{{SecretSamples.GitHubToken}}}"}}
+                """))!;
+
+        Assert.Equal($"key={SecretScanner.Marker("aws-access-key")}", summary["content"]);
+        Assert.Equal($$"""{"github": "{{SecretScanner.Marker("github-token")}}"}""", summary["auth"]);
+    }
+
+    [Fact]
+    public void Summarize_RedactsBeforeCutting_SoAKeyAtTheCutIsNotHalfSent()
+    {
+        // Cut first, and the first half of the key would go out: too short for
+        // the detector to recognise, long enough to narrow a search for the rest.
+        var padding = new string('x', WebhookApprovalChannel.MaxArgumentLength - 8);
+
+        var summary = WebhookApprovalChannel.Summarize(
+            TestArguments.From($$"""{"content": "{{padding}} {{SecretSamples.AwsAccessKey}}"}"""))!;
+
+        Assert.DoesNotContain(SecretSamples.AwsAccessKey[..6], summary["content"], StringComparison.Ordinal);
     }
 
     [Fact]

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Serialization;
 
 namespace McpGuardrails.Core.Approval;
@@ -166,6 +167,13 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
         "sha256=" + Convert.ToHexStringLower(HMACSHA256.HashData(_secret, body));
 
     /// <summary>Shortens arguments to what an approver needs to see.</summary>
+    /// <remarks>
+    /// Secrets are redacted whatever <c>scanners.secrets</c> says, because the
+    /// endpoint is one more system outside the proxy and an approver decides on
+    /// the path and the shape of a call, never on a key's value. Redacted before
+    /// the cut, so truncation cannot leave half a key the detectors no longer
+    /// recognise. PII is left alone: "which customer" is often the question.
+    /// </remarks>
     internal static IReadOnlyDictionary<string, string>? Summarize(
         IReadOnlyDictionary<string, JsonElement>? arguments)
     {
@@ -184,7 +192,7 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
                 ? value.GetString()!
                 : value.GetRawText();
 
-            summary[name] = Truncate(text);
+            summary[name] = Truncate(SecretScanner.Redact(text, includePii: false).Text);
         }
 
         return summary;

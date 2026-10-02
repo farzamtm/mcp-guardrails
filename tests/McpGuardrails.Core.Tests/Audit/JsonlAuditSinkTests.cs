@@ -134,6 +134,67 @@ public sealed class JsonlAuditSinkTests : IDisposable
     }
 
     [Fact]
+    public async Task RecordsWhatTheResultScannerFound()
+    {
+        // Names and the action, on the same line as the call they belong to, so
+        // "what did my agent read that tried to steer it?" is one jq query rather
+        // than a correlation exercise.
+        await using (var sink = new JsonlAuditSink(LogPath))
+        {
+            await sink.WriteAsync(Record("web__fetch") with
+            {
+                ScannerHits = ["instruction-override", "exfiltration"],
+                ScannerAction = "annotated",
+            });
+        }
+
+        var entry = (await ReadLogAsync())[0];
+
+        Assert.Equal("annotated", entry.GetProperty("scanner_action").GetString());
+        Assert.Equal(
+            ["instruction-override", "exfiltration"],
+            entry.GetProperty("scanner_hits").EnumerateArray().Select(hit => hit.GetString()));
+    }
+
+    [Fact]
+    public async Task RecordsWhatSecretRedactionFound()
+    {
+        await using (var sink = new JsonlAuditSink(LogPath))
+        {
+            await sink.WriteAsync(Record("fs__write_file") with
+            {
+                ArgumentSecrets = ["aws-access-key"],
+                ArgumentSecretsAction = "forwarded",
+                ResultSecrets = ["jwt"],
+                ResultSecretsAction = "redacted",
+            });
+        }
+
+        var entry = (await ReadLogAsync())[0];
+
+        Assert.Equal("aws-access-key", entry.GetProperty("argument_secrets")[0].GetString());
+        Assert.Equal("forwarded", entry.GetProperty("argument_secrets_action").GetString());
+        Assert.Equal("jwt", entry.GetProperty("result_secrets")[0].GetString());
+        Assert.Equal("redacted", entry.GetProperty("result_secrets_action").GetString());
+    }
+
+    [Fact]
+    public async Task ACleanResultAddsNoScannerFields()
+    {
+        await using (var sink = new JsonlAuditSink(LogPath))
+        {
+            await sink.WriteAsync(Record("fs__read_file"));
+        }
+
+        var entry = (await ReadLogAsync())[0];
+
+        Assert.False(entry.TryGetProperty("scanner_hits", out _));
+        Assert.False(entry.TryGetProperty("scanner_action", out _));
+        Assert.False(entry.TryGetProperty("argument_secrets", out _));
+        Assert.False(entry.TryGetProperty("result_secrets", out _));
+    }
+
+    [Fact]
     public async Task RejectsInvalidConstructorArguments()
     {
         Assert.Throws<ArgumentException>(() => new JsonlAuditSink("  "));

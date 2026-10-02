@@ -127,6 +127,7 @@ public static class PolicyLoader
 
         document.EffectiveBudgets.Validate();
         document.EffectiveApprovers.Validate(document.EffectiveRules);
+        document.EffectiveScanners.Validate();
 
         return document;
     }
