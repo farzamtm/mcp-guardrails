@@ -80,6 +80,9 @@ send it somewhere, call a destructive tool, hide what it did from the user.
   blocks, embedded text resources, `structuredContent` and error results.
   - `annotate` (default) fences the result between a warning header and a
     trailer, so the injection is not the last thing in the context window.
+    `structuredContent` cannot carry a warning, so it is withheld and its data
+    delivered inside the fence as text; the result is marked `isError` so a
+    client validating against the tool's `outputSchema` does not reject it.
   - `block` withholds the content and returns a tool error instead.
   - No regex anywhere in the scan path, so a large or crafted result cannot
     stall the proxy through backtracking.
@@ -257,10 +260,20 @@ match the *shape* of an injection, so:
 - **Annotate still delivers the payload.** The default puts a warning around
   the injection, and the model reads both. Whether the warning wins is up to the
   model.
-- **`structuredContent` is scanned but not fenced.** In `annotate` mode the
-  warning goes into the text content; `structuredContent` is passed through
-  untouched. A client that only hands the model the structured payload delivers
-  it without the warning (the audit log still records the hit).
+- **A flagged structured result costs the client its structure.** A JSON
+  payload that has to match an `outputSchema` has nowhere to put a warning, so
+  in `annotate` mode `structuredContent` is withheld rather than forwarded bare
+  to a client that reads only that field. The same data reaches the model as
+  text inside the fence — the server's own text copy when it sent one, the
+  serialized payload when it did not. The result is marked `isError: true`,
+  because the MCP specification says clients SHOULD validate structured results
+  and the TypeScript SDK rejects a *successful* result from a tool with an
+  `outputSchema` that has no `structuredContent`; errors are exempt. The header
+  tells the model the tool did run. A client that drives program logic off
+  `structuredContent` sees a failed call instead of data, and the audit log
+  records `scanner_structured_content_withheld: true` so that is traceable.
+  Stripping `outputSchema` from `tools/list` instead would have weakened every
+  clean call to protect the rare flagged one.
 - **One setting for everything.** `scanners.injection.action` applies to every
   server and tool; there is no per-server `block`.
 - **False positives are certain.** A document *about* prompt injection will be
@@ -339,6 +352,12 @@ Resources and prompts are not proxied at all.
   detectors have not heard of, is logged and returned in plain text. The
   default `arguments: redact_audit` still forwards the real value to the
   server; the log records `argument_secrets_action: "forwarded"` when it does.
+  In a result's `structuredContent` the markers replace string values in
+  place, so the payload keeps its shape but may no longer satisfy a `pattern`,
+  `format` or `enum` in the tool's `outputSchema`; a validating client then
+  rejects the result outright, which fails closed. The notice that the markers
+  are placeholders goes into the text content only — a client that reads only
+  `structuredContent` sees `[REDACTED:<kind>]` with no further explanation.
   The arguments are also
   model-written, so they can carry injected text of their own — the scanner's
   "names only" rule covers results, not arguments. Do not pipe the log into

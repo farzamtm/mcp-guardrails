@@ -466,6 +466,8 @@ var mcp = builder.Services
                         ? scan.Heuristics
                         : null,
                     ScannerAction = scope.Scan?.Describe(),
+                    ScannerStructuredContentWithheld =
+                        scope.Scan is { StructuredContentWithheld: true } ? true : null,
                     Classifier = scope.Scan?.Classifier?.Describe(),
                     ClassifierTruncated = scope.Scan?.Classifier is { Truncated: true } ? true : null,
                     ClassifierError = scope.Scan?.Classifier?.Error,

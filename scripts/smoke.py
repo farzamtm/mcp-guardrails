@@ -647,6 +647,19 @@ SCAN_CHECKS: list[tuple[dict, str, object]] = [
         lambda r: "exfiltration agent" in result_text(r),
     ),
     (
+        call(6, "fs__read_text_file", {"path": POISONED}),
+        "the unfenceable structuredContent is withheld, flagged as an error",
+        # The filesystem server advertises an outputSchema and returns the file
+        # in structuredContent as well. A client reading only that would get the
+        # injection with no warning; a validating client would reject a success
+        # with the payload missing, so the result is marked as an error instead.
+        lambda r: (
+            "structuredContent" not in r
+            and bool(r.get("isError"))
+            and "the tool did run" in result_text(r)
+        ),
+    ),
+    (
         call(5, "fs__read_text_file", {"path": PROBE}),
         "an ordinary result is not annotated",
         # Checked against the fence markers, not the word "guardrails": the probe
@@ -677,8 +690,11 @@ CLASSIFIER_BENIGN_CHECKS: list[tuple[dict, str, object]] = [
     (
         call(1, "fs__read_text_file", {"path": POISONED}),
         "a classifier that calls the hit benign softens block to annotate",
+        # Not told apart by isError: an annotated read of this server is an error
+        # too, because its structuredContent is withheld. The block message is
+        # the difference.
         lambda r: (
-            not r.get("isError")
+            "Blocked by guardrails scanner" not in result_text(r)
             and "begin untrusted output" in result_text(r)
             and "exfiltration agent" in result_text(r)
         ),
@@ -1794,12 +1810,22 @@ def check_scan_audit_log() -> int:
 
     flagged = [entry for entry in lines if entry.get("scanner_hits")]
 
-    # Three annotated reads in the default session, one blocked read in the
+    # Four annotated reads in the default session, one blocked read in the
     # strict one. The write that planted the file is not among them: its own
     # result said only that it succeeded.
     expect(
-        len(flagged) == 4,
+        len(flagged) == 5,
         f"every poisoned read is recorded, not just the first (got {len(flagged)})",
+    )
+    # Every one of those reads returned structuredContent, and none of it was
+    # passed on - the client got an error flag the server never set, and the
+    # log has to explain that.
+    expect(
+        all(
+            entry.get("scanner_structured_content_withheld") is True
+            for entry in flagged
+        ),
+        "audit records that the structured payload was withheld",
     )
     expect(
         all(
