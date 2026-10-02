@@ -11,6 +11,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Protocol;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 // ---------------------------------------------------------------------------
 // STEP 3 - the pass-through proxy.
@@ -31,6 +34,26 @@ var listOnly = args.Contains("list-upstream", StringComparer.Ordinal);
 // blocked?" is answerable without reading the rules. Off by default: building
 // the trail allocates on a path that runs for every single tool call.
 var explain = args.Contains("--explain", StringComparer.Ordinal);
+
+// --injection-classifier turns on the LLM second stage of the injection scanner
+// with its defaults (confirm mode, Haiku, ANTHROPIC_API_KEY) when the policy does
+// not configure it. A policy `classifier:` block always wins, including one that
+// says `mode: off`: the file is the reviewed, committed statement of intent, and
+// a flag in a launcher config should not be able to quietly override it.
+var classifierFlag = args.Contains("--injection-classifier", StringComparer.Ordinal);
+
+// OpenTelemetry export is opt-in. Setting the standard OTLP endpoint variable is
+// itself the opt-in, so the proxy behaves like any other OTel-instrumented
+// process; --otel means "export to the default collector on localhost". Off by
+// default because a security tool should not open network connections nobody
+// asked for.
+var otel = args.Contains("--otel", StringComparer.Ordinal)
+           || !string.IsNullOrWhiteSpace(
+               Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT"));
+
+// Reported as the MCP server version and as the OTel service.version, so a
+// trace and a client's server list agree on what was running.
+const string ProxyVersion = "0.1.0";
 
 // Where the sandboxed filesystem server is allowed to operate.
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
@@ -61,6 +84,38 @@ builder.Logging.ClearProviders();
 builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 builder.Logging.SetMinimumLevel(listOnly ? LogLevel.Warning : LogLevel.Information);
 
+// Created unconditionally: with no exporter attached the span and instruments
+// are inert, and the audit filter does not need a second code path.
+using var telemetry = new ToolCallTelemetry();
+
+if (otel)
+{
+    // Traces and metrics only, not logs. The proxy's log lines are for the
+    // operator's terminal; exporting them would be a second, unreviewed channel
+    // out of the process.
+    //
+    // "Experimental.ModelContextProtocol" is the MCP SDK's own source and meter.
+    // Subscribing to it adds the semconv tools/call server span above ours and a
+    // client span per downstream call beneath it, so one trace shows the whole
+    // hop: client -> guardrails -> downstream server.
+    //
+    // Endpoint, protocol, headers, export intervals and OTEL_SDK_DISABLED come
+    // from the standard OTEL_* environment variables, read by the SDK. The
+    // exporter writes to the network, never to stdout, so the JSON-RPC wire is
+    // not at risk.
+    const string McpSdkSource = "Experimental.ModelContextProtocol";
+
+    builder.Services.AddOpenTelemetry()
+        .ConfigureResource(resource =>
+            resource.AddService("mcp-guardrails", serviceVersion: ProxyVersion))
+        .WithTracing(tracing => tracing
+            .AddSource(ToolCallTelemetry.SourceName, McpSdkSource)
+            .AddOtlpExporter())
+        .WithMetrics(metrics => metrics
+            .AddMeter(ToolCallTelemetry.SourceName, McpSdkSource)
+            .AddOtlpExporter());
+}
+
 using var loggerFactory = LoggerFactory.Create(logging =>
 {
     logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
@@ -80,7 +135,8 @@ await using var upstream = await UpstreamRegistry.ConnectAsync(
 // Declared after the registry so it is disposed BEFORE it: `await using` unwinds
 // in reverse order, so the sink drains its queue while the tool calls that feed
 // it are already finished.
-await using var audit = new JsonlAuditSink(auditPath);
+await using var audit = new JsonlAuditSink(
+    auditPath, logger: loggerFactory.CreateLogger<JsonlAuditSink>());
 
 // ---------------------------------------------------------------------------
 // Load the policy.
@@ -95,6 +151,12 @@ var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
                      ".mcp-guardrails",
                      "policy.yaml");
 
+// One client for the life of the process, as HttpClient is designed to be used.
+// Infinite timeout because the injection gate owns the classifier deadline;
+// two competing timeouts would make "timed out" mean two different things.
+// Created unconditionally because it is cheap and opens no connection until used.
+using var classifierHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+
 PolicyEvaluator policy;
 BudgetGate budget;
 InjectionGate scanner;
@@ -107,12 +169,34 @@ try
 
     // On by default, including with no policy file at all: a result scanner that
     // has to be switched on protects nobody, and annotating cannot break a call.
-    scanner = new InjectionGate(document.EffectiveScanners.EffectiveInjection);
+    var injection = document.EffectiveScanners.EffectiveInjection;
+
+    if (classifierFlag && injection.Classifier is null)
+    {
+        injection = injection with { Classifier = ClassifierSettings.Default };
+    }
 
     // Also on by default. Out of the box it changes no call - arguments are
     // forwarded as sent and only the audit log is scrubbed - but it does redact
     // secrets from results, because a key the model has read cannot be unread.
-    secrets = new SecretGate(document.EffectiveScanners.EffectiveSecrets);
+    var secretSettings = document.EffectiveScanners.EffectiveSecrets;
+    secrets = new SecretGate(secretSettings);
+
+    // The classifier is opt-in and off by default: it sends tool output to a
+    // third party and costs money per call. A missing API key is a startup
+    // error (PolicyException, caught below) rather than a classifier that
+    // silently fails on every call. It runs inside the secret gate, so it
+    // redacts for itself before anything leaves the process.
+    scanner = injection.UsesClassifier
+        ? new InjectionGate(
+            injection,
+            new RedactingInjectionClassifier(
+                AnthropicInjectionClassifier.Create(
+                    injection.Classifier!,
+                    classifierHttp,
+                    Environment.GetEnvironmentVariable),
+                secretSettings.IncludePii))
+        : new InjectionGate(injection);
 
     // No `budgets:` section means an unlimited gate rather than no gate: the
     // call path is then the same whether or not anyone configured a cap, so the
@@ -166,7 +250,7 @@ const string UnnamedTool = "(missing)";
 builder.Services
     .AddMcpServer(options =>
     {
-        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = "0.1.0" };
+        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = ProxyVersion };
 
         // -------------------------------------------------------------------
         // THE INTERCEPTOR PIPELINE.
@@ -191,10 +275,34 @@ builder.Services
 
             var toolName = request.Params?.Name ?? UnnamedTool;
 
+            // Fail closed: with the log broken, a forwarded call would leave no
+            // evidence at all. Refuse BEFORE forwarding - the sink would throw
+            // afterwards anyway, but only once the downstream action had run.
+            if (audit.IsFaulted)
+            {
+                return new CallToolResult
+                {
+                    IsError = true,
+                    Content = [new TextContentBlock
+                    {
+                        Text = $"Refused '{toolName}': the guardrails audit log cannot be written, " +
+                               "so no tool calls are being forwarded. This needs an operator.",
+                    }],
+                };
+            }
+
             // Resolve purely to enrich the log. The call handler resolves again
             // to actually route; duplicating a dictionary lookup is cheaper than
             // coupling the two concerns together.
             var resolved = upstream.TryResolve(toolName, out var connection, out var downstreamName);
+
+            // Opened before `next` so policy, approval and the downstream call
+            // all run inside the span, and the SDK's client span for the forward
+            // nests under it rather than becoming a sibling.
+            using var span = telemetry.Start(
+                toolName,
+                resolved ? connection.Name : null,
+                resolved ? downstreamName : null);
 
             // Scanned here, before anything runs, rather than taken from the
             // filters inside: a call the policy refuses never reaches them, and
@@ -209,7 +317,7 @@ builder.Services
             var startedAt = Stopwatch.GetTimestamp();
 
             CallToolResult? result = null;
-            string? failure = null;
+            Exception? thrown = null;
 
             try
             {
@@ -220,12 +328,14 @@ builder.Services
             {
                 // Record the failure, then rethrow. The audit sink observes; it
                 // must never change the outcome of a call.
-                failure = $"{ex.GetType().Name}: {ex.Message}";
+                thrown = ex;
                 throw;
             }
             finally
             {
                 var decision = scope.Decision;
+                var elapsed = Stopwatch.GetElapsedTime(startedAt);
+                var failure = thrown is null ? null : $"{thrown.GetType().Name}: {thrown.Message}";
 
                 var record = new AuditRecord
                 {
@@ -246,16 +356,23 @@ builder.Services
                         ? scan.Heuristics
                         : null,
                     ScannerAction = scope.Scan?.Describe(),
+                    Classifier = scope.Scan?.Classifier?.Describe(),
+                    ClassifierTruncated = scope.Scan?.Classifier is { Truncated: true } ? true : null,
+                    ClassifierError = scope.Scan?.Classifier?.Error,
                     ArgumentSecrets = arguments.Report.IsClean ? null : arguments.Report.Detectors,
                     ArgumentSecretsAction = secrets.DescribeArguments(arguments, decision),
                     ResultSecrets = scope.Redaction is { Effect: not RedactionEffect.None } redaction
                         ? redaction.Report.Detectors
                         : null,
                     ResultSecretsAction = scope.Redaction?.Describe(),
-                    DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    DurationMs = elapsed.TotalMilliseconds,
                     IsError = failure is not null || result?.IsError is true,
                     Error = failure,
                 };
+
+                // Same duration and decision as the record, so a dashboard and
+                // the log never disagree about the same call.
+                span.Complete(decision, elapsed, result?.IsError is true, thrown);
 
                 // CancellationToken.None on purpose: if the caller cancelled, we
                 // still want the record. Losing the evidence of an aborted call
@@ -373,7 +490,14 @@ builder.Services
         {
             var result = await next(request, cancellationToken);
 
-            var outcome = scanner.Inspect(result, request.Params?.Name ?? UnnamedTool);
+            // Async because the optional classifier is a network call. Without
+            // one configured this completes synchronously and costs what Inspect
+            // did. Classifier failures never surface here - the gate turns them
+            // into "the heuristic verdict stands" and records why.
+            var outcome = await scanner.InspectAsync(
+                result,
+                request.Params?.Name ?? UnnamedTool,
+                cancellationToken);
 
             // Report upward so the audit record carries the finding, exactly as
             // the policy filter reports its decision.

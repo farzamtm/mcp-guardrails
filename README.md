@@ -32,11 +32,90 @@ your agent actually does.
   MCP client and waits for an answer, with a configurable deadline
 - **Scans what comes back** — tool results are checked for prompt-injection
   attempts and fenced as untrusted data before the model reads them, on by
-  default
+  default, with an optional LLM classifier as a second opinion
 - **Redacts secrets** — API keys, tokens, private keys and passwords are
   replaced with `[REDACTED:<kind>]` markers in tool results before the model
   reads them and in the audit log; optionally in the arguments sent downstream,
   or the call is refused outright. Email addresses and card numbers on request
+- **Exports OpenTelemetry**, opt-in: a span per tool call and counters for
+  decisions, denials and approvals, over OTLP to Jaeger, the Aspire dashboard or
+  any collector, with no argument values in any attribute
+
+## Install
+
+The same program ships three ways. Pick by what is already on the machine.
+
+The downstream servers are still the hardcoded filesystem server started with
+`npx` (configurable upstreams are on the roadmap), so wherever the proxy runs
+needs **Node.js** on `PATH` too.
+
+### Native binary — nothing else to install
+
+Each [GitHub Release](https://github.com/farzamtm/mcp-guardrails/releases)
+carries a self-contained Native AOT executable for `linux-x64`, `linux-arm64`,
+`osx-arm64` and `win-x64`, plus a `SHA256SUMS` file. No .NET runtime needed, and
+startup is fast enough not to matter when a client spawns one proxy per session.
+
+```bash
+VERSION=0.1.0 RID=osx-arm64
+curl -LO "https://github.com/farzamtm/mcp-guardrails/releases/download/v$VERSION/mcp-guardrails-$VERSION-$RID.tar.gz"
+curl -LO "https://github.com/farzamtm/mcp-guardrails/releases/download/v$VERSION/SHA256SUMS"
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf "mcp-guardrails-$VERSION-$RID.tar.gz"
+./mcp-guardrails-$VERSION-$RID/mcp-guardrails list-upstream
+```
+
+The binaries are not code-signed yet, so macOS Gatekeeper will refuse a
+downloaded one until you clear the quarantine flag:
+`xattr -d com.apple.quarantine mcp-guardrails`. Windows gets a `.zip` with
+`mcp-guardrails.exe`.
+
+Building one yourself is a single command; naming a runtime is what switches
+the build to Native AOT:
+
+```bash
+dotnet publish src/McpGuardrails.Cli -c Release -r osx-arm64 -o out
+```
+
+### `dotnet tool` — if you already have the .NET 10 SDK
+
+```bash
+dotnet tool install -g McpGuardrails
+mcp-guardrails list-upstream
+```
+
+The tool package is portable IL rather than a native binary (a tool package has
+to run on every platform), so it needs the .NET 10 runtime. Until the package is
+on nuget.org, install the `.nupkg` attached to a release build from a folder:
+`dotnet tool install -g McpGuardrails --add-source ./folder-with-nupkg`.
+
+### Docker
+
+```bash
+docker build -t mcp-guardrails .
+```
+
+The image is a Native AOT build on Microsoft's chiseled `runtime-deps` base — no
+shell, no package manager, running as a non-root user (uid 1654) — so it
+contains the proxy and nothing else. The downstream servers it spawns have to
+live in the same container, so build on top of it rather than running it bare
+(bare, it exits at startup because there is no `npx` to spawn):
+
+```dockerfile
+FROM mcp-guardrails AS guardrails
+
+FROM node:22-bookworm-slim
+COPY --from=guardrails /usr/local/bin/mcp-guardrails /usr/local/bin/mcp-guardrails
+USER node
+ENTRYPOINT ["/usr/local/bin/mcp-guardrails"]
+```
+
+```bash
+docker build -t my-guardrails -f Dockerfile.mine .
+docker run -i --rm my-guardrails list-upstream
+```
+
+`-i` matters: stdio is the transport, so stdin has to stay open.
 
 ## Policy
 
@@ -351,6 +430,86 @@ jq 'select(.scanner_hits)' ~/.mcp-guardrails/audit.jsonl
 jq 'select(.scanner_action == "blocked")' ~/.mcp-guardrails/audit.jsonl
 ```
 
+### Optional: a second opinion from a model
+
+The heuristics can't tell a document *about* prompt injection from an attack.
+A language model usually can. The classifier is an optional second stage that
+asks Claude, through the Anthropic Messages API, whether a result is trying to
+steer the agent. It is **off unless you ask for it**: it sends tool output to a
+third party and costs money, and neither should be a default.
+
+```yaml
+scanners:
+  injection:
+    action: block
+    classifier:
+      mode: confirm                        # confirm (default) | all | off
+      model: claude-haiku-4-5-20251001     # default
+      api_key_env: ANTHROPIC_API_KEY       # default; the key itself never goes in the file
+      timeout_ms: 5000                     # default; 1 to 60000
+      max_chars: 32000                     # default; longer results are cut down to this
+      # base_url: https://api.anthropic.com  # default; a gateway path prefix is kept
+```
+
+An empty `classifier: {}` block turns it on with every default. Without a
+policy file, `--injection-classifier` on the command line does the same thing.
+A `classifier:` block in the policy always wins over the flag, including
+`mode: off`. Startup fails if the API key variable is unset or blank. A
+classifier that failed on every call would otherwise sit there looking enabled.
+
+**When it runs.**
+
+- `confirm` asks only about results the heuristics already flagged, which costs
+  nothing on the clean majority.
+- `all` asks about every result that has readable text, so it can catch what
+  the heuristics miss, at one API call per tool call.
+- Image-only results are never sent.
+
+**How the two stages combine.**
+
+| Heuristics | Classifier | Result |
+| --- | --- | --- |
+| flagged | `INJECTION` | the configured `action` |
+| flagged | `BENIGN` | **annotated**. Never blocked, never forwarded bare |
+| clean | `INJECTION` (`mode: all` only) | the configured `action`, reported as hit `llm-classifier` |
+| clean | `BENIGN` | forwarded untouched |
+| either | timed out / failed | the heuristic verdict, exactly as without a classifier |
+
+The classifier reads the same attacker-controlled text as the agent, so it
+might be talked round too. It is therefore trusted only to soften a block into
+a warning, and never to remove a warning. That is what makes `action: block`
+workable on prose: a result is withheld only when both stages agree. With
+`action: annotate` and `mode: confirm`, the verdict changes nothing the model
+sees. It only adds evidence to the audit log. Use `block` + `confirm`, or
+`mode: all`, if you want the classifier to change outcomes.
+
+**Failure never breaks a call.** If the call times out, returns a non-2xx
+status, has a network error, or comes back with anything other than the single
+word `INJECTION` or `BENIGN`, the heuristic verdict stands and the audit log
+records `classifier: "timed_out"` or `"failed"` with a short reason. The proxy
+applies the deadline itself. If the client cancels the call, the classifier
+request is cancelled with it.
+
+**Large results** go to the classifier as their first and last `max_chars / 2`
+characters, with a marker in between saying how much was dropped. Payloads
+usually sit at the start or end of a result. One deliberately padded into the
+middle of a very large result will not be seen. The audit log marks such calls
+with `classifier_truncated`.
+
+**The tool output is data in the prompt, not instructions.** It is wrapped in
+tags named with a fresh random nonce on every call, so the content can't guess
+the closing tag and break out. The instruction to answer with one word comes
+*after* it. Anything other than exactly one of the two words counts as a
+failure, and the reply is never logged.
+
+**Privacy and cost.** Every classified result, up to `max_chars`, is sent to
+Anthropic, or to `base_url` if you point it at a gateway. Secrets are redacted
+from it first, with the same detectors as [secret redaction](#secret-redaction)
+and even when `scanners.secrets.results` is `off`: the classifier never needs a
+real key to recognise an injection. `base_url` must be
+https. Plain http is accepted only for a loopback address, because the API key
+travels in a header.
+
 ## Secret redaction
 
 A credential can leak in two directions, and the proxy sits on both.
@@ -498,6 +657,22 @@ was done, and its `arguments` hold markers rather than the values:
 reach the server. The others are `redacted` and `blocked`; results use
 `result_secrets` and `result_secrets_action` (`redacted` or `blocked`).
 
+When the classifier ran, there are up to three more fields:
+
+- `classifier`: `benign`, `injection`, `timed_out` or `failed`
+- `classifier_truncated`: `true` only when the result was cut down to `max_chars`
+- `classifier_error`: on failure, a short reason such as an HTTP status
+
+As with `scanner_hits`, these record the verdict and never the text.
+
+```bash
+# Calls where the heuristics and the classifier disagreed
+jq 'select(.scanner_hits and .classifier == "benign")' ~/.mcp-guardrails/audit.jsonl
+
+# Is the classifier actually working?
+jq -r 'select(.classifier) | .classifier' ~/.mcp-guardrails/audit.jsonl | sort | uniq -c
+```
+
 ```bash
 # What did my agent touch, and how long did it take?
 jq -r '[.ts, .tool, (.duration_ms|tostring)] | @tsv' ~/.mcp-guardrails/audit.jsonl
@@ -505,6 +680,94 @@ jq -r '[.ts, .tool, (.duration_ms|tostring)] | @tsv' ~/.mcp-guardrails/audit.jso
 # Only the failures
 jq 'select(.is_error)' ~/.mcp-guardrails/audit.jsonl
 ```
+
+## OpenTelemetry
+
+The JSONL log answers "what happened in this session". OpenTelemetry answers it
+across many sessions, on the dashboards you already have. Export is **off by
+default** and switched on by either:
+
+- setting `OTEL_EXPORTER_OTLP_ENDPOINT` (the standard OTel variable), or
+- passing `--otel`, which exports to the default collector on `localhost:4317`.
+
+All the standard `OTEL_*` variables apply: `OTEL_EXPORTER_OTLP_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SDK_DISABLED`, and so on.
+
+### Quickstart: the Aspire dashboard
+
+The [Aspire dashboard](https://aspire.dev/dashboard/standalone/) is a single
+container that shows traces and metrics:
+
+```bash
+docker run --rm -d --name aspire-dashboard \
+  -p 18888:18888 -p 4317:18889 \
+  -e ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true \
+  mcr.microsoft.com/dotnet/aspire-dashboard:latest
+
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  ./src/McpGuardrails.Cli/bin/Debug/net10.0/McpGuardrails.Cli
+```
+
+Open <http://localhost:18888> and the `mcp-guardrails` service appears after its
+first tool call. (`UNSECURED_ALLOW_ANONYMOUS` skips the login token. That is fine
+on a laptop, not on a shared host.)
+
+From Claude Desktop, put the variable in the server's `env` block next to
+`GUARDRAILS_POLICY`.
+
+[Jaeger](https://www.jaegertracing.io/) works the same way for traces, though it
+has nowhere to put metrics:
+
+```bash
+docker run --rm -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/jaeger:latest
+```
+
+### What is exported
+
+One trace per tool call shows the whole hop. The MCP SDK's own `tools/call`
+server span is the root; the guardrails span, `guardrails tools/call <tool>`,
+sits inside it; the SDK's client span for the downstream call sits inside that.
+A call that policy refused has no client span, which is how you can see that
+it never left the proxy.
+
+| Attribute | Meaning |
+| --- | --- |
+| `gen_ai.tool.name` | Client-visible tool name (semconv) |
+| `mcp_guardrails.server`, `mcp_guardrails.downstream_tool` | Where the call was routed |
+| `mcp_guardrails.decision` | `allow`, `deny`, `require_approval`, as in the audit log |
+| `mcp_guardrails.decision.source` | `policy`, `budget` or `approval` |
+| `mcp_guardrails.rule` | Rule that decided, or the budget limit (`session.max_cost`) |
+| `mcp_guardrails.budget.cost` | What the call costs against the budget |
+| `mcp_guardrails.approval.outcome` | `approved`, `declined`, `timed_out`, `unavailable`, `failed` |
+| `error.type` | Exception type, or `tool_error` when the downstream tool reported failure (semconv) |
+
+| Metric | Type | Attributes |
+| --- | --- | --- |
+| `mcp_guardrails.tool_calls` | counter | tool, server, decision, `error.type` |
+| `mcp_guardrails.denials` | counter | tool, server, decision source, rule |
+| `mcp_guardrails.approvals` | counter | tool, server, rule, approval outcome |
+| `mcp_guardrails.tool_call.duration` | histogram, seconds | tool, server, decision, `error.type` |
+
+The SDK's semconv metrics (`mcp.server.operation.duration`,
+`mcp.client.operation.duration`, ...) are exported alongside these.
+
+Telemetry is held to a **stricter** privacy line than the audit log. A trace
+backend is usually shared far more widely than a file on the proxy's own disk,
+so:
+
+- **argument values are never exported**, and neither are exception messages or
+  decision reasons, which can quote arguments. A span carries the exception
+  *type* and the rule *name*, which is enough to find the full audit line.
+- a tool name the proxy could not resolve is free text from the client, so
+  metrics record it as `_OTHER` rather than minting a time series per typo.
+- **a denial is not an error.** The model receives it as an `isError` result,
+  but the span status stays unset: a denial is the guardrail working, and
+  counting it as a failure would turn every error-rate panel into a denial-rate
+  panel.
+
+`scripts/smoke.py` runs a session against a fake OTLP collector and checks that
+spans and metrics arrive and that an argument value sent in the call appears
+nowhere in what was exported.
 
 ## Quickstart
 
@@ -561,13 +824,15 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | `src/McpGuardrails.Core/Policy/` | Decisions, rules, evaluator, YAML loader |
 | `src/McpGuardrails.Core/Pipeline/` | Per-call scope shared between filters |
 | `src/McpGuardrails.Core/Scanners/` | Injection scanning and secret redaction: detectors, settings, the gates |
-| `src/McpGuardrails.Core/Audit/` | Audit record + channel-backed JSONL sink |
+| `src/McpGuardrails.Core/Audit/` | Audit record, channel-backed JSONL sink, OTel span and metrics (BCL APIs only) |
 | `src/McpGuardrails.Core/Serialization/` | Source-generated JSON (AOT-safe) |
 | `src/McpGuardrails.Cli/Program.cs` | Host wiring; the server half of the proxy |
 | `tests/McpGuardrails.Core.Tests/` | xUnit tests, 100% line and branch on Core |
 | `scripts/smoke.py` | Dependency-free MCP driver for end-to-end checks |
 | `scripts/coverage.sh` | Coverage run + threshold gate, same in CI and locally |
 | `ruff.toml` | Lint settings for the Python tooling |
+| `Dockerfile` | Native AOT image on a chiseled, non-root base |
+| `.github/workflows/release.yml` | On a version tag: AOT binaries per platform, tool package, draft release |
 
 ## Testing
 
@@ -598,7 +863,8 @@ confusing parse error. This is the most common way to break an stdio MCP server.
 **Down-level servers still exist.** The official Node filesystem server does not
 implement the 2026-07-28 discovery flow; you'll see a benign
 `server/discover: Method not found` on stderr as the SDK falls back to the older
-`initialize` handshake. Supporting both eras is a real requirement, not a wart.
+`initialize` handshake. Supporting both eras is a real requirement, not a wart —
+see [protocol compatibility](docs/protocol-compatibility.md).
 
 **`McpClientTool.WithName()` is a trap for proxies.** It renames the client-side
 wrapper but not the underlying `ProtocolTool`, so `tools/list` advertises the old
@@ -659,9 +925,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching and commit conventions.
 
 ## Security
 
-The [threat model](SECURITY.md) documents what this defends against and, just as
-importantly, what it does not. Please report vulnerabilities privately rather
-than in a public issue.
+The [threat model](docs/threat-model.md) documents what this defends against
+and, just as importantly, what it does not — attacker by attacker, with a pointer
+into the code for every mitigation and a section of known gaps.
+[SECURITY.md](SECURITY.md) has the short version and how to report a
+vulnerability: privately, please, rather than in a public issue.
+
+Which MCP protocol revisions the proxy speaks on each side, and how approval
+behaves with clients that do and do not support elicitation, is in
+[protocol compatibility](docs/protocol-compatibility.md).
 
 ## Licence
 

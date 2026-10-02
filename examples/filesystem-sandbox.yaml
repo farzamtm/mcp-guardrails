@@ -55,6 +55,21 @@ scanners:
     results: redact
     pii: false
 
+    # Optional second opinion from Claude. Left commented out because it sends
+    # file contents to the Anthropic API, costs money, and needs a key in
+    # ANTHROPIC_API_KEY - startup fails without one, by design.
+    #
+    # The classifier can soften a heuristic 'block' into an annotation but can
+    # never remove a warning, so pair it with 'action: block' (withhold only
+    # when both stages agree) or 'mode: all' (also catch what the heuristics
+    # miss). With 'annotate' + 'confirm' it only adds evidence to the audit log.
+    # If it times out or fails, the heuristic verdict stands.
+    #
+    # classifier:
+    #   mode: confirm          # confirm: only flagged results | all: every result
+    #   timeout_ms: 5000
+    #   max_chars: 32000
+
 rules:
   # A glob, so every read tool the server has (or gains later) is covered
   # without listing them. '*' matches any run of characters, '?' exactly one.

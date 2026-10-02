@@ -13,12 +13,14 @@ Usage:
     python3 scripts/smoke.py [path-to-binary]
 """
 
+import http.server
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BIN = (
     sys.argv[1]
@@ -59,6 +61,13 @@ SECRET_BLOCK_FILE = f"{SANDBOX}/smoke-secrets-block.yaml"
 SECRET_PROBE = f"{SANDBOX}/smoke-credentials.txt"
 SECRET_REDACTED = f"{SANDBOX}/smoke-credentials-redacted.txt"
 SECRET_REFUSED = f"{SANDBOX}/smoke-credentials-refused.txt"
+CLASSIFIER_AUDIT = f"{SANDBOX}/audit-classifier.jsonl"
+CLASSIFIER_FILE = f"{SANDBOX}/smoke-classifier.yaml"
+OTEL_AUDIT = f"{SANDBOX}/audit-otel.jsonl"
+OTEL_PROBE = f"{SANDBOX}/smoke-otel.txt"
+# Written as an argument value so the OTel phase can prove it never leaves the
+# process. Distinctive enough that a stray match is impossible.
+OTEL_SECRET = "otel-must-never-see-this-7f3a9c"
 CONTENT = "written through the guardrails proxy"
 
 # A file whose CONTENT is the attack. Nothing about the call that reads it is
@@ -178,6 +187,96 @@ scanners:
     arguments: block
     results: block
 """
+
+# The LLM classifier, pointed at a fake Messages API on loopback so the run
+# needs neither a real key nor the network. block + confirm is the combination
+# where the classifier changes the outcome: a heuristic hit it calls BENIGN is
+# softened to an annotation, and one it cannot answer stays blocked.
+CLASSIFIER_POLICY = """
+scanners:
+  injection:
+    action: block
+    classifier:
+      mode: confirm
+      base_url: {base_url}
+      api_key_env: GUARDRAILS_SMOKE_CLASSIFIER_KEY
+      timeout_ms: 5000
+"""
+
+CLASSIFIER_KEY = "smoke-test-key-not-a-real-one"
+
+
+class FakeAnthropic:
+    """A stand-in for POST /v1/messages that answers with a fixed verdict.
+
+    status 200 replies with `verdict` as the single text block; anything else
+    replies with that status and an Anthropic-shaped error body. Every request
+    is kept so the run can check what the proxy actually sent.
+    """
+
+    def __init__(self) -> None:
+        self.verdict = "BENIGN"
+        self.status = 200
+        self.requests: list[tuple[str, dict[str, str], dict]] = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                body = json.loads(read_http_body(self) or b"{}")
+                fake.requests.append((self.path, dict(self.headers), body))
+
+                if fake.status == 200:
+                    reply = {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": fake.verdict}],
+                        "stop_reason": "end_turn",
+                    }
+                else:
+                    reply = {"type": "error", "error": {"type": "api_error"}}
+
+                payload = json.dumps(reply).encode()
+                self.send_response(fake.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                # The default handler logs every request to stderr, which would
+                # interleave with the check output.
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def read_http_body(handler: http.server.BaseHTTPRequestHandler) -> bytes:
+    """Read a request body, chunked or not.
+
+    HttpClient streams JsonContent without a Content-Length, so the request
+    arrives chunked, and BaseHTTPRequestHandler does not decode that itself.
+    """
+    if handler.headers.get("Transfer-Encoding", "").lower() != "chunked":
+        return handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+
+    chunks: list[bytes] = []
+    while True:
+        size = int(handler.rfile.readline().split(b";")[0].strip(), 16)
+        if size == 0:
+            handler.rfile.readline()
+            return b"".join(chunks)
+        chunks.append(handler.rfile.read(size))
+        handler.rfile.readline()
+
 
 # Every write goes to a human. The timeout is deliberately tiny: one phase below
 # never answers at all, and CI should not spend five minutes proving it.
@@ -330,6 +429,19 @@ TIMEOUT_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
+OTEL_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": OTEL_PROBE, "content": OTEL_SECRET}),
+        "with OTel export on, an allowed write still goes through",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(2, "fs__write_file", {"path": ESCAPE, "content": OTEL_SECRET}),
+        "with OTel export on, a denied write is still denied",
+        lambda r: denied_with(r, "Write inside the sandbox instead."),
+    ),
+]
+
 NO_APPROVER_CHECKS: list[tuple[dict, str, object]] = [
     (
         call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
@@ -393,6 +505,39 @@ SCAN_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
         lambda r: (
             bool(r.get("isError"))
             and "exfiltration agent" not in result_text(r)
+            and "Blocked by guardrails scanner 'injection'" in result_text(r)
+        ),
+    ),
+]
+
+# The fake classifier says BENIGN: it can soften the block, never drop the
+# warning, because it read the same attacker-controlled text and may have been
+# talked round.
+CLASSIFIER_BENIGN_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__read_text_file", {"path": POISONED}),
+        "a classifier that calls the hit benign softens block to annotate",
+        lambda r: (
+            not r.get("isError")
+            and "begin untrusted output" in result_text(r)
+            and "exfiltration agent" in result_text(r)
+        ),
+    ),
+    (
+        call(2, "fs__read_text_file", {"path": PROBE}),
+        "confirm mode leaves a clean result alone",
+        lambda r: CONTENT in result_text(r) and "untrusted" not in result_text(r),
+    ),
+]
+
+# The fake classifier answers HTTP 500: an unavailable second opinion must not
+# break the call, and must not weaken it either.
+CLASSIFIER_FAILED_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__read_text_file", {"path": POISONED}),
+        "a failing classifier leaves the heuristic block in place",
+        lambda r: (
+            bool(r.get("isError"))
             and "Blocked by guardrails scanner 'injection'" in result_text(r)
         ),
     ),
@@ -482,11 +627,14 @@ def main() -> int:
         APPROVAL_PROBE,
         APPROVAL_REFUSED,
         SCAN_AUDIT,
+        CLASSIFIER_AUDIT,
         POISONED,
         SECRET_AUDIT,
         SECRET_PROBE,
         SECRET_REDACTED,
         SECRET_REFUSED,
+        OTEL_AUDIT,
+        OTEL_PROBE,
         ESCAPE,
     ):
         try:
@@ -613,6 +761,19 @@ def main() -> int:
     failures += check_secret_files()
     failures += check_secret_audit_log()
 
+    # Phase 7: the optional LLM classifier, against a fake API on loopback.
+    print("\n--- injection classifier ---")
+    classifier_failures, classifier_stderr = run_classifier_phase()
+    failures += classifier_failures
+
+    # Phase 8: OpenTelemetry export to a fake collector. Proves the exporter
+    # leaves stdout alone, that spans and metrics actually arrive, and that
+    # argument values never do.
+    print("\n--- opentelemetry ---")
+    otel_failures, otel_stderr = run_otel_phase()
+    failures += otel_failures
+    approval_stderr += otel_stderr
+
     unapproved = os.path.exists(APPROVAL_REFUSED)
     print(f"{'FAIL' if unapproved else 'PASS'}  no unapproved write reached the disk")
     failures += 1 if unapproved else 0
@@ -636,6 +797,7 @@ def main() -> int:
                 + approval_stderr
                 + scan_stderr
                 + secret_stderr
+                + classifier_stderr
             )[-30:]
         )
 
@@ -771,6 +933,84 @@ def run_session(
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+    return failures, stderr_lines
+
+
+def run_otel_phase() -> tuple[int, list[str]]:
+    """Run a policy session with OTLP export pointed at an in-process collector.
+
+    The collector is a few lines of http.server: OTLP/HTTP is a plain POST of a
+    protobuf body to /v1/traces or /v1/metrics. Decoding protobuf would need a
+    dependency, but it does not have to be decoded to be checked - protobuf
+    stores strings as raw UTF-8, so attribute names and values are visible as
+    bytes, and so is anything that should not be there.
+    """
+    received: dict[str, list[bytes]] = {}
+
+    class Collector(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            received.setdefault(self.path, []).append(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-protobuf")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            # Silence the per-request access log; it would bury the PASS lines.
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    try:
+        failures, stderr_lines = run_session(
+            OTEL_CHECKS,
+            {
+                "GUARDRAILS_AUDIT": OTEL_AUDIT,
+                "GUARDRAILS_POLICY": POLICY_FILE,
+                # Setting the endpoint is the opt-in; no --otel flag needed.
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                # Export fast so the run does not wait out the 5s/60s defaults;
+                # shutdown flushes whatever is left either way.
+                "OTEL_BSP_SCHEDULE_DELAY": "100",
+                "OTEL_METRIC_EXPORT_INTERVAL": "200",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    traces = b"".join(received.get("/v1/traces", []))
+    metrics = b"".join(received.get("/v1/metrics", []))
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    expect(bool(traces), "spans are exported over OTLP")
+    expect(b"guardrails tools/call fs__write_file" in traces, "one span per tool call")
+    expect(
+        b"mcp_guardrails.decision" in traces and b"deny-sandbox-escape" in traces,
+        "the span carries the decision and the rule that made it",
+    )
+    expect(
+        b"Experimental.ModelContextProtocol" in traces,
+        "the MCP SDK's own spans are in the same trace export",
+    )
+    expect(
+        b"mcp_guardrails.denials" in metrics
+        and b"mcp_guardrails.tool_call.duration" in metrics,
+        "denial counter and latency histogram are exported",
+    )
+    expect(
+        OTEL_SECRET.encode() not in traces + metrics,
+        "argument values never reach the telemetry backend",
+    )
 
     return failures, stderr_lines
 
@@ -1073,6 +1313,128 @@ def check_secret_audit_log() -> int:
         {entry.get("result_secrets_action") for entry in reads}
         == {"redacted", "blocked"},
         "audit distinguishes a redacted result from a withheld one",
+    )
+
+    return failures
+
+
+def run_classifier_phase() -> tuple[int, list[str]]:
+    """The classifier end to end: wiring, wire format, combination, audit."""
+    fake = FakeAnthropic()
+    try:
+        with open(CLASSIFIER_FILE, "w", encoding="utf-8") as handle:
+            handle.write(CLASSIFIER_POLICY.format(base_url=fake.base_url))
+
+        env = {
+            "GUARDRAILS_AUDIT": CLASSIFIER_AUDIT,
+            "GUARDRAILS_POLICY": CLASSIFIER_FILE,
+        }
+        failures = check_classifier_needs_key(env)
+
+        keyed = {**env, "GUARDRAILS_SMOKE_CLASSIFIER_KEY": CLASSIFIER_KEY}
+        benign_failures, stderr_lines = run_session(CLASSIFIER_BENIGN_CHECKS, keyed)
+        failures += benign_failures
+        failures += check_classifier_requests(fake)
+
+        fake.status = 500
+        failed_failures, failed_stderr = run_session(CLASSIFIER_FAILED_CHECKS, keyed)
+        failures += failed_failures
+        failures += check_classifier_audit_log()
+
+        return failures, stderr_lines + failed_stderr
+    except OSError as exc:
+        print(f"FAIL  classifier phase could not run: {exc}")
+        return 1, []
+    finally:
+        fake.close()
+
+
+def check_classifier_needs_key(env: dict[str, str]) -> int:
+    """An enabled classifier without a key is a startup error, not a silent no-op."""
+    clean = {
+        k: v for k, v in os.environ.items() if k != "GUARDRAILS_SMOKE_CLASSIFIER_KEY"
+    }
+    proc = subprocess.run(
+        [BIN, "list-upstream"],
+        env={**clean, "GUARDRAILS_SANDBOX": SANDBOX, **env},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    ok = proc.returncode != 0 and "GUARDRAILS_SMOKE_CLASSIFIER_KEY" in proc.stderr
+    print(f"{'PASS' if ok else 'FAIL'}  a classifier with no API key refuses to start")
+    return 0 if ok else 1
+
+
+def check_classifier_requests(fake: FakeAnthropic) -> int:
+    """What went over the wire: one call, the right headers, the content fenced."""
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    # Confirm mode: only the flagged read is sent, not the clean one.
+    expect(
+        len(fake.requests) == 1,
+        f"confirm mode asks only about the flagged result (got {len(fake.requests)})",
+    )
+    if not fake.requests:
+        return failures
+
+    path, headers, body = fake.requests[0]
+    lowered = {k.lower(): v for k, v in headers.items()}
+    expect(path == "/v1/messages", "the request goes to /v1/messages")
+    expect(
+        lowered.get("x-api-key") == CLASSIFIER_KEY
+        and lowered.get("anthropic-version") == "2023-06-01",
+        "the request carries the key and the API version",
+    )
+    content = (body.get("messages") or [{}])[0].get("content", "")
+    expect(
+        "exfiltration agent" in content and "</tool_output_" in content,
+        "the tool output is sent fenced inside nonce-named tags",
+    )
+
+    return failures
+
+
+def check_classifier_audit_log() -> int:
+    """The verdict is audited; the text never is."""
+    try:
+        with open(CLASSIFIER_AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  classifier audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  classifier audit log unreadable: {exc}")
+        return 1
+
+    failures = 0
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    judged = [entry for entry in lines if entry.get("classifier")]
+    expect(
+        [(e.get("classifier"), e.get("scanner_action")) for e in judged]
+        == [("benign", "annotated"), ("failed", "blocked")],
+        "audit records each verdict next to the action it led to",
+    )
+    expect(
+        any("HTTP 500" in entry.get("classifier_error", "") for entry in judged),
+        "a failed classification says why",
+    )
+    expect(
+        not any("exfiltration agent" in json.dumps(entry) for entry in judged),
+        "audit records the verdict, never the classified text",
     )
 
     return failures
