@@ -58,4 +58,7 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(ScannerPolicy))]
 [JsonSerializable(typeof(ScannerSettings))]
 [JsonSerializable(typeof(ScanAction))]
+[JsonSerializable(typeof(SecretScannerSettings))]
+[JsonSerializable(typeof(SecretArgumentAction))]
+[JsonSerializable(typeof(SecretResultAction))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

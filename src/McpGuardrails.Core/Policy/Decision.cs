@@ -47,6 +47,9 @@ public enum DecisionSource
 
     /// <summary>A human, or the absence of one.</summary>
     Approval,
+
+    /// <summary>A content scanner that found something in the arguments.</summary>
+    Scanner,
 }
 
 /// <summary>
@@ -134,6 +137,7 @@ public sealed record Decision(
         (DecisionSource.Budget, { } limit) => $"Blocked by guardrails budget '{limit}': {Reason}",
         (DecisionSource.Approval, { } rule) =>
             $"Blocked by guardrails approval for rule '{rule}': {Reason}",
+        (DecisionSource.Scanner, { } scanner) => $"Blocked by guardrails scanner '{scanner}': {Reason}",
         (_, { } rule) => $"Blocked by guardrails policy rule '{rule}': {Reason}",
         _ => $"Blocked by guardrails policy: {Reason}",
     };

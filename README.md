@@ -13,8 +13,8 @@ your agent actually does.
 > audits every one of them, can **refuse** them by policy - matching on tool
 > globs, the tool's own MCP annotations, and predicates over the arguments -
 > enforces a **session budget** with per-rule costs, can **hold a call until a
-> human approves it**, and **scans what comes back** for prompt injection.
-> Secret redaction and the Streamable HTTP host are next.
+> human approves it**, **scans what comes back** for prompt injection, and
+> **redacts secrets** in both directions. The Streamable HTTP host is next.
 > See [the spec](mcp-guardrails-dotnet-spec.md).
 
 ## What works today
@@ -33,6 +33,10 @@ your agent actually does.
 - **Scans what comes back** — tool results are checked for prompt-injection
   attempts and fenced as untrusted data before the model reads them, on by
   default
+- **Redacts secrets** — API keys, tokens, private keys and passwords are
+  replaced with `[REDACTED:<kind>]` markers in tool results before the model
+  reads them and in the audit log; optionally in the arguments sent downstream,
+  or the call is refused outright. Email addresses and card numbers on request
 
 ## Policy
 
@@ -347,10 +351,111 @@ jq 'select(.scanner_hits)' ~/.mcp-guardrails/audit.jsonl
 jq 'select(.scanner_action == "blocked")' ~/.mcp-guardrails/audit.jsonl
 ```
 
-**Not implemented yet:** `scanners.secrets` (secret and PII redaction of
-arguments, results and the audit log) is rejected at load time rather than
-silently ignored, for the same reason `budgets.daily:` is. Until it ships,
-`arguments` are logged verbatim.
+## Secret redaction
+
+A credential can leak in two directions, and the proxy sits on both.
+
+**Coming back**, a tool result is read by the model, which means it has been
+sent to the model provider, may be quoted back to the user, and can be passed
+to the next tool call. An agent asked to "fix the deploy script" reads `.env`
+along the way, and the production key is now in a transcript.
+
+**Going out**, the arguments the model writes reach a server — possibly a
+third-party one — and the audit log. An audit log that records API keys is a
+liability rather than a safety feature.
+
+```yaml
+scanners:
+  secrets:
+    arguments: redact_audit   # redact_audit (default) | redact | block | off
+    results: redact           # redact (default) | block | off
+    pii: false                # also emails and card numbers (default false)
+```
+
+**On by default, with no policy file**, for the same lopsided-costs reason as
+injection scanning: a key the model has read cannot be unread, and a false
+positive costs a marker where a token-shaped string used to be.
+
+| `arguments:` | The server receives | The audit log records |
+| --- | --- | --- |
+| `redact_audit` | the real value | a marker |
+| `redact` | a marker | a marker |
+| `block` | nothing — the call is refused | a marker, and the refusal |
+| `off` | the real value | the real value |
+
+The default forwards the real value deliberately. The model may have been asked
+to write that config file, and a proxy that silently rewrites it into
+`aws_access_key_id = [REDACTED:aws-access-key]` breaks the task without saying
+so. `redact` is for servers you do not trust with credentials; `block` refuses
+the call before approval and budget run, so nobody is asked to approve a call
+that carries a key they cannot see, and nothing is charged for it.
+
+What the model sees after `results: redact`:
+
+```text
+[default]
+aws_access_key_id = [REDACTED:aws-access-key]
+region = eu-west-1
+
+[guardrails] 1 sensitive value was redacted from the output of 'fs__read_text_file'
+(aws-access-key) and replaced with [REDACTED:<kind>] markers. The markers are
+placeholders, not the real values: do not write them back into a file...
+```
+
+Markers rather than deletions, so the model can tell a value was there and say
+so. The trailing notice is the part that matters: the failure to guard against
+is not the model seeing a marker, it is the model reading a config file,
+editing one line, and writing the whole file back — markers included — over the
+real keys. `results: block` withholds the result entirely instead.
+
+### What it looks for
+
+| Detector | Matches |
+| --- | --- |
+| `private-key` | PEM `-----BEGIN … PRIVATE KEY-----` blocks, including truncated ones |
+| `jwt` | three base64url segments, the first two starting `eyJ` |
+| `aws-access-key` | `AKIA`, `ASIA`, `ABIA`, `ACCA` followed by 16 characters |
+| `github-token` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_` |
+| `slack-token`, `slack-webhook` | `xox[abposr]-…`, `https://hooks.slack.com/services/…` |
+| `stripe-key` | `sk_live_`, `sk_test_`, `rk_live_`, `rk_test_` (not publishable `pk_`) |
+| `anthropic-key`, `openai-key`, `google-api-key` | `sk-ant-…`, `sk-…`/`sk-proj-…`, `AIza…` |
+| `bearer-token` | the token after `Bearer` — the scheme stays readable |
+| `credential-assignment` | the value in `password=…`, `api_key: "…"`, `DB_PASSWORD=…`, `"secret": "…"` |
+| `sensitive-field` | the whole value of a JSON key named `password`, `client_secret`, `authorization`, `cookie`… |
+| `email` | with `pii: true` |
+| `credit-card` | with `pii: true`; a known network prefix **and** a valid Luhn check digit |
+
+Prefixed tokens are matched on shape alone, because the prefix is distinctive.
+The generic patterns need corroboration: an assignment's bare value must look
+generated (a digit or symbol in it) and must not be code — `password =
+get_password()` and `api_key = os.environ["KEY"]` are left alone, because a
+marker in the middle of a source file the agent is editing would be written back
+on the next save. A JSON key named just `token` is **not** treated as sensitive:
+pagination cursors are called that too, and redacting one breaks the next page.
+
+Only string values are rewritten; keys, numbers and the structure of a JSON
+payload are left as they are.
+
+**Regular expressions, but never backtracking ones.** Unlike the injection
+scanner these are shapes, not phrases, and a regex is the honest way to write
+`AKIA` followed by sixteen characters. Every pattern is compiled with
+`RegexOptions.NonBacktracking`, which runs in time linear in the input, so no
+tool result — however large or crafted — can stall the proxy. That engine has no
+lookarounds or backreferences, so the context checks that would need them live
+in ordinary code beside each pattern.
+
+The audit log records which detectors fired and what became of the value —
+never the value. Shapes that are not on the list — a human-chosen password
+outside a recognisable assignment, a key format this proxy has not heard of —
+are not caught. This narrows what leaks; it does not make leaking impossible.
+
+```bash
+# Which calls carried a credential to a server?
+jq 'select(.argument_secrets_action == "forwarded")' ~/.mcp-guardrails/audit.jsonl
+
+# Which results had something taken out?
+jq 'select(.result_secrets)' ~/.mcp-guardrails/audit.jsonl
+```
 
 ## The audit log
 
@@ -377,6 +482,21 @@ nothing came back to scan.
  "scanner_hits":["instruction-override","exfiltration"],"scanner_action":"annotated",
  "duration_ms":3.21,"is_error":false}
 ```
+
+A call that carried or returned a secret says which detectors fired and what
+was done, and its `arguments` hold markers rather than the values:
+
+```json
+{"ts":"2026-10-01T09:12:44.501270+00:00","event":"tool_call","tool":"fs__write_file",
+ "server":"fs","downstream_tool":"write_file","decision":"allow",
+ "arguments":{"path":"/tmp/guardrails-sandbox/.env","content":"KEY=[REDACTED:aws-access-key]"},
+ "argument_secrets":["aws-access-key"],"argument_secrets_action":"forwarded",
+ "duration_ms":4.02,"is_error":false}
+```
+
+`forwarded` is the value to search for: the key is out of the log, but it did
+reach the server. The others are `redacted` and `blocked`; results use
+`result_secrets` and `result_secrets_action` (`redacted` or `blocked`).
 
 ```bash
 # What did my agent touch, and how long did it take?
@@ -440,7 +560,7 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | `src/McpGuardrails.Core/Upstream/` | Downstream connections, tool namespacing |
 | `src/McpGuardrails.Core/Policy/` | Decisions, rules, evaluator, YAML loader |
 | `src/McpGuardrails.Core/Pipeline/` | Per-call scope shared between filters |
-| `src/McpGuardrails.Core/Scanners/` | Result scanning: heuristics, settings, the gate |
+| `src/McpGuardrails.Core/Scanners/` | Injection scanning and secret redaction: detectors, settings, the gates |
 | `src/McpGuardrails.Core/Audit/` | Audit record + channel-backed JSONL sink |
 | `src/McpGuardrails.Core/Serialization/` | Source-generated JSON (AOT-safe) |
 | `src/McpGuardrails.Cli/Program.cs` | Host wiring; the server half of the proxy |
@@ -457,7 +577,7 @@ Three layers, each covering what the one below cannot:
 | --- | --- |
 | Unit tests | Pure logic — namespacing, config validation, the audit sink |
 | In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
-| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in five phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give; and a poisoned file written, read back, and caught on the way out |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in six phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give; a poisoned file written, read back, and caught on the way out; and a credential forwarded, redacted and refused on the way in and scrubbed or withheld on the way out, with the audit log checked for the raw key |
 
 CI runs all three on Linux, macOS and Windows, plus a `lint` job
 (`dotnet format`, `ruff`, `shellcheck`) and a check that every example policy in

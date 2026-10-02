@@ -49,6 +49,14 @@ public sealed class GuardrailsCallScope : IDisposable
     /// </remarks>
     public ScanOutcome? Scan { get; private set; }
 
+    /// <summary>
+    /// What secret redaction did to the result, if the call returned one.
+    /// </summary>
+    /// <remarks>
+    /// Null on a refused call for the same reason as <see cref="Scan"/>.
+    /// </remarks>
+    public RedactionOutcome? Redaction { get; private set; }
+
     /// <summary>Opens a scope for one tool call. Dispose at the end of the call.</summary>
     public static GuardrailsCallScope Begin()
     {
@@ -88,6 +96,22 @@ public sealed class GuardrailsCallScope : IDisposable
         if (_currentScope.Value is { } scope)
         {
             scope.Scan = outcome;
+        }
+    }
+
+    /// <summary>
+    /// Records what secret redaction did to the result for the call in progress.
+    /// </summary>
+    /// <remarks>
+    /// A no-op without an active scope, like the other two recorders.
+    /// </remarks>
+    public static void RecordRedaction(RedactionOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+
+        if (_currentScope.Value is { } scope)
+        {
+            scope.Redaction = outcome;
         }
     }
 

@@ -40,9 +40,20 @@ budgets:
 # suits a server whose output should be structured data; it is risky for one
 # returning prose, because these are heuristics and they do misfire.
 # 'off' disables scanning, which is an honest choice to make deliberately.
+#
+# 'secrets' runs in both directions. The values below are the defaults, spelled
+# out: results are scrubbed before the model reads them, and arguments reach the
+# server unchanged but the audit log only ever sees markers. Change arguments to
+# 'redact' if this server should never receive a credential, or 'block' to
+# refuse any call that carries one. pii: true also redacts email addresses and
+# card numbers - off by default because they are often the point of the call.
 scanners:
   injection:
     action: annotate
+  secrets:
+    arguments: redact_audit
+    results: redact
+    pii: false
 
 rules:
   # A glob, so every read tool the server has (or gains later) is covered
