@@ -1,0 +1,74 @@
+# Example policy: an unattended agent whose risky calls are approved elsewhere.
+#
+# filesystem-sandbox.yaml asks the person at the MCP client. This one is for
+# when there is no such person - an agent running in CI or on a schedule - so
+# the question goes to an HTTP endpoint you run, which can page someone or post
+# to a chat room and reply once they decide. See the README's "Asking a webhook
+# instead" for the request and response format.
+#
+# Use it with:
+#   export GUARDRAILS_WEBHOOK_SECRET="$(openssl rand -hex 32)"   # share with the receiver
+#   GUARDRAILS_POLICY=examples/webhook-approval.yaml McpGuardrails
+#
+# The proxy refuses to start serving when the variable is unset: a request
+# signed with no secret is one anyone could forge.
+
+approvers:
+  webhook:
+    # https is required. For a receiver on this machine during development,
+    # http://localhost:<port>/... works together with
+    #   allow_insecure_localhost: true
+    # which permits plain http to loopback addresses and nothing else.
+    url: https://approvals.example.com/hooks/guardrails
+
+    # The NAME of the environment variable holding the HMAC-SHA256 secret,
+    # never the secret itself: policy files get committed and pasted around.
+    secret_env: GUARDRAILS_WEBHOOK_SECRET
+
+rules:
+  - name: allow-reads
+    match:
+      annotations:
+        readOnlyHint: true
+    decision: allow
+
+  # Every rule picks its own channel. This one stays with the client - useful
+  # when the same policy is shared by interactive and unattended sessions, and
+  # a client that cannot ask gets a clear refusal rather than a silent allow.
+  - name: approve-moves-at-the-client
+    match:
+      tool: fs__move_*
+    decision: require_approval
+    approval:
+      mode: in_band
+      timeout_s: 120
+
+  # The out-of-band gate. Ten minutes, because a paged human needs longer than
+  # one already looking at the screen; the endpoint holds the request open until
+  # they answer, and the proxy stops waiting at the deadline either way.
+  #
+  # Anything the endpoint says other than a well-formed "approve" for this exact
+  # request - an error status, a redirect, garbage, a refused connection - is a
+  # denial. Only the deadline counts as "nobody answered", and silence is not
+  # consent.
+  - name: approve-writes-by-webhook
+    match:
+      tool: fs__write_*
+    decision: require_approval
+    approval:
+      mode: webhook
+      timeout_s: 600
+      on_timeout: deny
+      prompt: >-
+        An unattended agent wants to write a file. Check the path in the
+        arguments before approving.
+
+  # Covers every tool that declares itself destructive, or declares nothing.
+  - name: deny-destructive
+    match:
+      annotations:
+        destructiveHint: true
+    decision: deny
+    message: >-
+      Destructive tools are disabled for this unattended agent. Report what you
+      would have changed instead.

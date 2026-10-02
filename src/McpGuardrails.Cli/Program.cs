@@ -159,12 +159,13 @@ var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
 using var classifierHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
 
 PolicyEvaluator policy;
+PolicyDocument document;
 BudgetPolicy budgets;
 InjectionGate scanner;
 SecretGate secrets;
 try
 {
-    var document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
+    document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
 
     policy = new PolicyEvaluator(document);
     budgets = document.EffectiveBudgets;
@@ -264,6 +265,35 @@ if (listOnly)
 
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// The webhook approver, if the policy configures one.
+//
+// Built here, after list-upstream has returned, because this is the first point
+// that needs the signing secret: listing (and CI's example-policy check) should
+// work on a machine that does not hold it. Serving without it is fatal, for the
+// same reason a malformed policy is - a rule routed to an approver we cannot
+// authenticate to would deny every call, and the operator should hear about it
+// now rather than from the first refusal.
+// ---------------------------------------------------------------------------
+WebhookApprovalChannel? webhook = null;
+if (document.EffectiveApprovers.Webhook is { } webhookSettings)
+{
+    try
+    {
+        webhook = new WebhookApprovalChannel(
+            webhookSettings.Endpoint,
+            webhookSettings.ReadSecret(Environment.GetEnvironmentVariable),
+            WebhookApprovalChannel.CreateHandler());
+    }
+    catch (PolicyException ex)
+    {
+        await Console.Error.WriteLineAsync($"Invalid policy file '{policyPath}': {ex.Message}");
+        return 1;
+    }
+}
+
+using var webhookLifetime = webhook;
 
 // The name a call is known by when the client did not send one. Shared by the
 // audit filter and the policy filter on purpose: if they disagreed, the log and
@@ -434,7 +464,11 @@ builder.Services
             // audit log and the policy would tell different stories.
             upstream.TryGetTool(toolName, out var tool);
 
-            var facts = PolicyFacts.ForCall(toolName, request.Params, tool);
+            // The owning server is not matched on, but an out-of-band approver
+            // shows it: "fs" or "prod-db" changes what a human says to a delete.
+            var server = upstream.TryResolve(toolName, out var owner, out _) ? owner.Name : null;
+
+            var facts = PolicyFacts.ForCall(toolName, request.Params, tool, server);
 
             // Four gates, in this order, and the order is the design.
             //
@@ -455,7 +489,9 @@ builder.Services
             decision = await ApprovalGate.ApplyAsync(
                 decision,
                 facts,
-                new ElicitationApprovalChannel(request.Server),
+                new ApprovalChannelRouter(
+                    new ElicitationApprovalChannel(request.Server),
+                    webhook),
                 cancellationToken);
 
             decision = budget.Apply(decision);

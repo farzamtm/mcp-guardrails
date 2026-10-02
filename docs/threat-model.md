@@ -153,18 +153,21 @@ the fastest route to "clean up the repo" is `rm`.
   - a malformed policy file, or a policy path that is a directory, **refuses to
     start** rather than falling back to passthrough
     ([`PolicyLoader`](../src/McpGuardrails.Core/Policy/PolicyLoader.cs));
-  - configuration the build cannot honour — `mode: slack` / `webhook` — is a
-    load-time error, not a silent no-op.
+  - configuration the build cannot honour — `mode: slack` — is a load-time
+    error, not a silent no-op.
 - **The arguments policy sees are the arguments the server gets.** The call
   handler forwards the same parsed argument dictionary the policy evaluated, so
   there is no second parse for a duplicate key or encoding trick to exploit.
 - **Approval** —
   [`ApprovalGate`](../src/McpGuardrails.Core/Approval/ApprovalGate.cs),
-  [`ElicitationApprovalChannel`](../src/McpGuardrails.Cli/ElicitationApprovalChannel.cs).
+  [`ElicitationApprovalChannel`](../src/McpGuardrails.Cli/ElicitationApprovalChannel.cs),
+  [`WebhookApprovalChannel`](../src/McpGuardrails.Core/Approval/WebhookApprovalChannel.cs).
   Nothing is forwarded while the question is open. Only an explicit `true` is
   consent; `accept` with anything else is a decline. Timeout defaults to
   **deny**. A client without elicitation is a **denial**, not a bypass. A
-  channel that throws is a denial (`failed`). Each distinct outcome is in the
+  channel that throws is a denial (`failed`), and so is any webhook answer other
+  than a well-formed `approve` echoing the request id; the request is
+  HMAC-signed and redirects are not followed. Each distinct outcome is in the
   audit log as `approval`.
 - **Budget** —
   [`BudgetGate`](../src/McpGuardrails.Core/Budget/BudgetGate.cs),
@@ -272,11 +275,13 @@ the only thing between that description and a matching tool call.
 
 ### Approval has limits of its own
 
-- **The approver does not see the arguments.** The question is the rule's
-  `prompt:` or a generated sentence naming the tool and the rule
+- **The approver at the client does not see the arguments.** The question is
+  the rule's `prompt:` or a generated sentence naming the tool and the rule
   ([`ApprovalGate.Question`](../src/McpGuardrails.Core/Approval/ApprovalGate.cs)).
-  The call's arguments are not included. A human approving `fs__write_file`
-  cannot tell from the prompt whether the path is the one they expect.
+  A human approving `fs__write_file` cannot tell from the prompt whether the
+  path is the one they expect. A webhook does get the arguments, cut to 256
+  characters with recognised secrets redacted, so the receiver is one more
+  place that stores what the model wrote.
 - **Approval is only as good as the client.** A client configured to
   auto-accept elicitation turns every `require_approval` into `allow`. The proxy
   cannot tell.
@@ -376,7 +381,7 @@ loader **rejects** it rather than accepting a setting that does nothing.
 
 | Planned | Today |
 | --- | --- |
-| Out-of-band approval: webhook and Slack (`approval.mode`) | Rejected at load; only `in_band` elicitation |
+| Slack approval (`approval.mode: slack`) | Rejected at load; `in_band` elicitation or a signed webhook |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
 | Streamable HTTP host | stdio only |
 | Configurable upstream servers | One hard-coded filesystem server ([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)) |

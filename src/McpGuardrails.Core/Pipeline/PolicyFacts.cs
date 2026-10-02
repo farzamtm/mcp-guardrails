@@ -26,8 +26,13 @@ public static class PolicyFacts
     /// apply to a call the proxy is about to reject anyway, or the audit log
     /// would disagree with the policy about what happened.
     /// </param>
-    public static ToolCallFacts ForCall(string toolName, CallToolRequestParams? request, Tool? tool) =>
-        new(toolName, request?.Arguments?.AsReadOnly(), Annotations(tool));
+    /// <param name="server">The owning downstream server, when the name resolved to one.</param>
+    public static ToolCallFacts ForCall(
+        string toolName,
+        CallToolRequestParams? request,
+        Tool? tool,
+        string? server = null) =>
+        new(toolName, request?.Arguments?.AsReadOnly(), Annotations(tool), server);
 
     /// <summary>Copies a tool's hints into the policy engine's own shape.</summary>
     /// <remarks>

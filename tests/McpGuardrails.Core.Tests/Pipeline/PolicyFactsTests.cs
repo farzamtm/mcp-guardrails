@@ -34,6 +34,13 @@ public sealed class PolicyFactsTests
     }
 
     [Fact]
+    public void ForCall_CarriesTheOwningServer_WhenThereIsOne()
+    {
+        Assert.Equal("fs", PolicyFacts.ForCall("fs__write_file", null, null, "fs").Server);
+        Assert.Null(PolicyFacts.ForCall("fs__write_file", null, null).Server);
+    }
+
+    [Fact]
     public void ForCall_PreservesUndeclaredHintsAsUndeclared()
     {
         // null is not false. The two produce different effective values, and

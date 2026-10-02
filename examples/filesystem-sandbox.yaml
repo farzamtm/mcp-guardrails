@@ -140,7 +140,9 @@ rules:
   # approved call is charged to the budget like any other.
   #
   # This needs a client that supports elicitation. One that does not gets a
-  # clear refusal, not a silent allow - see the README's approval section.
+  # clear refusal, not a silent allow - see the README's approval section. For
+  # an agent with nobody at the client, webhook-approval.yaml sends the question
+  # to an HTTP endpoint instead.
   - name: approve-moves
     match:
       tool: fs__move_*
