@@ -6,6 +6,13 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
+
+    <!-- OpenTelemetry SDK + OTLP exporter, CLI only. Core emits through the
+         BCL's ActivitySource/Meter and never sees these; they are wired up only
+         when the otel flag or OTEL_EXPORTER_OTLP_ENDPOINT asks for them
+         (XML comments cannot contain a double hyphen, hence no flag spelling). -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.19.1" />
   </ItemGroup>
 
   <PropertyGroup>

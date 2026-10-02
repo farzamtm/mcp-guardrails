@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BIN = (
     sys.argv[1]
@@ -50,6 +51,11 @@ APPROVAL_AUDIT = f"{SANDBOX}/audit-approval.jsonl"
 APPROVAL_FILE = f"{SANDBOX}/smoke-approval.yaml"
 APPROVAL_PROBE = f"{SANDBOX}/smoke-approved.txt"
 APPROVAL_REFUSED = f"{SANDBOX}/smoke-unapproved.txt"
+OTEL_AUDIT = f"{SANDBOX}/audit-otel.jsonl"
+OTEL_PROBE = f"{SANDBOX}/smoke-otel.txt"
+# Written as an argument value so the OTel phase can prove it never leaves the
+# process. Distinctive enough that a stray match is impossible.
+OTEL_SECRET = "otel-must-never-see-this-7f3a9c"
 CONTENT = "written through the guardrails proxy"
 
 # A path the sandbox rules must refuse. Never actually written: the point is
@@ -278,6 +284,19 @@ TIMEOUT_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
+OTEL_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": OTEL_PROBE, "content": OTEL_SECRET}),
+        "with OTel export on, an allowed write still goes through",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(2, "fs__write_file", {"path": ESCAPE, "content": OTEL_SECRET}),
+        "with OTel export on, a denied write is still denied",
+        lambda r: denied_with(r, "Write inside the sandbox instead."),
+    ),
+]
+
 NO_APPROVER_CHECKS: list[tuple[dict, str, object]] = [
     (
         call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
@@ -313,6 +332,8 @@ def main() -> int:
         APPROVAL_AUDIT,
         APPROVAL_PROBE,
         APPROVAL_REFUSED,
+        OTEL_AUDIT,
+        OTEL_PROBE,
         ESCAPE,
     ):
         try:
@@ -392,6 +413,14 @@ def main() -> int:
         approval_stderr += session_stderr
 
     failures += check_approval_audit_log()
+
+    # Phase 5: OpenTelemetry export to a fake collector. Proves the exporter
+    # leaves stdout alone, that spans and metrics actually arrive, and that
+    # argument values never do.
+    print("\n--- opentelemetry ---")
+    otel_failures, otel_stderr = run_otel_phase()
+    failures += otel_failures
+    approval_stderr += otel_stderr
 
     unapproved = os.path.exists(APPROVAL_REFUSED)
     print(f"{'FAIL' if unapproved else 'PASS'}  no unapproved write reached the disk")
@@ -544,6 +573,84 @@ def run_session(
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+    return failures, stderr_lines
+
+
+def run_otel_phase() -> tuple[int, list[str]]:
+    """Run a policy session with OTLP export pointed at an in-process collector.
+
+    The collector is a few lines of http.server: OTLP/HTTP is a plain POST of a
+    protobuf body to /v1/traces or /v1/metrics. Decoding protobuf would need a
+    dependency, but it does not have to be decoded to be checked - protobuf
+    stores strings as raw UTF-8, so attribute names and values are visible as
+    bytes, and so is anything that should not be there.
+    """
+    received: dict[str, list[bytes]] = {}
+
+    class Collector(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            received.setdefault(self.path, []).append(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-protobuf")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            # Silence the per-request access log; it would bury the PASS lines.
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    try:
+        failures, stderr_lines = run_session(
+            OTEL_CHECKS,
+            {
+                "GUARDRAILS_AUDIT": OTEL_AUDIT,
+                "GUARDRAILS_POLICY": POLICY_FILE,
+                # Setting the endpoint is the opt-in; no --otel flag needed.
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                # Export fast so the run does not wait out the 5s/60s defaults;
+                # shutdown flushes whatever is left either way.
+                "OTEL_BSP_SCHEDULE_DELAY": "100",
+                "OTEL_METRIC_EXPORT_INTERVAL": "200",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    traces = b"".join(received.get("/v1/traces", []))
+    metrics = b"".join(received.get("/v1/metrics", []))
+
+    def expect(condition: bool, label: str) -> None:
+        nonlocal failures
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures += 1
+
+    expect(bool(traces), "spans are exported over OTLP")
+    expect(b"guardrails tools/call fs__write_file" in traces, "one span per tool call")
+    expect(
+        b"mcp_guardrails.decision" in traces and b"deny-sandbox-escape" in traces,
+        "the span carries the decision and the rule that made it",
+    )
+    expect(
+        b"Experimental.ModelContextProtocol" in traces,
+        "the MCP SDK's own spans are in the same trace export",
+    )
+    expect(
+        b"mcp_guardrails.denials" in metrics
+        and b"mcp_guardrails.tool_call.duration" in metrics,
+        "denial counter and latency histogram are exported",
+    )
+    expect(
+        OTEL_SECRET.encode() not in traces + metrics,
+        "argument values never reach the telemetry backend",
+    )
 
     return failures, stderr_lines
 
