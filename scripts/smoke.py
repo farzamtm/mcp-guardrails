@@ -13,12 +13,16 @@ Usage:
     python3 scripts/smoke.py [path-to-binary]
 """
 
+import hashlib
+import hmac
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 BIN = (
     sys.argv[1]
@@ -50,6 +54,12 @@ APPROVAL_AUDIT = f"{SANDBOX}/audit-approval.jsonl"
 APPROVAL_FILE = f"{SANDBOX}/smoke-approval.yaml"
 APPROVAL_PROBE = f"{SANDBOX}/smoke-approved.txt"
 APPROVAL_REFUSED = f"{SANDBOX}/smoke-unapproved.txt"
+WEBHOOK_AUDIT = f"{SANDBOX}/audit-webhook.jsonl"
+WEBHOOK_FILE = f"{SANDBOX}/smoke-webhook.yaml"
+WEBHOOK_PROBE = f"{SANDBOX}/smoke-webhook-approved.txt"
+WEBHOOK_REFUSED = f"{SANDBOX}/smoke-webhook-refused.txt"
+WEBHOOK_SECRET_ENV = "GUARDRAILS_SMOKE_WEBHOOK_SECRET"
+WEBHOOK_SECRET = "smoke-test-signing-secret"
 CONTENT = "written through the guardrails proxy"
 
 # A path the sandbox rules must refuse. Never actually written: the point is
@@ -144,6 +154,36 @@ rules:
       timeout_s: 2
       prompt: Allow the agent to write a file in the sandbox?
 """
+
+
+# Writes go to an HTTP approver instead of the client. The URL is filled in once
+# the local receiver below has a port; plain http is only accepted because it is
+# loopback AND the policy says allow_insecure_localhost.
+WEBHOOK_POLICY = (
+    """
+approvers:
+  webhook:
+    url: http://127.0.0.1:{port}/approve
+    secret_env: """
+    + WEBHOOK_SECRET_ENV
+    + """
+    allow_insecure_localhost: true
+
+rules:
+  - name: allow-reads
+    match:
+      tool: fs__read_*
+    decision: allow
+
+  - name: webhook-writes
+    match:
+      tool: fs__write_*
+    decision: require_approval
+    approval:
+      mode: webhook
+      timeout_s: 5
+"""
+)
 
 
 def request(rid: int, method: str, params: dict | None = None) -> dict:
@@ -287,6 +327,127 @@ NO_APPROVER_CHECKS: list[tuple[dict, str, object]] = [
 ]
 
 
+# One session, no handshake: the client declares no elicitation capability, so
+# a pass here proves the question went to the webhook and not to the client.
+WEBHOOK_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": WEBHOOK_PROBE, "content": CONTENT}),
+        "a webhook approves and the write goes through",
+        lambda r: not r.get("isError"),
+    ),
+    (
+        call(2, "fs__write_file", {"path": WEBHOOK_REFUSED, "content": CONTENT}),
+        "a webhook denies and the call is refused",
+        lambda r: denied_with(r, "declined it"),
+    ),
+]
+
+
+class WebhookReceiver(BaseHTTPRequestHandler):
+    """A minimal approver: verify the signature, then decide by path.
+
+    Written the way the README tells a receiver author to write one - HMAC over
+    the raw body, constant-time compare, echo the request_id - so the smoke test
+    doubles as a check that the documented contract is the implemented one.
+    """
+
+    seen: ClassVar[list[dict]] = []
+
+    def do_POST(self) -> None:
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        expected = (
+            "sha256="
+            + hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        )
+        signed = hmac.compare_digest(
+            expected, self.headers.get("X-Guardrails-Signature", "")
+        )
+        payload = json.loads(body)
+        WebhookReceiver.seen.append({"signed": signed, **payload})
+
+        if not signed:
+            self.send_response(401)
+            self.end_headers()
+            return
+
+        path = payload.get("arguments", {}).get("path", "")
+        decision = "approve" if path == WEBHOOK_PROBE else "deny"
+        reply = json.dumps(
+            {"request_id": payload["request_id"], "decision": decision}
+        ).encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+    def log_message(self, format: str, *args: object) -> None:
+        # Silence the default access log; the PASS/FAIL lines are the output.
+        pass
+
+
+def run_webhook_phase() -> tuple[int, list[str]]:
+    """Approval through an HTTP endpoint, end to end."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), WebhookReceiver)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    try:
+        with open(WEBHOOK_FILE, "w", encoding="utf-8") as handle:
+            handle.write(WEBHOOK_POLICY.replace("{port}", str(server.server_port)))
+
+        env = {"GUARDRAILS_AUDIT": WEBHOOK_AUDIT, "GUARDRAILS_POLICY": WEBHOOK_FILE}
+
+        failures, stderr_lines = run_session(
+            WEBHOOK_CHECKS, {**env, WEBHOOK_SECRET_ENV: WEBHOOK_SECRET}
+        )
+
+        def expect(condition: bool, label: str) -> None:
+            nonlocal failures
+            print(f"{'PASS' if condition else 'FAIL'}  {label}")
+            if not condition:
+                failures += 1
+
+        seen = WebhookReceiver.seen
+        expect(len(seen) == 2, f"the receiver was asked twice (got {len(seen)})")
+        expect(
+            all(entry["signed"] for entry in seen),
+            "every request carried a valid HMAC-SHA256 signature",
+        )
+        expect(
+            all(
+                entry.get("server") == "fs" and entry.get("rule") == "webhook-writes"
+                for entry in seen
+            ),
+            "the request names the server and the rule",
+        )
+
+        # Serving without the secret must not start at all: a webhook we cannot
+        # sign for would deny every call, and the operator should hear it now.
+        unsigned = subprocess.run(
+            [BIN],
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **{k: v for k, v in os.environ.items() if k != WEBHOOK_SECRET_ENV},
+                "GUARDRAILS_SANDBOX": SANDBOX,
+                **env,
+            },
+            check=False,
+        )
+        expect(
+            unsigned.returncode != 0 and WEBHOOK_SECRET_ENV in unsigned.stderr,
+            "a missing signing secret is a startup error that names the variable",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    return failures, stderr_lines
+
+
 def main() -> int:
     try:
         os.makedirs(SANDBOX, exist_ok=True)
@@ -313,6 +474,9 @@ def main() -> int:
         APPROVAL_AUDIT,
         APPROVAL_PROBE,
         APPROVAL_REFUSED,
+        WEBHOOK_AUDIT,
+        WEBHOOK_PROBE,
+        WEBHOOK_REFUSED,
         ESCAPE,
     ):
         try:
@@ -397,6 +561,16 @@ def main() -> int:
     print(f"{'FAIL' if unapproved else 'PASS'}  no unapproved write reached the disk")
     failures += 1 if unapproved else 0
 
+    # Phase 5: the same gate, answered by an HTTP endpoint instead of the client.
+    print("\n--- webhook approval ---")
+    webhook_failures, webhook_stderr = run_webhook_phase()
+    failures += webhook_failures
+    failures += check_webhook_audit_log()
+
+    refused = os.path.exists(WEBHOOK_REFUSED)
+    print(f"{'FAIL' if refused else 'PASS'}  the webhook-denied write never happened")
+    failures += 1 if refused else 0
+
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
     print(f"{'FAIL' if escaped else 'PASS'}  denied write never touched the disk")
@@ -409,7 +583,13 @@ def main() -> int:
     if failures:
         print("\n--- server stderr (last 30) ---", file=sys.stderr)
         sys.stderr.writelines(
-            (stderr_lines + policy_stderr + budget_stderr + approval_stderr)[-30:]
+            (
+                stderr_lines
+                + policy_stderr
+                + budget_stderr
+                + approval_stderr
+                + webhook_stderr
+            )[-30:]
         )
 
     print("\nFAILED" if failures else "\nALL OK")
@@ -640,6 +820,26 @@ def check_approval_audit_log() -> int:
     )
 
     return failures
+
+
+def check_webhook_audit_log() -> int:
+    """A webhook's answers are audited exactly like a human's at the client."""
+    try:
+        with open(WEBHOOK_AUDIT, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        print("FAIL  webhook audit log was not created")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  webhook audit log unreadable: {exc}")
+        return 1
+
+    pairs = sorted((entry.get("approval"), entry.get("decision")) for entry in lines)
+    ok = pairs == [("approved", "allow"), ("declined", "deny")]
+    print(
+        f"{'PASS' if ok else 'FAIL'}  audit records the webhook's answers (got {pairs})"
+    )
+    return 0 if ok else 1
 
 
 def check_budget_audit_log() -> int:

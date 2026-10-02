@@ -11,6 +11,11 @@ namespace McpGuardrails.Core.Policy;
 /// Behaviour hints the downstream server published for the tool, or null when it
 /// published none.
 /// </param>
+/// <param name="Server">
+/// The downstream server that owns the tool, or null when the name resolved to
+/// none. Not matched on - the tool glob already covers a server - but carried so
+/// an out-of-band approver can say which system the call would touch.
+/// </param>
 /// <remarks>
 /// Deliberately a plain data snapshot rather than the live MCP request: it keeps
 /// the evaluator free of any protocol types, which is what makes it trivially
@@ -20,7 +25,8 @@ namespace McpGuardrails.Core.Policy;
 public sealed record ToolCallFacts(
     string ToolName,
     IReadOnlyDictionary<string, JsonElement>? Arguments = null,
-    ToolAnnotationFacts? Annotations = null)
+    ToolAnnotationFacts? Annotations = null,
+    string? Server = null)
 {
     /// <summary>The tool's hints, or the defaults when it declared none.</summary>
     public ToolAnnotationFacts EffectiveAnnotations => Annotations ?? ToolAnnotationFacts.Undeclared;

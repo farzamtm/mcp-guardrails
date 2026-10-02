@@ -53,4 +53,11 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(BudgetLimits))]
 [JsonSerializable(typeof(ApprovalSettings))]
 [JsonSerializable(typeof(ApprovalMode))]
+[JsonSerializable(typeof(ApproversPolicy))]
+[JsonSerializable(typeof(WebhookApproverSettings))]
+// The webhook approval wire format, both directions. Registered here for the
+// same reason as everything else: a reflection-serialized request would go out
+// as "{}" from an AOT binary, and the receiver would be asked about nothing.
+[JsonSerializable(typeof(WebhookApprovalPayload))]
+[JsonSerializable(typeof(WebhookApprovalAnswer))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

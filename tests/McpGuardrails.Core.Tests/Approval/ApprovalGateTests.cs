@@ -1,5 +1,6 @@
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Tests.Policy;
 
 namespace McpGuardrails.Core.Tests.Approval;
 
@@ -231,6 +232,46 @@ public sealed class ApprovalGateTests
         await ApprovalGate.ApplyAsync(NeedsApproval(rule: null), _call, channel);
 
         Assert.Equal("(unnamed rule)", channel.Asked?.RuleName);
+    }
+
+    [Fact]
+    public async Task TheRequest_CarriesWhatAnOutOfBandApproverNeeds()
+    {
+        // A person reading a webhook notification is not looking at the agent's
+        // conversation: which server, which arguments, and how long they have
+        // are all things only the request can tell them.
+        var channel = new FakeChannel();
+        var arguments = TestArguments.From("""{"path": "/srv/data"}""");
+        var call = new ToolCallFacts("fs__delete_everything", arguments, Server: "fs");
+        var settings = new ApprovalSettings { Mode = ApprovalMode.Webhook, TimeoutSeconds = 60 };
+        var before = DateTimeOffset.UtcNow;
+
+        await ApprovalGate.ApplyAsync(NeedsApproval(settings: settings), call, channel);
+
+        var asked = channel.Asked!;
+        Assert.Equal(ApprovalMode.Webhook, asked.Mode);
+        Assert.Equal("fs", asked.Server);
+        Assert.Same(arguments, asked.Arguments);
+        Assert.InRange(
+            asked.Deadline!.Value,
+            before.AddSeconds(60),
+            DateTimeOffset.UtcNow.AddSeconds(60));
+        Assert.Equal(32, asked.RequestId.Length);
+    }
+
+    [Fact]
+    public async Task EveryQuestion_GetsItsOwnRequestId()
+    {
+        // The id is what lets a webhook answer be matched to its question; two
+        // questions sharing one would let a "yes" to one approve the other.
+        var first = new FakeChannel();
+        var second = new FakeChannel();
+
+        await ApprovalGate.ApplyAsync(NeedsApproval(), _call, first);
+        await ApprovalGate.ApplyAsync(NeedsApproval(), _call, second);
+
+        Assert.NotEqual(first.Asked!.RequestId, second.Asked!.RequestId);
+        Assert.Equal(ApprovalMode.InBand, first.Asked.Mode);
     }
 
     // ------------------------------------------------------------- arguments

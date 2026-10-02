@@ -48,6 +48,17 @@ public sealed record PolicyDocument
     [JsonIgnore]
     public BudgetPolicy EffectiveBudgets => Budgets ?? BudgetPolicy.None;
 
+    /// <summary>
+    /// Where out-of-band approval questions go, or null when none is configured.
+    /// </summary>
+    /// <remarks>Nullable for the same reason as <see cref="Budgets"/>.</remarks>
+    [JsonPropertyName("approvers")]
+    public ApproversPolicy? Approvers { get; init; }
+
+    /// <summary>The approvers section, or an empty one when the file omits it.</summary>
+    [JsonIgnore]
+    public ApproversPolicy EffectiveApprovers => Approvers ?? ApproversPolicy.None;
+
     /// <summary>An empty policy: everything allowed, nothing configured.</summary>
     public static PolicyDocument Empty { get; } = new();
 }

@@ -77,6 +77,57 @@ public sealed class ApprovalPolicyLoadingTests
     }
 
     [Fact]
+    public void AWebhookApprover_IsParsed()
+    {
+        var document = PolicyLoader.Parse("""
+            approvers:
+              webhook:
+                url: http://localhost:8080/approve
+                secret_env: GUARDRAILS_WEBHOOK_SECRET
+                allow_insecure_localhost: true
+            rules:
+              - name: approve-deletes
+                decision: require_approval
+                approval:
+                  mode: webhook
+            """);
+
+        var webhook = document.EffectiveApprovers.Webhook;
+
+        Assert.Equal(ApprovalMode.Webhook, document.EffectiveRules[0].Approval?.EffectiveMode);
+        Assert.Equal(new Uri("http://localhost:8080/approve"), webhook?.Endpoint);
+        Assert.Equal("GUARDRAILS_WEBHOOK_SECRET", webhook?.SecretEnv);
+        Assert.True(webhook?.AllowInsecureLocalhost);
+    }
+
+    [Fact]
+    public void AWebhookRuleWithoutAnApprover_FailsAtLoadTime()
+    {
+        var error = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            rules:
+              - name: approve-deletes
+                decision: require_approval
+                approval:
+                  mode: webhook
+            """));
+
+        Assert.Contains("approvers.webhook", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnInsecureWebhook_FailsAtLoadTime()
+    {
+        var error = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
+            approvers:
+              webhook:
+                url: http://approvals.example.com/hook
+                secret_env: GUARDRAILS_WEBHOOK_SECRET
+            """));
+
+        Assert.Contains("https", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void AnUnparseableTimeout_FailsAtLoadTime()
     {
         var error = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""

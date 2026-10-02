@@ -13,7 +13,7 @@ your agent actually does.
 > audits every one of them, can **refuse** them by policy - matching on tool
 > globs, the tool's own MCP annotations, and predicates over the arguments -
 > enforces a **session budget** with per-rule costs, and can **hold a call until
-> a human approves it**.
+> a human approves it**, at the client or through a signed webhook.
 > Result scanning and the Streamable HTTP host are next.
 > See [the spec](mcp-guardrails-dotnet-spec.md).
 
@@ -29,7 +29,8 @@ your agent actually does.
 - **Caps a session** — a maximum number of calls, or a maximum total cost with
   per-rule weights, refused with a message that tells the agent to stop
 - **Asks a human** — `require_approval` puts the question to the person at the
-  MCP client and waits for an answer, with a configurable deadline
+  MCP client, or POSTs it to a signed webhook, and waits for an answer, with a
+  configurable deadline
 
 ## Policy
 
@@ -238,11 +239,104 @@ jq 'select(.approval == "timed_out" and .decision == "allow")' ~/.mcp-guardrails
 `approval` is one of `approved`, `declined`, `timed_out`, `unavailable` or
 `failed`.
 
-**Not implemented yet:** `mode: slack` and `mode: webhook` (out-of-band
-approvers) are rejected at load time rather than silently ignored, for the same
-reason `budgets.daily:` is. The Tasks/MRTR path the spec prefers — returning an
-`input_required` task instead of holding the request open — lands behind the same
-`IApprovalChannel` seam.
+### Asking a webhook instead
+
+When nobody is sitting at the client — an autonomous agent, a CI job — send the
+question to an HTTP endpoint you run, which can page someone, post to a chat
+room, or consult a ticketing system:
+
+```yaml
+approvers:
+  webhook:
+    url: https://approvals.example.com/hooks/guardrails
+    secret_env: GUARDRAILS_WEBHOOK_SECRET   # the variable's NAME, never the secret
+
+rules:
+  - name: approve-deletes
+    match:
+      tool: "*__delete_*"
+    decision: require_approval
+    approval:
+      mode: webhook
+      timeout_s: 600
+```
+
+The endpoint is configured once, under `approvers:`, and each rule chooses
+`mode: in_band` (the default) or `mode: webhook`. A webhook rule without an
+`approvers.webhook` section is a load-time error.
+
+**The protocol is one POST, answered synchronously.** The proxy sends:
+
+```text
+POST /hooks/guardrails
+Content-Type: application/json; charset=utf-8
+X-Guardrails-Signature: sha256=<hex HMAC-SHA256 of the raw body>
+X-Guardrails-Request-Id: 8e0f3c2b9a7d4c51b6a2f0e1d3c4b5a6
+```
+
+```json
+{
+  "version": 1,
+  "request_id": "8e0f3c2b9a7d4c51b6a2f0e1d3c4b5a6",
+  "tool": "fs__delete_file",
+  "server": "fs",
+  "rule": "approve-deletes",
+  "question": "Allow the agent to call 'fs__delete_file'? Guardrails rule 'approve-deletes' requires your approval.",
+  "arguments": { "path": "/srv/reports/q3.csv" },
+  "sent_at": "2026-10-01T12:00:00+00:00",
+  "deadline": "2026-10-01T12:10:00+00:00"
+}
+```
+
+(sent on one line; `server` and `arguments` are omitted when there are none) and
+holds the request open until the endpoint replies `200 OK` with:
+
+```json
+{ "request_id": "8e0f3c2b9a7d4c51b6a2f0e1d3c4b5a6", "decision": "approve" }
+```
+
+`"decision": "deny"` refuses the call. That is the whole contract. A receiver
+that has to wait for a person keeps the connection open until they answer, or
+until `deadline`, after which the proxy has stopped listening anyway. Polling a
+status URL was considered and rejected: it adds a second, remotely supplied URL
+that would need its own scheme, host and signature checks, to buy something a
+receiver can do internally.
+
+Argument values are sent as strings and cut at 256 characters — an approver
+needs to see *which* path, not the 40 KB being written to it. They are otherwise
+exactly what the model sent, so run the endpoint somewhere you would be
+comfortable storing them.
+
+**Verify the signature before you parse the body.** Compute
+`HMAC-SHA256(secret, raw body bytes)`, hex-encode it, and compare it with the
+header value after `sha256=` in constant time; use `sent_at` to reject replays
+older than you are willing to accept. The proxy reads the secret from the
+variable named by `secret_env` when it starts serving, and refuses to start if
+it is unset or empty rather than send requests anyone could forge. Generate one
+with `openssl rand -hex 32`.
+
+**Everything except a clean answer is a denial.** A status other than `200`, a
+redirect (never followed — it would send the signed body somewhere the policy
+did not name), a body that does not parse, a `request_id` that does not match
+the question, any decision other than exactly `approve` or `deny`, a refused
+connection or a TLS failure: each is logged as `approval: "failed"` and the call
+is refused. Only the rule's own `timeout_s` produces `timed_out`, so
+`on_timeout` means the same for a webhook as for a person at the client —
+including that `on_timeout: allow` lets a call through when an endpoint *hangs*,
+whereas one that is down refuses the connection and fails closed.
+
+**HTTPS is required.** For a receiver on the same machine during development,
+`allow_insecure_localhost: true` permits plain `http://` to a loopback address
+(`localhost`, `127.0.0.1`, `::1`) and nothing else. Credentials in the URL are
+rejected; the signature is the authentication.
+
+See [`examples/webhook-approval.yaml`](examples/webhook-approval.yaml), and
+`scripts/smoke.py` for a 40-line receiver that verifies the signature.
+
+**Not implemented yet:** `mode: slack` is rejected at load time rather than
+silently ignored, for the same reason `budgets.daily:` is. The Tasks/MRTR path
+the spec prefers — returning an `input_required` task instead of holding the
+request open — lands behind the same `IApprovalChannel` seam.
 
 ## The audit log
 
@@ -337,7 +431,7 @@ Three layers, each covering what the one below cannot:
 | --- | --- |
 | Unit tests | Pure logic — namespacing, config validation, the audit sink |
 | In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
-| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in two phases: pure passthrough, then a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in two phases: pure passthrough, then a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; then budgets, approval at the client, and approval through a local webhook receiver that verifies the signature |
 
 CI runs all three on Linux, macOS and Windows, plus a `lint` job
 (`dotnet format`, `ruff`, `shellcheck`) and a check that every example policy in
