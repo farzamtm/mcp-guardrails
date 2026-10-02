@@ -33,6 +33,85 @@ your agent actually does.
 - **Scans what comes back** — tool results are checked for prompt-injection
   attempts and fenced as untrusted data before the model reads them, on by
   default, with an optional LLM classifier as a second opinion
+- **Exports OpenTelemetry**, opt-in: a span per tool call and counters for
+  decisions, denials and approvals, over OTLP to Jaeger, the Aspire dashboard or
+  any collector, with no argument values in any attribute
+
+## Install
+
+The same program ships three ways. Pick by what is already on the machine.
+
+The downstream servers are still the hardcoded filesystem server started with
+`npx` (configurable upstreams are on the roadmap), so wherever the proxy runs
+needs **Node.js** on `PATH` too.
+
+### Native binary — nothing else to install
+
+Each [GitHub Release](https://github.com/farzamtm/mcp-guardrails/releases)
+carries a self-contained Native AOT executable for `linux-x64`, `linux-arm64`,
+`osx-arm64` and `win-x64`, plus a `SHA256SUMS` file. No .NET runtime needed, and
+startup is fast enough not to matter when a client spawns one proxy per session.
+
+```bash
+VERSION=0.1.0 RID=osx-arm64
+curl -LO "https://github.com/farzamtm/mcp-guardrails/releases/download/v$VERSION/mcp-guardrails-$VERSION-$RID.tar.gz"
+curl -LO "https://github.com/farzamtm/mcp-guardrails/releases/download/v$VERSION/SHA256SUMS"
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf "mcp-guardrails-$VERSION-$RID.tar.gz"
+./mcp-guardrails-$VERSION-$RID/mcp-guardrails list-upstream
+```
+
+The binaries are not code-signed yet, so macOS Gatekeeper will refuse a
+downloaded one until you clear the quarantine flag:
+`xattr -d com.apple.quarantine mcp-guardrails`. Windows gets a `.zip` with
+`mcp-guardrails.exe`.
+
+Building one yourself is a single command; naming a runtime is what switches
+the build to Native AOT:
+
+```bash
+dotnet publish src/McpGuardrails.Cli -c Release -r osx-arm64 -o out
+```
+
+### `dotnet tool` — if you already have the .NET 10 SDK
+
+```bash
+dotnet tool install -g McpGuardrails
+mcp-guardrails list-upstream
+```
+
+The tool package is portable IL rather than a native binary (a tool package has
+to run on every platform), so it needs the .NET 10 runtime. Until the package is
+on nuget.org, install the `.nupkg` attached to a release build from a folder:
+`dotnet tool install -g McpGuardrails --add-source ./folder-with-nupkg`.
+
+### Docker
+
+```bash
+docker build -t mcp-guardrails .
+```
+
+The image is a Native AOT build on Microsoft's chiseled `runtime-deps` base — no
+shell, no package manager, running as a non-root user (uid 1654) — so it
+contains the proxy and nothing else. The downstream servers it spawns have to
+live in the same container, so build on top of it rather than running it bare
+(bare, it exits at startup because there is no `npx` to spawn):
+
+```dockerfile
+FROM mcp-guardrails AS guardrails
+
+FROM node:22-bookworm-slim
+COPY --from=guardrails /usr/local/bin/mcp-guardrails /usr/local/bin/mcp-guardrails
+USER node
+ENTRYPOINT ["/usr/local/bin/mcp-guardrails"]
+```
+
+```bash
+docker build -t my-guardrails -f Dockerfile.mine .
+docker run -i --rm my-guardrails list-upstream
+```
+
+`-i` matters: stdio is the transport, so stdin has to stay open.
 
 ## Policy
 
@@ -479,6 +558,94 @@ jq -r '[.ts, .tool, (.duration_ms|tostring)] | @tsv' ~/.mcp-guardrails/audit.jso
 jq 'select(.is_error)' ~/.mcp-guardrails/audit.jsonl
 ```
 
+## OpenTelemetry
+
+The JSONL log answers "what happened in this session". OpenTelemetry answers it
+across many sessions, on the dashboards you already have. Export is **off by
+default** and switched on by either:
+
+- setting `OTEL_EXPORTER_OTLP_ENDPOINT` (the standard OTel variable), or
+- passing `--otel`, which exports to the default collector on `localhost:4317`.
+
+All the standard `OTEL_*` variables apply: `OTEL_EXPORTER_OTLP_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SDK_DISABLED`, and so on.
+
+### Quickstart: the Aspire dashboard
+
+The [Aspire dashboard](https://aspire.dev/dashboard/standalone/) is a single
+container that shows traces and metrics:
+
+```bash
+docker run --rm -d --name aspire-dashboard \
+  -p 18888:18888 -p 4317:18889 \
+  -e ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true \
+  mcr.microsoft.com/dotnet/aspire-dashboard:latest
+
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  ./src/McpGuardrails.Cli/bin/Debug/net10.0/McpGuardrails.Cli
+```
+
+Open <http://localhost:18888> and the `mcp-guardrails` service appears after its
+first tool call. (`UNSECURED_ALLOW_ANONYMOUS` skips the login token. That is fine
+on a laptop, not on a shared host.)
+
+From Claude Desktop, put the variable in the server's `env` block next to
+`GUARDRAILS_POLICY`.
+
+[Jaeger](https://www.jaegertracing.io/) works the same way for traces, though it
+has nowhere to put metrics:
+
+```bash
+docker run --rm -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/jaeger:latest
+```
+
+### What is exported
+
+One trace per tool call shows the whole hop. The MCP SDK's own `tools/call`
+server span is the root; the guardrails span, `guardrails tools/call <tool>`,
+sits inside it; the SDK's client span for the downstream call sits inside that.
+A call that policy refused has no client span, which is how you can see that
+it never left the proxy.
+
+| Attribute | Meaning |
+| --- | --- |
+| `gen_ai.tool.name` | Client-visible tool name (semconv) |
+| `mcp_guardrails.server`, `mcp_guardrails.downstream_tool` | Where the call was routed |
+| `mcp_guardrails.decision` | `allow`, `deny`, `require_approval`, as in the audit log |
+| `mcp_guardrails.decision.source` | `policy`, `budget` or `approval` |
+| `mcp_guardrails.rule` | Rule that decided, or the budget limit (`session.max_cost`) |
+| `mcp_guardrails.budget.cost` | What the call costs against the budget |
+| `mcp_guardrails.approval.outcome` | `approved`, `declined`, `timed_out`, `unavailable`, `failed` |
+| `error.type` | Exception type, or `tool_error` when the downstream tool reported failure (semconv) |
+
+| Metric | Type | Attributes |
+| --- | --- | --- |
+| `mcp_guardrails.tool_calls` | counter | tool, server, decision, `error.type` |
+| `mcp_guardrails.denials` | counter | tool, server, decision source, rule |
+| `mcp_guardrails.approvals` | counter | tool, server, rule, approval outcome |
+| `mcp_guardrails.tool_call.duration` | histogram, seconds | tool, server, decision, `error.type` |
+
+The SDK's semconv metrics (`mcp.server.operation.duration`,
+`mcp.client.operation.duration`, ...) are exported alongside these.
+
+Telemetry is held to a **stricter** privacy line than the audit log. A trace
+backend is usually shared far more widely than a file on the proxy's own disk,
+so:
+
+- **argument values are never exported**, and neither are exception messages or
+  decision reasons, which can quote arguments. A span carries the exception
+  *type* and the rule *name*, which is enough to find the full audit line.
+- a tool name the proxy could not resolve is free text from the client, so
+  metrics record it as `_OTHER` rather than minting a time series per typo.
+- **a denial is not an error.** The model receives it as an `isError` result,
+  but the span status stays unset: a denial is the guardrail working, and
+  counting it as a failure would turn every error-rate panel into a denial-rate
+  panel.
+
+`scripts/smoke.py` runs a session against a fake OTLP collector and checks that
+spans and metrics arrive and that an argument value sent in the call appears
+nowhere in what was exported.
+
 ## Quickstart
 
 ```bash
@@ -534,13 +701,15 @@ the SDK's `McpServerFilters.Request.CallToolFilters` pipeline.
 | `src/McpGuardrails.Core/Policy/` | Decisions, rules, evaluator, YAML loader |
 | `src/McpGuardrails.Core/Pipeline/` | Per-call scope shared between filters |
 | `src/McpGuardrails.Core/Scanners/` | Result scanning: heuristics, settings, the gate |
-| `src/McpGuardrails.Core/Audit/` | Audit record + channel-backed JSONL sink |
+| `src/McpGuardrails.Core/Audit/` | Audit record, channel-backed JSONL sink, OTel span and metrics (BCL APIs only) |
 | `src/McpGuardrails.Core/Serialization/` | Source-generated JSON (AOT-safe) |
 | `src/McpGuardrails.Cli/Program.cs` | Host wiring; the server half of the proxy |
 | `tests/McpGuardrails.Core.Tests/` | xUnit tests, 100% line and branch on Core |
 | `scripts/smoke.py` | Dependency-free MCP driver for end-to-end checks |
 | `scripts/coverage.sh` | Coverage run + threshold gate, same in CI and locally |
 | `ruff.toml` | Lint settings for the Python tooling |
+| `Dockerfile` | Native AOT image on a chiseled, non-root base |
+| `.github/workflows/release.yml` | On a version tag: AOT binaries per platform, tool package, draft release |
 
 ## Testing
 

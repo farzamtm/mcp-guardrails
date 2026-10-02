@@ -251,7 +251,11 @@ match the *shape* of an injection, so:
 - **One setting for everything.** `scanners.injection.action` applies to every
   server and tool; there is no per-server `block`.
 - **False positives are certain.** A document *about* prompt injection will be
-  flagged. That is why the default is `annotate`.
+  flagged. That is why the default is `annotate`. The optional LLM classifier
+  (`scanners.injection.classifier`, off by default) can soften a `block` to an
+  annotation on a false positive, but it reads the same attacker-controlled text,
+  so it is never trusted to remove a warning; when it fails or times out the
+  heuristic verdict stands. Turning it on sends tool output to Anthropic.
 
 ### Tool metadata is not inspected
 
@@ -319,13 +323,12 @@ Resources and prompts are not proxied at all.
   another model unfiltered.
 - **A record is written after the call finishes.** A proxy killed mid-call
   leaves no line for that call; there is no separate "call started" record.
-- **If the writer fails, calls eventually hang rather than go unrecorded.** The
-  sink buffers up to 10,000 records and never drops; a write error ends the
-  background writer, so once the buffer fills, every subsequent call blocks on
-  the audit write
-  ([`JsonlAuditSink`](../src/McpGuardrails.Core/Audit/JsonlAuditSink.cs)).
-  Records buffered at that point are lost, and by then each blocked call has
-  already been forwarded.
+- **If the writer fails, the proxy stops forwarding.** A write error marks the
+  sink faulted, logs a critical error with the number of buffered records lost,
+  and every later call is refused before it is forwarded
+  ([`JsonlAuditSink`](../src/McpGuardrails.Core/Audit/JsonlAuditSink.cs)). The
+  call whose record hit the error had already been forwarded, and records still
+  buffered at that moment are lost.
 - **No tamper evidence**, as above.
 - **Only `tools/call` is recorded.** `tools/list`, connection and approval
   prompts themselves are not separate events.
@@ -363,12 +366,10 @@ loader **rejects** it rather than accepting a setting that does nothing.
 | Planned | Today |
 | --- | --- |
 | Secret / PII redaction of arguments, results and the audit log (`scanners.secrets`) | Rejected at load; arguments logged verbatim |
-| Optional LLM classifier behind the injection heuristics | Heuristics only |
 | Out-of-band approval: webhook and Slack (`approval.mode`) | Rejected at load; only `in_band` elicitation |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
 | Persistent budgets and daily caps (SQLite store, `budgets.daily`) | Rejected at load; in-memory session counters |
 | Streamable HTTP host | stdio only |
-| OpenTelemetry audit export | JSONL file only |
 | Configurable upstream servers | One hard-coded filesystem server ([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)) |
 | Policy reload without restart | Read once at startup |
 
