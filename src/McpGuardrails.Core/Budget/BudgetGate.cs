@@ -19,20 +19,69 @@ namespace McpGuardrails.Core.Budget;
 /// </remarks>
 public sealed class BudgetGate
 {
+    /// <summary>The scope name for the per-process budget.</summary>
+    public const string SessionScope = "session";
+
+    /// <summary>The scope name for the per-UTC-day budget.</summary>
+    public const string DailyScope = "daily";
+
     private readonly IBudgetStore _store;
     private readonly string _scope;
 
+    // Set only when both scopes are configured. See ApplyBoth for why the session
+    // has to be the concrete in-memory store rather than any IBudgetStore.
+    private readonly InMemoryBudgetStore? _session;
+    private readonly IBudgetStore? _daily;
+    private readonly Lock _pair = new();
+
     /// <param name="store">Where the running totals live.</param>
     /// <param name="scope">
-    /// The scope name used in refusals, matching the policy file (<c>session</c>).
+    /// The scope name used in refusals, matching the policy file
+    /// (<see cref="SessionScope"/> or <see cref="DailyScope"/>).
     /// </param>
-    public BudgetGate(IBudgetStore store, string scope = "session")
+    public BudgetGate(IBudgetStore store, string scope = SessionScope)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentException.ThrowIfNullOrWhiteSpace(scope);
 
         _store = store;
         _scope = scope;
+    }
+
+    /// <summary>A gate enforcing a session budget and a daily budget together.</summary>
+    /// <param name="session">The per-process counters.</param>
+    /// <param name="daily">The per-day counters, normally a <see cref="SqliteBudgetStore"/>.</param>
+    public BudgetGate(InMemoryBudgetStore session, IBudgetStore daily)
+        : this(session)
+    {
+        ArgumentNullException.ThrowIfNull(daily);
+
+        _session = session;
+        _daily = daily;
+    }
+
+    /// <summary>Builds the gate a policy file's <c>budgets:</c> section asks for.</summary>
+    /// <param name="budgets">The validated budget section.</param>
+    /// <param name="openDaily">
+    /// Opens the persistent daily store. Only called when a daily cap is
+    /// configured, so a policy without one never creates a database file.
+    /// </param>
+    /// <remarks>
+    /// Lives here rather than in the CLI so all four combinations are covered by
+    /// unit tests instead of only by the smoke run.
+    /// </remarks>
+    public static BudgetGate For(BudgetPolicy budgets, Func<BudgetLimits, IBudgetStore> openDaily)
+    {
+        ArgumentNullException.ThrowIfNull(budgets);
+        ArgumentNullException.ThrowIfNull(openDaily);
+
+        return (budgets.Session, budgets.Daily) switch
+        {
+            ({ } session, { } daily) => new BudgetGate(new InMemoryBudgetStore(session), openDaily(daily)),
+            ({ } session, null) => new BudgetGate(new InMemoryBudgetStore(session)),
+            (null, { } daily) => new BudgetGate(openDaily(daily), DailyScope),
+            _ => Unlimited,
+        };
     }
 
     /// <summary>A gate over an unlimited store: charges nothing away, refuses nothing.</summary>
@@ -45,7 +94,11 @@ public sealed class BudgetGate
     public static BudgetGate Unlimited { get; } = new(new InMemoryBudgetStore());
 
     /// <summary>The totals so far, for logging and tests.</summary>
+    /// <remarks>The session store when both scopes are configured.</remarks>
     public IBudgetStore Store => _store;
+
+    /// <summary>The daily store when both scopes are configured, otherwise null.</summary>
+    public IBudgetStore? DailyStore => _daily;
 
     /// <summary>
     /// Applies the budget to a decision the policy already made.
@@ -67,16 +120,67 @@ public sealed class BudgetGate
             return decision;
         }
 
+        if (_session is not null && _daily is not null)
+        {
+            return ApplyBoth(decision, _session, _daily);
+        }
+
         var charge = _store.TryCharge(decision.Cost);
 
-        return charge.Allowed ? decision : Refuse(charge, decision);
+        return charge.Allowed ? decision : Refuse(charge, decision, _scope);
     }
 
-    private Decision Refuse(BudgetCharge charge, Decision decision) => new(
+    /// <remarks>
+    /// Two stores cannot be charged in one atomic step, so the order does the
+    /// work. The session goes first because it is private to this process and
+    /// can be undone exactly. The daily store goes last because it is shared
+    /// with other proxies and cannot be: whatever it decides is final, so it
+    /// never needs undoing. If the day refuses, the session charge is handed back.
+    ///
+    /// The lock stops another call in this process from seeing the session
+    /// charge in the moment before it is refunded, which would refuse that call
+    /// for budget that was never really spent.
+    /// </remarks>
+    private Decision ApplyBoth(Decision decision, InMemoryBudgetStore session, IBudgetStore daily)
+    {
+        lock (_pair)
+        {
+            var sessionCharge = session.TryCharge(decision.Cost);
+
+            if (!sessionCharge.Allowed)
+            {
+                return Refuse(sessionCharge, decision, SessionScope);
+            }
+
+            BudgetCharge dailyCharge;
+            try
+            {
+                dailyCharge = daily.TryCharge(decision.Cost);
+            }
+            catch
+            {
+                // The database failed, so the call fails and is not forwarded -
+                // and a call that did not go out must not cost the session.
+                session.Refund(decision.Cost);
+                throw;
+            }
+
+            if (dailyCharge.Allowed)
+            {
+                return decision;
+            }
+
+            session.Refund(decision.Cost);
+
+            return Refuse(dailyCharge, decision, DailyScope);
+        }
+    }
+
+    private static Decision Refuse(BudgetCharge charge, Decision decision, string scope) => new(
         Verdict.Deny,
-        Explain(charge),
-        $"{_scope}.{LimitName(charge.Exceeded)}",
-        decision.Trail is null ? null : [.. decision.Trail, $"budget '{_scope}': exhausted -> deny"])
+        Explain(charge, scope),
+        $"{scope}.{LimitName(charge.Exceeded)}",
+        decision.Trail is null ? null : [.. decision.Trail, $"budget '{scope}': exhausted -> deny"])
     {
         Source = DecisionSource.Budget,
         Cost = decision.Cost,
@@ -91,21 +195,34 @@ public sealed class BudgetGate
     /// <remarks>
     /// Written for the model, and specifically written to stop it retrying. A
     /// budget denial is not "try something else" like a policy denial - nothing
-    /// the agent does next will work - so the message says the session is done
+    /// the agent does next will work - so the message says the budget is done
     /// and who can change that, and gives the numbers so a human reading the
     /// transcript can tell whether the cap was too tight.
+    ///
+    /// The daily wording names UTC and the reset, because "start a new session"
+    /// is precisely the advice that does not help against a daily cap.
     /// </remarks>
-    private string Explain(BudgetCharge charge) => charge.Exceeded switch
+    private static string Explain(BudgetCharge charge, string scope) => (scope, charge.Exceeded) switch
     {
-        BudgetDimension.Cost =>
-            $"this call costs {Number(charge.Requested)} and the {_scope} has already spent " +
+        (DailyScope, BudgetDimension.Cost) =>
+            $"this call costs {Number(charge.Requested)} and {Number(charge.Used)} of today's " +
+            $"{Number(charge.Cap)} budget is already spent (days are UTC). Stop calling tools " +
+            "and tell the user the daily budget is exhausted; only they can raise " +
+            "'budgets.daily.max_cost', otherwise it resets at 00:00 UTC.",
+        (DailyScope, _) =>
+            $"{Number(charge.Used)} tool calls have been made today (UTC), which is the daily " +
+            $"limit of {Number(charge.Cap)}. Stop calling tools and tell the user the daily " +
+            "budget is exhausted; only they can raise 'budgets.daily.max_calls', otherwise " +
+            "it resets at 00:00 UTC.",
+        (_, BudgetDimension.Cost) =>
+            $"this call costs {Number(charge.Requested)} and the {scope} has already spent " +
             $"{Number(charge.Used)} of its {Number(charge.Cap)} budget. Stop calling tools and " +
             "tell the user the budget is exhausted; only they can raise " +
-            $"'budgets.{_scope}.max_cost' or start a new session.",
+            $"'budgets.{scope}.max_cost' or start a new session.",
         _ =>
-            $"the {_scope} has made {Number(charge.Used)} tool calls, which is its limit of " +
+            $"the {scope} has made {Number(charge.Used)} tool calls, which is its limit of " +
             $"{Number(charge.Cap)}. Stop calling tools and tell the user the budget is " +
-            $"exhausted; only they can raise 'budgets.{_scope}.max_calls' or start a new session.",
+            $"exhausted; only they can raise 'budgets.{scope}.max_calls' or start a new session.",
     };
 
     /// <remarks>

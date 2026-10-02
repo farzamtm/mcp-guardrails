@@ -60,6 +60,9 @@ ENV GUARDRAILS_AUDIT=/home/app/.mcp-guardrails/audit.jsonl \
     GUARDRAILS_SANDBOX=/tmp/guardrails-sandbox
 
 COPY --from=build --chown=root:root --chmod=0755 /out/McpGuardrails.Cli /usr/local/bin/mcp-guardrails
+# SQLite for daily budgets is a native library Native AOT does not link in; it
+# is loaded from beside the binary, and without it a daily cap fails at startup.
+COPY --from=build --chown=root:root --chmod=0755 /out/libe_sqlite3.so /usr/local/bin/libe_sqlite3.so
 
 # Numeric, so Kubernetes' runAsNonRoot can verify it without resolving a name.
 USER 1654

@@ -153,8 +153,8 @@ the fastest route to "clean up the repo" is `rm`.
   - a malformed policy file, or a policy path that is a directory, **refuses to
     start** rather than falling back to passthrough
     ([`PolicyLoader`](../src/McpGuardrails.Core/Policy/PolicyLoader.cs));
-  - configuration the build cannot honour — `budgets.daily`, `mode: slack` /
-    `webhook` — is a load-time error, not a silent no-op.
+  - configuration the build cannot honour — `mode: slack` / `webhook` — is a
+    load-time error, not a silent no-op.
 - **The arguments policy sees are the arguments the server gets.** The call
   handler forwards the same parsed argument dictionary the policy evaluated, so
   there is no second parse for a duplicate key or encoding trick to exploit.
@@ -344,8 +344,10 @@ Resources and prompts are not proxied at all.
 
 ### Smaller sharp edges
 
-- **Budgets are per process.** "Session" means this proxy process; restarting
-  the client resets every counter. Daily caps are rejected rather than faked.
+- **Session budgets are per process.** "Session" means this proxy process;
+  restarting the client resets the session counters. Daily caps persist in a
+  SQLite file (`GUARDRAILS_BUDGET_DB`) shared by every proxy pointed at it, so
+  anyone who can write that file can reset or inflate the daily spend.
 - **A call to an unknown tool is charged.** If policy allows it, the budget
   charges it before the call handler finds no such tool. Harmless, but not quite
   "only forwarded calls cost".
@@ -376,7 +378,6 @@ loader **rejects** it rather than accepting a setting that does nothing.
 | --- | --- |
 | Out-of-band approval: webhook and Slack (`approval.mode`) | Rejected at load; only `in_band` elicitation |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
-| Persistent budgets and daily caps (SQLite store, `budgets.daily`) | Rejected at load; in-memory session counters |
 | Streamable HTTP host | stdio only |
 | Configurable upstream servers | One hard-coded filesystem server ([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)) |
 | Policy reload without restart | Read once at startup |

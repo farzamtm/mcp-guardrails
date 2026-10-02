@@ -7,6 +7,7 @@ using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -158,7 +159,7 @@ var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
 using var classifierHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
 
 PolicyEvaluator policy;
-BudgetGate budget;
+BudgetPolicy budgets;
 InjectionGate scanner;
 SecretGate secrets;
 try
@@ -166,6 +167,7 @@ try
     var document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
 
     policy = new PolicyEvaluator(document);
+    budgets = document.EffectiveBudgets;
 
     // On by default, including with no policy file at all: a result scanner that
     // has to be switched on protects nobody, and annotating cannot break a call.
@@ -197,13 +199,6 @@ try
                     Environment.GetEnvironmentVariable),
                 secretSettings.IncludePii))
         : new InjectionGate(injection);
-
-    // No `budgets:` section means an unlimited gate rather than no gate: the
-    // call path is then the same whether or not anyone configured a cap, so the
-    // configured path is not the one that only ever runs in production.
-    budget = document.EffectiveBudgets.Session is { } session
-        ? new BudgetGate(new InMemoryBudgetStore(session))
-        : BudgetGate.Unlimited;
 }
 catch (PolicyException ex)
 {
@@ -211,6 +206,47 @@ catch (PolicyException ex)
     await Console.Error.WriteLineAsync($"Invalid policy file '{policyPath}': {ex.Message}");
     return 1;
 }
+
+// Where daily budget counters persist. An environment variable like the audit
+// and policy paths, not a policy key: the policy says what the limits are, the
+// deployment says where state lives - and two agents sharing one policy file
+// may well want separate daily budgets. Every proxy pointed at the same file
+// shares one budget. Only opened when `budgets.daily` is configured.
+var budgetDbPath = Environment.GetEnvironmentVariable("GUARDRAILS_BUDGET_DB")
+                   ?? Path.Combine(
+                       Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                       ".mcp-guardrails",
+                       "budgets.db");
+
+// Captured so it can be disposed on exit; null when no daily cap is configured.
+SqliteBudgetStore? dailyStore = null;
+BudgetGate budget;
+
+// list-upstream only prints tools, so it must not create a database file - the
+// example-policy check in CI runs exactly this.
+if (listOnly)
+{
+    budget = BudgetGate.Unlimited;
+}
+else
+{
+    try
+    {
+        // No `budgets:` section means an unlimited gate rather than no gate: the
+        // call path is then the same whether or not anyone configured a cap, so
+        // the configured path is not the one that only ever runs in production.
+        budget = BudgetGate.For(budgets, limits => dailyStore = new SqliteBudgetStore(budgetDbPath, limits));
+    }
+    catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
+    {
+        // Fatal, like a malformed policy: running without the daily cap the
+        // operator asked for would be failing open.
+        await Console.Error.WriteLineAsync($"Cannot open budget store '{budgetDbPath}': {ex.Message}");
+        return 1;
+    }
+}
+
+using var dailyStoreLifetime = dailyStore;
 
 // ---------------------------------------------------------------------------
 // STEP 2 demo: print what we discovered downstream, then exit.

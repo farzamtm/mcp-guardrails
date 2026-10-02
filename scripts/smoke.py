@@ -48,6 +48,11 @@ BUDGET_AUDIT = f"{SANDBOX}/audit-budget.jsonl"
 BUDGET_FILE = f"{SANDBOX}/smoke-budget.yaml"
 BUDGET_PROBE = f"{SANDBOX}/smoke-budget-1.txt"
 BUDGET_OVER = f"{SANDBOX}/smoke-budget-2.txt"
+DAILY_AUDIT = f"{SANDBOX}/audit-daily.jsonl"
+DAILY_FILE = f"{SANDBOX}/smoke-daily.yaml"
+DAILY_DB = f"{SANDBOX}/smoke-budgets.db"
+DAILY_PROBE = f"{SANDBOX}/smoke-daily-1.txt"
+DAILY_OVER = f"{SANDBOX}/smoke-daily-2.txt"
 APPROVAL_AUDIT = f"{SANDBOX}/audit-approval.jsonl"
 APPROVAL_FILE = f"{SANDBOX}/smoke-approval.yaml"
 APPROVAL_PROBE = f"{SANDBOX}/smoke-approved.txt"
@@ -162,6 +167,22 @@ rules:
       tool: fs__write_*
     decision: allow
     cost: 2
+"""
+
+# One write a day. Two proxy processes run against the same database file, so
+# the second write is refused only if the first process's spend survived its
+# exit - which is the property a daily cap exists for.
+DAILY_POLICY = """
+budgets:
+  daily:
+    max_cost: 1
+
+rules:
+  - name: reads-are-free
+    match:
+      tool: fs__read_*
+    decision: allow
+    cost: 0
 """
 
 # Scanning defaults to annotate, so the first scanning phase runs with no
@@ -397,6 +418,30 @@ BUDGET_CHECKS: list[tuple[dict, str, object]] = [
 ]
 
 
+# Two sessions, two processes, one database: the second must see the first's
+# spend.
+DAILY_FIRST_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": DAILY_PROBE, "content": CONTENT}),
+        "the first write of the day fits the daily budget",
+        lambda r: not r.get("isError"),
+    ),
+]
+
+DAILY_SECOND_CHECKS: list[tuple[dict, str, object]] = [
+    (
+        call(1, "fs__write_file", {"path": DAILY_OVER, "content": CONTENT}),
+        "a restarted proxy still remembers today's spend and refuses",
+        lambda r: denied_with(r, "Blocked by guardrails budget 'daily.max_cost'"),
+    ),
+    (
+        call(2, "fs__read_text_file", {"path": DAILY_PROBE}),
+        "a cost-0 read still works after the daily budget is spent",
+        lambda r: CONTENT in json.dumps(r.get("content", [])),
+    ),
+]
+
+
 # Four sessions, one per answer a human can give - including not being there at
 # all. Each runs against its own proxy process because the answer is fixed for
 # the session.
@@ -623,6 +668,12 @@ def main() -> int:
         BUDGET_AUDIT,
         BUDGET_PROBE,
         BUDGET_OVER,
+        DAILY_AUDIT,
+        DAILY_DB,
+        f"{DAILY_DB}-wal",
+        f"{DAILY_DB}-shm",
+        DAILY_PROBE,
+        DAILY_OVER,
         APPROVAL_AUDIT,
         APPROVAL_PROBE,
         APPROVAL_REFUSED,
@@ -650,6 +701,8 @@ def main() -> int:
             handle.write(POLICY)
         with open(BUDGET_FILE, "w", encoding="utf-8") as handle:
             handle.write(BUDGET_POLICY)
+        with open(DAILY_FILE, "w", encoding="utf-8") as handle:
+            handle.write(DAILY_POLICY)
         with open(APPROVAL_FILE, "w", encoding="utf-8") as handle:
             handle.write(APPROVAL_POLICY)
         with open(SCAN_BLOCK_FILE, "w", encoding="utf-8") as handle:
@@ -693,6 +746,24 @@ def main() -> int:
     )
     failures += budget_failures
     failures += check_budget_audit_log()
+
+    # Phase 3b: a daily budget outliving the process that spent it. Two runs,
+    # one database file - an in-memory counter would let the second write in.
+    print("\n--- daily budget across restarts ---")
+    daily_env = {
+        "GUARDRAILS_AUDIT": DAILY_AUDIT,
+        "GUARDRAILS_POLICY": DAILY_FILE,
+        "GUARDRAILS_BUDGET_DB": DAILY_DB,
+    }
+    daily_stderr: list[str] = []
+    for checks in (DAILY_FIRST_CHECKS, DAILY_SECOND_CHECKS):
+        session_failures, session_stderr = run_session(checks, daily_env)
+        failures += session_failures
+        daily_stderr += session_stderr
+
+    persisted = os.path.exists(DAILY_DB)
+    print(f"{'PASS' if persisted else 'FAIL'}  the daily spend was written to disk")
+    failures += 0 if persisted else 1
 
     # Phase 4: a human in the loop. One session per answer, because the fake
     # human's answer is fixed for a session - and the last one is not there at
@@ -787,6 +858,13 @@ def main() -> int:
     print(f"{'FAIL' if overspent else 'PASS'}  the over-budget write never happened")
     failures += 1 if overspent else 0
 
+    overspent_daily = os.path.exists(DAILY_OVER)
+    print(
+        f"{'FAIL' if overspent_daily else 'PASS'}  "
+        "the over-budget write on the second day-run never happened"
+    )
+    failures += 1 if overspent_daily else 0
+
     if failures:
         print("\n--- server stderr (last 30) ---", file=sys.stderr)
         sys.stderr.writelines(
@@ -794,6 +872,7 @@ def main() -> int:
                 stderr_lines
                 + policy_stderr
                 + budget_stderr
+                + daily_stderr
                 + approval_stderr
                 + scan_stderr
                 + secret_stderr
