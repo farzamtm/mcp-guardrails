@@ -376,7 +376,8 @@ if (document.EffectiveApprovers.Webhook is { } webhookSettings)
         webhook = new WebhookApprovalChannel(
             webhookSettings.Endpoint,
             webhookSettings.ReadSecret(Environment.GetEnvironmentVariable),
-            WebhookApprovalChannel.CreateHandler());
+            WebhookApprovalChannel.CreateHandler(),
+            document.EffectiveScanners.EffectiveSecrets);
     }
     catch (PolicyException ex)
     {
@@ -400,7 +401,7 @@ const string UnnamedTool = "(missing)";
 // client, so it works the same on either transport.
 Func<McpServer, IApprovalChannel> approvalChannel = serve.Transport is Transport.Http
     ? _ => StatelessHttpApprovalChannel.Instance
-    : server => new ElicitationApprovalChannel(server);
+    : server => new ElicitationApprovalChannel(server, document.EffectiveScanners.EffectiveSecrets);
 
 // ---------------------------------------------------------------------------
 // STEP 3: serve the aggregated tools.

@@ -393,16 +393,6 @@ public sealed record InjectionReport(IReadOnlyList<string> Heuristics)
             return other;
         }
 
-        var merged = new List<string>(Heuristics);
-
-        foreach (var name in other.Heuristics)
-        {
-            if (!merged.Contains(name))
-            {
-                merged.Add(name);
-            }
-        }
-
-        return new InjectionReport(merged);
+        return new InjectionReport(ResultContent.OrderedUnion(Heuristics, other.Heuristics));
     }
 }

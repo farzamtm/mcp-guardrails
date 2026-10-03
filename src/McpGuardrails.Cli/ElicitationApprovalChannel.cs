@@ -1,5 +1,6 @@
 using System.Text.Json;
 using McpGuardrails.Core.Approval;
+using McpGuardrails.Core.Scanners;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
@@ -26,12 +27,18 @@ internal sealed class ElicitationApprovalChannel : IApprovalChannel
     private const string _approveField = "approve";
 
     private readonly McpServer _server;
+    private readonly SecretScannerSettings _redaction;
 
-    public ElicitationApprovalChannel(McpServer server)
+    // The redaction settings are required for the reason they are on the webhook
+    // channel: both channels show a human the same arguments, and a dialog that
+    // ignored pii: true would leak what the webhook payload withholds.
+    public ElicitationApprovalChannel(McpServer server, SecretScannerSettings redaction)
     {
         ArgumentNullException.ThrowIfNull(server);
+        ArgumentNullException.ThrowIfNull(redaction);
 
         _server = server;
+        _redaction = redaction;
     }
 
     public async ValueTask<ApprovalOutcome> RequestAsync(
@@ -57,7 +64,7 @@ internal sealed class ElicitationApprovalChannel : IApprovalChannel
                     // The question plus the call's arguments: the person at the
                     // client is otherwise approving a tool name, unable to see
                     // which path or what content they are saying yes to.
-                    Message = ApprovalArguments.Describe(request),
+                    Message = ApprovalArguments.Describe(request, _redaction),
                     RequestedSchema = new ElicitRequestParams.RequestSchema
                     {
                         Properties =

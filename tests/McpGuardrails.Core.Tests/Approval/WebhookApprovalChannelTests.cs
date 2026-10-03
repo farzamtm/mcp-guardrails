@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Tests.Policy;
 
 namespace McpGuardrails.Core.Tests.Approval;
@@ -62,8 +63,8 @@ public sealed class WebhookApprovalChannelTests
     private static HttpResponseMessage Json(HttpStatusCode status, string body) =>
         new(status) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
 
-    private static WebhookApprovalChannel Channel(HttpMessageHandler handler) =>
-        new(_endpoint, _secret, handler);
+    private static WebhookApprovalChannel Channel(HttpMessageHandler handler, SecretScannerSettings? redaction = null) =>
+        new(_endpoint, _secret, handler, redaction ?? SecretScannerSettings.Default);
 
     private static ApprovalRequest Request(
         IReadOnlyDictionary<string, JsonElement>? arguments = null,
@@ -253,7 +254,8 @@ public sealed class WebhookApprovalChannelTests
     public async Task TheSignature_ChangesWithTheSecret()
     {
         var handler = Decides("approve");
-        using var channel = new WebhookApprovalChannel(_endpoint, Encoding.UTF8.GetBytes("other"), handler);
+        using var channel = new WebhookApprovalChannel(
+            _endpoint, Encoding.UTF8.GetBytes("other"), handler, SecretScannerSettings.Default);
 
         await channel.RequestAsync(Request(), CancellationToken.None);
 
@@ -288,6 +290,29 @@ public sealed class WebhookApprovalChannelTests
             new DateTimeOffset(2026, 10, 1, 12, 5, 0, TimeSpan.Zero),
             root.GetProperty("deadline").GetDateTimeOffset());
         Assert.InRange(root.GetProperty("sent_at").GetDateTimeOffset(), before, DateTimeOffset.UtcNow);
+    }
+
+    [Fact]
+    public async Task TheBody_RedactsSensitiveFieldsAndPersonalData_AsThePolicyConfigures()
+    {
+        // The receiver is outside the proxy and keeps what it is sent, so it gets
+        // the same redaction the audit log does - including pii: true.
+        var handler = Decides("approve");
+        using var channel = Channel(handler, new SecretScannerSettings { Pii = true });
+
+        await channel.RequestAsync(
+            Request(TestArguments.From("""{"password": "correcthorse", "to": "ada@example.com"}""")),
+            CancellationToken.None);
+
+        using var json = JsonDocument.Parse(handler.Body!);
+        var arguments = json.RootElement.GetProperty("arguments");
+
+        Assert.DoesNotContain("correcthorse", handler.Body!, StringComparison.Ordinal);
+        Assert.DoesNotContain("ada@example.com", handler.Body!, StringComparison.Ordinal);
+        Assert.Equal(
+            SecretScanner.Marker(SecretScanner.SensitiveField),
+            arguments.GetProperty("password").GetString());
+        Assert.Equal(SecretScanner.Marker(SecretScanner.Email), arguments.GetProperty("to").GetString());
     }
 
     [Fact]
@@ -330,10 +355,11 @@ public sealed class WebhookApprovalChannelTests
     {
         using var handler = Decides("approve");
 
-        Assert.Throws<ArgumentNullException>(() => new WebhookApprovalChannel(null!, _secret, handler));
-        Assert.Throws<ArgumentNullException>(() => new WebhookApprovalChannel(_endpoint, null!, handler));
-        Assert.Throws<ArgumentNullException>(() => new WebhookApprovalChannel(_endpoint, _secret, null!));
-        Assert.Throws<ArgumentException>(() => new WebhookApprovalChannel(_endpoint, [], handler));
+        Assert.Throws<ArgumentNullException>(() => new WebhookApprovalChannel(null!, _secret, handler, SecretScannerSettings.Default));
+        Assert.Throws<ArgumentNullException>(() => new WebhookApprovalChannel(_endpoint, null!, handler, SecretScannerSettings.Default));
+        Assert.Throws<ArgumentNullException>(() => new WebhookApprovalChannel(_endpoint, _secret, null!, SecretScannerSettings.Default));
+        Assert.Throws<ArgumentException>(() => new WebhookApprovalChannel(_endpoint, [], handler, SecretScannerSettings.Default));
+        Assert.Throws<ArgumentNullException>(() => new WebhookApprovalChannel(_endpoint, _secret, handler, null!));
 
         using var channel = Channel(Decides("approve"));
         await Assert.ThrowsAsync<ArgumentNullException>(async () =>

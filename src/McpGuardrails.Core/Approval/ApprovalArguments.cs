@@ -52,17 +52,26 @@ public static class ApprovalArguments
     private static readonly JavaScriptEncoder _encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping;
 
     /// <summary>Shortens arguments to what an approver needs to see.</summary>
+    /// <param name="arguments">The arguments the agent sent, if any.</param>
+    /// <param name="secrets">
+    /// The secret scanner's settings, for whether personal data is redacted too.
+    /// </param>
     /// <remarks>
-    /// Secrets are redacted whatever <c>scanners.secrets</c> says: an approver
+    /// Credentials are redacted even with <c>scanners.secrets</c> off: an approver
     /// decides on the path and the shape of a call, never on a key's value, and
     /// both a webhook receiver and a client's dialog history are places outside
-    /// the proxy that keep what they were shown. Redacted before the cut, so
-    /// truncation cannot leave half a key the detectors no longer recognise. PII
-    /// is left alone: "which customer" is often the question.
+    /// the proxy that keep what they were shown. PII follows <c>pii:</c>, because
+    /// an operator who turned it on has said personal data must not leave the
+    /// proxy, and an approval channel is a way out like any other. Redacted before
+    /// the cut, so truncation cannot leave half a key the detectors no longer
+    /// recognise.
     /// </remarks>
     public static IReadOnlyDictionary<string, string>? Summarize(
-        IReadOnlyDictionary<string, JsonElement>? arguments)
+        IReadOnlyDictionary<string, JsonElement>? arguments,
+        SecretScannerSettings secrets)
     {
+        ArgumentNullException.ThrowIfNull(secrets);
+
         if (arguments is null)
         {
             return null;
@@ -72,13 +81,7 @@ public static class ApprovalArguments
 
         foreach (var (name, value) in arguments)
         {
-            // Strings unquoted, so a path reads as a path; anything else as the
-            // JSON the model sent, so an object or a number is not misrepresented.
-            var text = value.ValueKind is JsonValueKind.String
-                ? value.GetString()!
-                : value.GetRawText();
-
-            summary[name] = Truncate(SecretScanner.Redact(text, includePii: false).Text);
+            summary[name] = Truncate(SecretScanner.RedactForDisplay(value, name, secrets.IncludePii));
         }
 
         return summary;
@@ -94,20 +97,21 @@ public static class ApprovalArguments
     /// <c>prompt:</c> as much as to the generated question, because a prompt
     /// written in advance cannot say which path this particular call touches.
     /// </remarks>
-    public static string Describe(ApprovalRequest request)
+    public static string Describe(ApprovalRequest request, SecretScannerSettings secrets)
     {
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(secrets);
 
         if (request.Arguments is not { Count: > 0 })
         {
             return request.Question;
         }
 
-        return $"{request.Question}\n\n{Label}\n{Render(Summarize(request.Arguments)!)}";
+        return $"{request.Question}\n\n{Label}\n{Render(Summarize(request.Arguments, secrets)!, secrets.IncludePii)}";
     }
 
     /// <summary>Renders a summary as one line of JSON, within the length bound.</summary>
-    internal static string Render(IReadOnlyDictionary<string, string> summary)
+    internal static string Render(IReadOnlyDictionary<string, string> summary, bool includePii)
     {
         var json = new StringBuilder("{");
         var shown = 0;
@@ -117,7 +121,7 @@ public static class ApprovalArguments
             // Names are as model-controlled as values, so they get the same
             // redaction, cut and escaping - a "parameter name" is free text too.
             var pair =
-                $"\"{Encode(Truncate(SecretScanner.Redact(name, includePii: false).Text))}\": " +
+                $"\"{Encode(Truncate(SecretScanner.Redact(name, includePii).Text))}\": " +
                 $"\"{Encode(value)}\"";
 
             var separator = shown == 0 ? "" : ", ";
@@ -178,9 +182,7 @@ public static class ApprovalArguments
 
         // Never split a surrogate pair: half of one is not a character, and the
         // reader would get a replacement glyph or a decoding error instead.
-        var cut = char.IsHighSurrogate(text[MaxArgumentLength - 1])
-            ? MaxArgumentLength - 1
-            : MaxArgumentLength;
+        var cut = SurrogateSafe.HeadLength(text, MaxArgumentLength);
 
         return $"{text[..cut]}... ({text.Length - cut} more characters)";
     }

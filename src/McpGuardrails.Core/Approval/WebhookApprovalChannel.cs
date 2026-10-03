@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Serialization;
 
 namespace McpGuardrails.Core.Approval;
@@ -45,15 +46,26 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
     private readonly HttpClient _http;
     private readonly Uri _endpoint;
     private readonly byte[] _secret;
+    private readonly SecretScannerSettings _redaction;
 
     /// <param name="endpoint">Where to POST. Validated by the policy loader, not here.</param>
     /// <param name="secret">The HMAC-SHA256 key.</param>
     /// <param name="handler">The transport; <see cref="CreateHandler"/> in production.</param>
-    public WebhookApprovalChannel(Uri endpoint, byte[] secret, HttpMessageHandler handler)
+    /// <param name="redaction">
+    /// The secret scanner's settings, so the arguments in the payload are redacted
+    /// as the rest of the proxy redacts them. Required rather than defaulted: a
+    /// host that forgot it would send personal data the policy said to withhold.
+    /// </param>
+    public WebhookApprovalChannel(
+        Uri endpoint,
+        byte[] secret,
+        HttpMessageHandler handler,
+        SecretScannerSettings redaction)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
         ArgumentNullException.ThrowIfNull(secret);
         ArgumentNullException.ThrowIfNull(handler);
+        ArgumentNullException.ThrowIfNull(redaction);
 
         if (secret.Length == 0)
         {
@@ -62,6 +74,7 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
 
         _endpoint = endpoint;
         _secret = secret;
+        _redaction = redaction;
 
         _http = new HttpClient(handler, disposeHandler: true)
         {
@@ -157,7 +170,7 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
     internal string Sign(byte[] body) =>
         "sha256=" + Convert.ToHexStringLower(HMACSHA256.HashData(_secret, body));
 
-    private static WebhookApprovalPayload Payload(ApprovalRequest request) => new()
+    private WebhookApprovalPayload Payload(ApprovalRequest request) => new()
     {
         RequestId = request.RequestId,
         Tool = request.Tool,
@@ -166,7 +179,7 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
         Question = request.Question,
         // Shared with the in-band question, so the two channels redact and cut
         // identically; see ApprovalArguments for what is withheld and why.
-        Arguments = ApprovalArguments.Summarize(request.Arguments),
+        Arguments = ApprovalArguments.Summarize(request.Arguments, _redaction),
         SentAt = DateTimeOffset.UtcNow,
         Deadline = request.Deadline,
     };
