@@ -171,6 +171,6 @@ See [`examples/webhook-approval.yaml`](../examples/webhook-approval.yaml), and
 **Not implemented yet:** Slack approval is planned. Until it exists, `slack` is
 not a recognised `mode`, so `mode: slack` fails at load time like any other
 unknown value rather than being silently ignored: accepting configuration the
-proxy does not honour would show the operator a safeguard that does nothing. The Tasks/MRTR path the spec prefers
-— returning an `input_required` task instead of holding the request open — lands
-behind the same `IApprovalChannel` seam.
+proxy does not honour would show the operator a safeguard that does nothing.
+The Tasks/MRTR path — returning an `input_required` task instead of holding the
+request open — lands behind the same `IApprovalChannel` seam.

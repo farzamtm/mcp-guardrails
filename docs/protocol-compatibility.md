@@ -33,7 +33,7 @@ it is a complete MCP server to the client and a complete MCP client to each
 upstream, and each connection negotiates on its own
 ([`Program.cs`](../src/McpGuardrails.Cli/Program.cs),
 [`UpstreamRegistry.cs`](../src/McpGuardrails.Core/Upstream/UpstreamRegistry.cs)).
-That is the spec's "discovery-first, no handshake proxying" in practice, and it
+That is "discovery-first, no handshake proxying" in practice, and it
 is what lets a 2026-07-28 client use a 2025-06-18 server through the proxy: no
 negotiated state crosses from one side to the other. Capabilities are not merged
 either — the client sees the proxy's own (tools), not a union of the upstreams'.
@@ -107,9 +107,11 @@ negotiated, or sends them for the client to ignore, is **(unverified)**.
 
 ## Approval across the eras
 
-The spec plans three approval paths: MRTR/Tasks for modern clients, out-of-band
+The design has three approval paths: MRTR/Tasks for modern clients, out-of-band
 (Slack/webhook) for headless agents, and a "hold the request" fallback for
-initialize-era clients. **This build ships one: elicitation, held open.**
+initialize-era clients. **This build ships the webhook and, in band, elicitation
+held open.** The webhook never touches the client, so the rest of this section
+is about the in-band path.
 [`ElicitationApprovalChannel`](../src/McpGuardrails.Cli/ElicitationApprovalChannel.cs)
 asks with a single required boolean field `approve`, and
 [`ApprovalGate`](../src/McpGuardrails.Core/Approval/ApprovalGate.cs) owns the
@@ -138,8 +140,8 @@ takes, up to `timeout_s`. That is fine over stdio, where the proxy is a
 long-lived process anyway, and it is what the smoke test exercises. Its weak
 point is the client's own request timeout, which may well be shorter than five
 minutes — it varies by client and is **(unverified)** for any specific one. The
-spec's fallback design sends progress
-notifications to keep the request alive; **this build does not send any**, so a
+planned fallback sends progress notifications to keep the request alive;
+**this build does not send any**, so a
 `timeout_s` longer than the client's request timeout means the client cancels
 first. Keep `timeout_s` under your client's limit, or expect cancellations
 (which refuse the call — they do not forward it).
@@ -177,14 +179,12 @@ for the MRTR approval channel.
   request, so approval survives client timeouts and works without a persistent
   connection. It belongs behind the existing `IApprovalChannel` seam
   ([`IApprovalChannel.cs`](../src/McpGuardrails.Core/Approval/IApprovalChannel.cs)).
-  The `ModelContextProtocol.Extensions.Tasks` package the spec names is not
-  referenced.
+  The `ModelContextProtocol.Extensions.Tasks` package is not referenced yet.
 - **Slack approval** (`mode: slack`) — not a recognised mode, so rejected at
   load time today. Out-of-band approval through `mode: webhook` is implemented.
-- **Streamable HTTP.** Not hosted. When it is, note that the SDK refuses
-  `ElicitAsync` on stateless servers, which includes every 2026-07-28 HTTP
-  request — so over HTTP the current channel would fail closed for modern
-  clients, and the MRTR channel stops being optional.
+- **In-band approval over Streamable HTTP.** The SDK refuses `ElicitAsync` on
+  stateless servers, so it is refused today (see the table above). The MRTR
+  channel is what would make it work; until then, use `mode: webhook`.
 - **Forwarding progress, `listChanged`, resources and prompts.**
 
 ## Sources

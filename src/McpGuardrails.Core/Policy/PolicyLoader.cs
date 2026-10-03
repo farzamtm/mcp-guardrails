@@ -13,7 +13,7 @@ namespace McpGuardrails.Core.Policy;
 /// </summary>
 /// <remarks>
 /// The two-stage conversion (YAML to JsonNode to typed object) is deliberate and
-/// is the mitigation the spec calls for.
+/// is the mitigation for reflection under Native AOT.
 ///
 /// YamlDotNet's convenient path is its Deserializer, which binds straight onto
 /// your classes using reflection. Native AOT trims the metadata that depends on,

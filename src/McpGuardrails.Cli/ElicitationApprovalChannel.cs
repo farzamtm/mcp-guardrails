@@ -16,7 +16,7 @@ namespace McpGuardrails.Cli;
 /// a live client.
 ///
 /// Elicitation rather than the Tasks extension, for now. Tasks (MRTR) is the
-/// spec's preferred design and avoids holding a request open at all, but it needs
+/// preferred design and avoids holding a request open at all, but it needs
 /// a task-capable client on the other end; elicitation is in the SDK already and
 /// works with anything that implements the capability. The interface is the seam:
 /// an MRTR channel drops in beside this one.

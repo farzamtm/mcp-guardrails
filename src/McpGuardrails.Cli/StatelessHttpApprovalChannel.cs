@@ -17,7 +17,7 @@ namespace McpGuardrails.Cli;
 ///
 /// Over HTTP today, a rule that needs a human should use <c>mode: webhook</c>,
 /// which asks out of band and never needs the client. The Tasks/MRTR channel the
-/// spec plans is the way to make in-band approval work here; it plugs into the
+/// planned is the way to make in-band approval work here; it plugs into the
 /// same seam.
 /// </remarks>
 internal sealed class StatelessHttpApprovalChannel : IApprovalChannel

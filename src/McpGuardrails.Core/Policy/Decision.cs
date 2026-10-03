@@ -83,7 +83,7 @@ public sealed record Decision(
 {
     /// <summary>The decision used when no rule matches: allow, and say so.</summary>
     /// <remarks>
-    /// Default-allow is the deliberate product choice from the spec: an empty
+    /// Default-allow is a deliberate product choice: an empty
     /// policy file must behave as a pure passthrough with audit logging, so the
     /// proxy can be adopted before anyone writes a rule. Default-deny would be
     /// safer in the abstract and would guarantee nobody ever installs it.
