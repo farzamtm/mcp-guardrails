@@ -515,9 +515,10 @@ rejected; the signature is the authentication.
 See [`examples/webhook-approval.yaml`](examples/webhook-approval.yaml), and
 `scripts/smoke.py` for a 40-line receiver that verifies the signature.
 
-**Not implemented yet:** `mode: slack` is rejected at load time rather than
-silently ignored: accepting configuration the proxy does not honour would show
-the operator a safeguard that does nothing. The Tasks/MRTR path the spec prefers
+**Not implemented yet:** Slack approval is planned. Until it exists, `slack` is
+not a recognised `mode`, so `mode: slack` fails at load time like any other
+unknown value rather than being silently ignored: accepting configuration the
+proxy does not honour would show the operator a safeguard that does nothing. The Tasks/MRTR path the spec prefers
 — returning an `input_required` task instead of holding the request open — lands
 behind the same `IApprovalChannel` seam.
 
@@ -760,7 +761,8 @@ from it first, with the same detectors as [secret redaction](#secret-redaction)
 and even when `scanners.secrets.results` is `off`: the classifier never needs a
 real key to recognise an injection. `base_url` must be
 https. Plain http is accepted only for a loopback address, because the API key
-travels in a header.
+travels in a header. Credentials in the URL are rejected; the key belongs in
+the variable named by `api_key_env`.
 
 ## Secret redaction
 

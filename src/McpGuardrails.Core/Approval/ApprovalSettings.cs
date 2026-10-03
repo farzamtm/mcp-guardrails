@@ -18,10 +18,6 @@ public enum ApprovalMode
     [JsonStringEnumMemberName("in_band")]
     InBand,
 
-    /// <summary>Ask a Slack channel. Not implemented yet.</summary>
-    [JsonStringEnumMemberName("slack")]
-    Slack,
-
     /// <summary>
     /// POST the question to the endpoint in <c>approvers.webhook</c> and wait for its answer.
     /// </summary>
@@ -96,19 +92,6 @@ public sealed record ApprovalSettings
                 $"Rule '{ruleName}' has an unknown approval mode. Use in_band or webhook.");
         }
 
-        // The same honesty the budgets section applies to `daily:`. A Slack
-        // approver needs somewhere to send the question and a way to hear the
-        // answer back, neither of which exists yet - so accepting the
-        // configuration would leave an operator believing Slack was being asked
-        // when nothing was.
-        if (EffectiveMode is ApprovalMode.Slack)
-        {
-            throw new PolicyException(
-                $"Rule '{ruleName}' asks for '{Describe(EffectiveMode)}' approval, which is not " +
-                "implemented yet. Use 'in_band' (asking the human at the MCP client) or " +
-                "'webhook'; remove the mode rather than relying on an approver nobody notifies.");
-        }
-
         if (TimeoutSeconds is <= 0)
         {
             throw new PolicyException(
@@ -126,11 +109,4 @@ public sealed record ApprovalSettings
                 $"'{PolicyEvaluator.Describe(EffectiveOnTimeout)}'. Use allow or deny.");
         }
     }
-
-    internal static string Describe(ApprovalMode mode) => mode switch
-    {
-        ApprovalMode.Slack => "slack",
-        ApprovalMode.Webhook => "webhook",
-        _ => "in_band",
-    };
 }

@@ -48,7 +48,6 @@ public sealed class ApprovalChannelRouterTests
 
     [Theory]
     [InlineData(ApprovalMode.Webhook)]
-    [InlineData(ApprovalMode.Slack)]
     [InlineData((ApprovalMode)99)]
     public async Task AModeWithNoChannel_FailsInsteadOfAskingTheClient(ApprovalMode mode)
     {

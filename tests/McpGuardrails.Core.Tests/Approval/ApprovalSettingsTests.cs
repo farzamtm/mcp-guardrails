@@ -39,19 +39,6 @@ public sealed class ApprovalSettingsTests
     // ----------------------------------------------------------- validation
 
     [Fact]
-    public void Slack_IsRejectedRatherThanIgnored()
-    {
-        // Same honesty as budgets.daily. An operator who writes 'mode: slack'
-        // believes Slack is being asked; nothing notifies Slack, so the call
-        // would silently fall through to whatever the in-band path decided.
-        var error = Assert.Throws<PolicyException>(() =>
-            new ApprovalSettings { Mode = ApprovalMode.Slack }.Validate("approve-destructive"));
-
-        Assert.Contains("slack", error.Message, StringComparison.Ordinal);
-        Assert.Contains("not implemented yet", error.Message, StringComparison.Ordinal);
-    }
-
-    [Fact]
     public void Webhook_IsAccepted()
     {
         // Whether an endpoint is configured for it is the document's question,
@@ -92,13 +79,5 @@ public sealed class ApprovalSettingsTests
 
         Assert.Contains("on_timeout", error.Message, StringComparison.Ordinal);
         Assert.Contains("Use allow or deny", error.Message, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void ModeNames_AreTheOnesUsedInThePolicyFile()
-    {
-        Assert.Equal("in_band", ApprovalSettings.Describe(ApprovalMode.InBand));
-        Assert.Equal("slack", ApprovalSettings.Describe(ApprovalMode.Slack));
-        Assert.Equal("webhook", ApprovalSettings.Describe(ApprovalMode.Webhook));
     }
 }

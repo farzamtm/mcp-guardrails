@@ -83,14 +83,19 @@ public sealed record ScannerPolicy
     /// <summary>Validates the section, throwing with a message naming the problem.</summary>
     public void Validate()
     {
-        EffectiveInjection.Validate("injection");
+        EffectiveInjection.Validate();
         EffectiveSecrets.Validate();
     }
 }
 
 /// <summary>
-/// Settings for one scanner.
+/// Settings for the injection scanner.
 /// </summary>
+/// <remarks>
+/// Only <c>scanners.injection</c> uses this shape; secrets have their own
+/// <see cref="SecretScannerSettings"/>, so the metadata and classifier keys
+/// cannot appear anywhere they would be ignored.
+/// </remarks>
 public sealed record ScannerSettings
 {
     /// <summary>The settings used when the policy file says nothing.</summary>
@@ -166,49 +171,21 @@ public sealed record ScannerSettings
     [JsonIgnore]
     public bool UsesClassifier => !IsOff && Classifier is { IsOff: false };
 
-    internal void Validate(string scanner)
+    internal void Validate()
     {
         if (!Enum.IsDefined(EffectiveAction))
         {
             throw new PolicyException(
-                $"'scanners.{scanner}.action' is not a known action. " +
-                "Use annotate, block or off.");
+                "'scanners.injection.action' is not a known action. Use annotate, block or off.");
         }
 
-        if (Metadata is { } metadata)
-        {
-            // Tool metadata is scanned for injection, not for secrets; the key
-            // anywhere else would read like protection and be none.
-            if (scanner != "injection")
-            {
-                throw new PolicyException(
-                    $"'scanners.{scanner}.metadata' is not supported. Only the injection scanner " +
-                    "inspects tool metadata.");
-            }
-
-            if (!Enum.IsDefined(metadata))
-            {
-                throw new PolicyException(
-                    $"'scanners.{scanner}.metadata' is not a known action. " +
-                    "Use annotate, block or off.");
-            }
-        }
-
-        if (Classifier is null)
-        {
-            return;
-        }
-
-        // Only the injection scanner knows how to ask one. Accepting the block
-        // elsewhere would read like a configured second opinion and be none.
-        if (scanner != "injection")
+        if (Metadata is { } metadata && !Enum.IsDefined(metadata))
         {
             throw new PolicyException(
-                $"'scanners.{scanner}.classifier' is not supported. Only the injection scanner " +
-                "has a classifier stage.");
+                "'scanners.injection.metadata' is not a known action. Use annotate, block or off.");
         }
 
-        Classifier.Validate();
+        Classifier?.Validate();
     }
 }
 

@@ -39,7 +39,7 @@ public sealed class ApprovalChannelRouter : IApprovalChannel
         };
 
         // Policy validation should make this unreachable - a webhook rule needs
-        // an approvers.webhook section and slack is refused at load time. If it
+        // an approvers.webhook section and any other mode fails to parse. If it
         // is reached anyway, the answer is a denial, and specifically not a
         // fallback to asking the client: an operator who routed a rule to an
         // out-of-band approver did so because nobody is at the client.
