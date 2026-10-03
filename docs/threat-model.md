@@ -2,8 +2,8 @@
 
 What the proxy defends against, how, and — at least as important — what it does
 not. Every claim here describes the code as it stands on this branch, with a
-pointer to where it lives. Plans from [the spec](design-spec.md)
-are listed as plans, in [Not yet](#not-yet-planned), and nowhere else.
+pointer to where it lives. Planned work is listed as such, in
+[Not yet](#not-yet-planned), and nowhere else.
 
 [SECURITY.md](../SECURITY.md) has the short version and the reporting process.
 This is the long version.

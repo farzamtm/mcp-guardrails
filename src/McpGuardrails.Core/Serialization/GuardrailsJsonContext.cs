@@ -23,8 +23,8 @@ namespace McpGuardrails.Core.Serialization;
 /// serialization code at build time. You then serialize against a typed handle -
 /// GuardrailsJsonContext.Default.AuditRecord - instead of a Type.
 ///
-/// Adding it up front costs nothing. Retrofitting it in week 4, once every type
-/// assumes reflection works, is the painful path the spec warns about.
+/// Adding it up front costs nothing. Retrofitting it later, once every type
+/// assumes reflection works, is the painful path.
 ///
 /// C# notes:
 /// - `partial` means the compiler generates the other half of this class. The

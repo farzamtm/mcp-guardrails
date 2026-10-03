@@ -57,7 +57,7 @@ public sealed record ApprovalRequest(string Tool, string RuleName, string Questi
 /// Somewhere a yes/no question can be put to a human.
 /// </summary>
 /// <remarks>
-/// The seam the spec asks for. Two implementations today - the person at the MCP
+/// The approval seam. Two implementations today - the person at the MCP
 /// client through protocol elicitation, and an HTTP endpoint
 /// (<see cref="WebhookApprovalChannel"/>) - with <see cref="ApprovalChannelRouter"/>
 /// choosing between them per rule. A Slack approver arrives behind this interface
