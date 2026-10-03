@@ -4,13 +4,22 @@ namespace McpGuardrails.Core.Audit;
 /// Destination for audit records.
 /// </summary>
 /// <remarks>
-/// An interface rather than a concrete class because the spec calls for a second
-/// implementation (OpenTelemetry) alongside the JSONL file, and because tests
-/// want an in-memory one. This is the same swap-the-implementation shape the
-/// budget store will use in step 7.
+/// An interface rather than the JSONL sink itself so the call pipeline can be
+/// tested against an in-memory sink, including one that has failed. Spans and
+/// metrics are not a second sink: they go through ToolCallTelemetry, beside it.
 /// </remarks>
 public interface IAuditSink : IAsyncDisposable
 {
+    /// <summary>
+    /// True once records can no longer be written.
+    /// </summary>
+    /// <remarks>
+    /// Part of the contract rather than a JsonlAuditSink detail because the
+    /// pipeline refuses every call while it is true: a call forwarded with the log
+    /// broken would leave no evidence at all.
+    /// </remarks>
+    bool IsFaulted { get; }
+
     /// <summary>
     /// Records one audited event.
     /// </summary>

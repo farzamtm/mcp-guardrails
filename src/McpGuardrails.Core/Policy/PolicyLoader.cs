@@ -196,8 +196,8 @@ public static class PolicyLoader
     /// Style matters here. In YAML, <c>true</c> is a boolean but <c>"true"</c> is
     /// a string, and the parser preserves that distinction in
     /// <see cref="YamlScalarNode.Style"/>. Honouring it means a quoted value is
-    /// never silently retyped - which will matter in step 6, when annotation
-    /// matching compares against real booleans.
+    /// never silently retyped, which matters because annotation matching and
+    /// argument predicates compare against real booleans and numbers.
     /// </remarks>
     internal static JsonNode? ToJsonValue(YamlScalarNode scalar)
     {

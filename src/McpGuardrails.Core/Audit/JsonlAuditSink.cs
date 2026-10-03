@@ -106,10 +106,11 @@ public sealed class JsonlAuditSink : IAuditSink
         return new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
     }
 
-    /// <summary>
-    /// True once the log could not be written. From then on WriteAsync throws, and
-    /// callers that must not act unaudited should refuse before acting.
-    /// </summary>
+    /// <inheritdoc />
+    /// <remarks>
+    /// From then on WriteAsync throws, and callers that must not act unaudited
+    /// should refuse before acting.
+    /// </remarks>
     public bool IsFaulted => _fault is not null;
 
     /// <inheritdoc />

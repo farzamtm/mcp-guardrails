@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using McpGuardrails.Cli;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
@@ -21,19 +20,23 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
 // ---------------------------------------------------------------------------
-// STEP 3 - the pass-through proxy.
+// The composition root.
 //
 // The proxy is two things at once:
 //   - an MCP SERVER, which the client (Claude Desktop) talks to over stdio -
 //     or, with --transport http, over Streamable HTTP
 //   - an MCP CLIENT, which talks to the real downstream servers
 //
+// This file only wires them together. What happens to a tool call lives in
+// GuardrailsCallPipeline in Core, where it is unit-tested; this file is covered
+// end to end by scripts/smoke.py instead.
+//
 // This file is a "top-level program": C# allows bare statements as the entry
 // point, and generates the `class Program { static Main }` wrapper for you.
 // ---------------------------------------------------------------------------
 
-// A crude command switch. Step 11 replaces this with System.CommandLine; right
-// now an extra dependency would only obscure the MCP concepts.
+// A plain argument scan rather than a command-line parser: four flags and one
+// subcommand do not justify a dependency.
 var listOnly = args.Contains("list-upstream", StringComparer.Ordinal);
 
 // --explain appends the policy decision trail to every denial, so "why was this
@@ -73,21 +76,15 @@ var otel = args.Contains("--otel", StringComparer.Ordinal)
 
 // Reported as the MCP server version and as the OTel service.version, so a
 // trace and a client's server list agree on what was running.
-const string ProxyVersion = "0.1.0";
+var proxyVersion = ProxyVersion.Of(typeof(Program).Assembly);
 
 // Where the sandboxed filesystem server is allowed to operate.
 var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
               ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
 Directory.CreateDirectory(sandbox);
 
-// Where the audit log lands. A stable, discoverable default matters: launched
-// from Claude Desktop the process has no cwd you can predict, so a relative
-// path would scatter logs wherever the client happened to start us.
-var auditPath = Environment.GetEnvironmentVariable("GUARDRAILS_AUDIT")
-                ?? Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    ".mcp-guardrails",
-                    "audit.jsonl");
+// Where the audit log lands.
+var auditPath = ConfigPath("GUARDRAILS_AUDIT", "audit.jsonl");
 
 // Both builders implement IHostApplicationBuilder, so everything below - logging,
 // and above all the MCP server with its guardrail filters - is configured once,
@@ -117,8 +114,7 @@ else
 // This is the single most common way to break an stdio MCP server.
 // ---------------------------------------------------------------------------
 builder.Logging.ClearProviders();
-builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
-builder.Logging.SetMinimumLevel(listOnly ? LogLevel.Warning : LogLevel.Information);
+LogToStandardError(builder.Logging);
 
 // Created unconditionally: with no exporter attached the span and instruments
 // are inert, and the audit filter does not need a second code path.
@@ -143,7 +139,7 @@ if (otel)
 
     builder.Services.AddOpenTelemetry()
         .ConfigureResource(resource =>
-            resource.AddService("mcp-guardrails", serviceVersion: ProxyVersion))
+            resource.AddService("mcp-guardrails", serviceVersion: proxyVersion))
         .WithTracing(tracing => tracing
             .AddSource(ToolCallTelemetry.SourceName, McpSdkSource)
             .AddOtlpExporter())
@@ -152,11 +148,10 @@ if (otel)
             .AddOtlpExporter());
 }
 
-using var loggerFactory = LoggerFactory.Create(logging =>
-{
-    logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
-    logging.SetMinimumLevel(listOnly ? LogLevel.Warning : LogLevel.Information);
-});
+// A second factory for what runs before the host exists - connecting upstream,
+// the audit sink, startup warnings - configured identically, so a log line looks
+// the same whichever of the two wrote it.
+using var loggerFactory = LoggerFactory.Create(LogToStandardError);
 
 // ---------------------------------------------------------------------------
 // Connect to every downstream server and cache the tools they advertise.
@@ -181,11 +176,7 @@ await using var audit = new JsonlAuditSink(
 // logging, which is the adoption story. A MALFORMED file is fatal - failing
 // open on a broken security policy is exactly the wrong default.
 // ---------------------------------------------------------------------------
-var policyPath = Environment.GetEnvironmentVariable("GUARDRAILS_POLICY")
-                 ?? Path.Combine(
-                     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                     ".mcp-guardrails",
-                     "policy.yaml");
+var policyPath = ConfigPath("GUARDRAILS_POLICY", "policy.yaml");
 
 // One client for the life of the process, as HttpClient is designed to be used.
 // Infinite timeout because the injection gate owns the classifier deadline;
@@ -290,60 +281,10 @@ foreach (var finding in toolMetadata.Findings)
             : "its description is prefixed with a warning");
 }
 
-// Where daily budget counters persist. An environment variable like the audit
-// and policy paths, not a policy key: the policy says what the limits are, the
-// deployment says where state lives - and two agents sharing one policy file
-// may well want separate daily budgets. Every proxy pointed at the same file
-// shares one budget. Only opened when `budgets.daily` is configured.
-var budgetDbPath = Environment.GetEnvironmentVariable("GUARDRAILS_BUDGET_DB")
-                   ?? Path.Combine(
-                       Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                       ".mcp-guardrails",
-                       "budgets.db");
-
-// Captured so it can be disposed on exit; null when no daily cap is configured.
-SqliteBudgetStore? dailyStore = null;
-BudgetGate budget;
-
-// list-upstream only prints tools, so it must not create a database file - the
-// example-policy check in CI runs exactly this.
-if (listOnly)
-{
-    budget = BudgetGate.Unlimited;
-}
-else
-{
-    try
-    {
-        // No `budgets:` section means an unlimited gate rather than no gate: the
-        // call path is then the same whether or not anyone configured a cap, so
-        // the configured path is not the one that only ever runs in production.
-        budget = BudgetGate.For(budgets, limits => dailyStore = new SqliteBudgetStore(budgetDbPath, limits));
-    }
-    catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
-    {
-        // Fatal, like a malformed policy: running without the daily cap the
-        // operator asked for would be failing open.
-        await Console.Error.WriteLineAsync($"Cannot open budget store '{budgetDbPath}': {ex.Message}");
-        return 1;
-    }
-}
-
-using var dailyStoreLifetime = dailyStore;
-
-// One audit line per flagged tool, written here - after list-upstream has had
-// its chance to return - so listing tools never adds lines to the operator's log.
-if (!listOnly)
-{
-    foreach (var finding in toolMetadata.Findings)
-    {
-        await audit.WriteAsync(finding.ToAuditRecord(DateTimeOffset.UtcNow), CancellationToken.None);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// STEP 2 demo: print what we discovered downstream, then exit.
-// ---------------------------------------------------------------------------
+// list-upstream only prints what the servers advertise, then exits - before the
+// budget store is opened, so it creates no database file (the example-policy
+// check in CI runs exactly this), and before the metadata findings are audited,
+// so listing tools never adds lines to the operator's log.
 if (listOnly)
 {
     foreach (var connection in upstream.Connections)
@@ -356,6 +297,40 @@ if (listOnly)
     }
 
     return 0;
+}
+
+// Where daily budget counters persist. An environment variable like the audit
+// and policy paths, not a policy key: the policy says what the limits are, the
+// deployment says where state lives - and two agents sharing one policy file
+// may well want separate daily budgets. Every proxy pointed at the same file
+// shares one budget. Only opened when `budgets.daily` is configured.
+var budgetDbPath = ConfigPath("GUARDRAILS_BUDGET_DB", "budgets.db");
+
+// Captured so it can be disposed on exit; null when no daily cap is configured.
+SqliteBudgetStore? dailyStore = null;
+BudgetGate budget;
+
+try
+{
+    // No `budgets:` section means an unlimited gate rather than no gate: the
+    // call path is then the same whether or not anyone configured a cap, so
+    // the configured path is not the one that only ever runs in production.
+    budget = BudgetGate.For(budgets, limits => dailyStore = new SqliteBudgetStore(budgetDbPath, limits));
+}
+catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
+{
+    // Fatal, like a malformed policy: running without the daily cap the
+    // operator asked for would be failing open.
+    await Console.Error.WriteLineAsync($"Cannot open budget store '{budgetDbPath}': {ex.Message}");
+    return 1;
+}
+
+using var dailyStoreLifetime = dailyStore;
+
+// One audit line per flagged tool.
+foreach (var finding in toolMetadata.Findings)
+{
+    await audit.WriteAsync(finding.ToAuditRecord(DateTimeOffset.UtcNow), CancellationToken.None);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,12 +363,6 @@ if (document.EffectiveApprovers.Webhook is { } webhookSettings)
 
 using var webhookLifetime = webhook;
 
-// The name a call is known by when the client did not send one. Shared by the
-// audit filter and the policy filter on purpose: if they disagreed, the log and
-// the policy would describe different calls, in exactly the malformed-traffic
-// case where someone reading the log afterwards most needs to trust it.
-const string UnnamedTool = "(missing)";
-
 // Who an in-band require_approval call is put to. Over stdio, the human at the
 // client via elicitation. Over stateless HTTP there is no channel back to the
 // client, so the answer is "nobody", given immediately - see
@@ -403,304 +372,38 @@ Func<McpServer, IApprovalChannel> approvalChannel = serve.Transport is Transport
     ? _ => StatelessHttpApprovalChannel.Instance
     : server => new ElicitationApprovalChannel(server, document.EffectiveScanners.EffectiveSecrets);
 
+var pipeline = new GuardrailsCallPipeline(
+    upstream,
+    audit,
+    telemetry,
+    policy,
+    toolMetadata,
+    secrets,
+    budget,
+    scanner,
+    webhook,
+    explain);
+
 // ---------------------------------------------------------------------------
-// STEP 3: serve the aggregated tools.
+// Serve the aggregated tools.
 //
-// Instead of registering tools of our own, we supply two handlers:
-//
-//   WithListToolsHandler - merges every downstream tool list into one, with
-//                          names rewritten into the proxy's namespace
-//   WithCallToolHandler  - routes an incoming call to the owning server
-//
-// Both are pure pass-through. Every guardrail in the spec - policy, budget,
-// approval, scanning, redaction - is a filter wrapped around these.
+// Instead of registering tools of our own, we supply two handlers - the merged
+// tool list and the forward - and one call filter wrapped around the forward
+// that runs every guardrail. The filter is the only place SDK request types
+// meet the pipeline, which takes plain protocol DTOs so it can be tested
+// without a live session.
 // ---------------------------------------------------------------------------
 var mcp = builder.Services
     .AddMcpServer(options =>
     {
-        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = ProxyVersion };
+        options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = proxyVersion };
 
-        // -------------------------------------------------------------------
-        // THE INTERCEPTOR PIPELINE.
-        //
-        // A filter takes the next handler and returns a replacement wrapping it.
-        // That is the whole middleware pattern - ASP.NET, Express and servlet
-        // filters are all this shape:
-        //
-        //     next => async (request, ct) => { before; await next(...); after; }
-        //
-        // Filters nest like onion layers, so the FIRST one added is the
-        // outermost. Audit goes on first deliberately: it must observe calls
-        // that inner layers (policy, budget, approval) reject, otherwise the
-        // log would only show what was permitted.
-        // -------------------------------------------------------------------
-        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
-        {
-            // Opens the per-call scope that lets the policy filter below report
-            // its decision back up to this one. See GuardrailsCallScope for why
-            // a mutable holder is required rather than a plain AsyncLocal value.
-            using var scope = GuardrailsCallScope.Begin();
-
-            var toolName = request.Params?.Name ?? UnnamedTool;
-
-            // Fail closed: with the log broken, a forwarded call would leave no
-            // evidence at all. Refuse BEFORE forwarding - the sink would throw
-            // afterwards anyway, but only once the downstream action had run.
-            if (audit.IsFaulted)
-            {
-                return new CallToolResult
-                {
-                    IsError = true,
-                    Content = [new TextContentBlock
-                    {
-                        Text = $"Refused '{toolName}': the guardrails audit log cannot be written, " +
-                               "so no tool calls are being forwarded. This needs an operator.",
-                    }],
-                };
-            }
-
-            // Resolve purely to enrich the log. The call handler resolves again
-            // to actually route; duplicating a dictionary lookup is cheaper than
-            // coupling the two concerns together.
-            var resolved = upstream.TryResolve(toolName, out var connection, out var downstreamName);
-
-            // Opened before `next` so policy, approval and the downstream call
-            // all run inside the span, and the SDK's client span for the forward
-            // nests under it rather than becoming a sibling.
-            using var span = telemetry.Start(
-                toolName,
-                resolved ? connection.Name : null,
-                resolved ? downstreamName : null);
-
-            // Scanned here, before anything runs, rather than taken from the
-            // filters inside: a call the policy refuses never reaches them, and
-            // its arguments are exactly as likely to hold a key. Before `next`,
-            // too, because the redaction filter may rewrite the arguments in
-            // place and this must see what the model actually sent.
-            var arguments = secrets.ScanArguments(request.Params?.Arguments);
-
-            // Stopwatch timestamps rather than DateTime subtraction: this reads a
-            // monotonic clock, so an NTP correction mid-call cannot produce a
-            // negative duration.
-            var startedAt = Stopwatch.GetTimestamp();
-
-            CallToolResult? result = null;
-            Exception? thrown = null;
-
-            try
-            {
-                result = await next(request, cancellationToken);
-                return result;
-            }
-            catch (Exception ex)
-            {
-                // Record the failure, then rethrow. The audit sink observes; it
-                // must never change the outcome of a call.
-                thrown = ex;
-                throw;
-            }
-            finally
-            {
-                var decision = scope.Decision;
-                var elapsed = Stopwatch.GetElapsedTime(startedAt);
-                var failure = thrown is null ? null : $"{thrown.GetType().Name}: {thrown.Message}";
-
-                var record = new AuditRecord
-                {
-                    Timestamp = DateTimeOffset.UtcNow,
-                    Event = "tool_call",
-                    Tool = toolName,
-                    Server = resolved ? connection.Name : null,
-                    DownstreamTool = resolved ? downstreamName : null,
-                    Arguments = arguments.Redacted,
-                    Decision = decision?.Verdict.ToWireName(),
-                    Rule = decision?.RuleName,
-                    DecisionReason = decision?.Reason,
-                    Approval = decision?.ApprovalResult?.ToWireName(),
-                    // Null unless something matched, so a clean result stays one
-                    // narrow line and `jq 'select(.scanner_hits)'` is the whole
-                    // query for "show me what the scanner caught".
-                    ScannerHits = scope.Scan is { Effect: not ScanEffect.None } scan
-                        ? scan.Heuristics
-                        : null,
-                    ScannerAction = scope.Scan?.Describe(),
-                    ScannerStructuredContentWithheld =
-                        scope.Scan is { StructuredContentWithheld: true } ? true : null,
-                    Classifier = scope.Scan?.Classifier?.Describe(),
-                    ClassifierTruncated = scope.Scan?.Classifier is { Truncated: true } ? true : null,
-                    ClassifierError = scope.Scan?.Classifier?.Error,
-                    ArgumentSecrets = arguments.Report.IsClean ? null : arguments.Report.Detectors,
-                    ArgumentSecretsAction = secrets.DescribeArguments(arguments, decision),
-                    ResultSecrets = scope.Redaction is { Effect: not RedactionEffect.None } redaction
-                        ? redaction.Report.Detectors
-                        : null,
-                    ResultSecretsAction = scope.Redaction?.Describe(),
-                    DurationMs = elapsed.TotalMilliseconds,
-                    IsError = failure is not null || result?.IsError is true,
-                    Error = failure,
-                };
-
-                // Same duration and decision as the record, so a dashboard and
-                // the log never disagree about the same call.
-                span.Complete(decision, elapsed, result?.IsError is true, thrown);
-
-                // CancellationToken.None on purpose: if the caller cancelled, we
-                // still want the record. Losing the evidence of an aborted call
-                // is exactly the case an audit log exists for.
-                await audit.WriteAsync(record, CancellationToken.None);
-            }
-        });
-
-        // -------------------------------------------------------------------
-        // POLICY AND BUDGET FILTER - registered second, so it sits INSIDE audit.
-        //
-        // That ordering is the point: when this filter refuses a call it returns
-        // without invoking `next`, so nothing downstream runs - but the audit
-        // filter wrapping it still records the attempt.
-        // -------------------------------------------------------------------
-        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
-        {
-            var toolName = request.Params?.Name ?? UnnamedTool;
-
-            // The tool definition carries the annotations rules match on. An
-            // unknown name yields null, and policy still runs: a catch-all deny
-            // has to cover calls the proxy was going to reject anyway, or the
-            // audit log and the policy would tell different stories.
-            upstream.TryGetTool(toolName, out var tool);
-
-            // The owning server is not matched on, but an out-of-band approver
-            // shows it: "fs" or "prod-db" changes what a human says to a delete.
-            //
-            // Resolving also tells the budget whether the call can be forwarded
-            // at all: an unknown tool ends at the call handler's error, so it is
-            // not charged. Policy, secrets and approval still see it, and audit
-            // still records it. The registry is immutable after startup, so the
-            // handler cannot resolve a name this lookup did not - no call is
-            // forwarded uncharged.
-            var resolved = upstream.TryResolve(toolName, out var owner, out _);
-            var server = resolved ? owner.Name : null;
-
-            var facts = PolicyFacts.ForCall(toolName, request.Params, tool, server);
-
-            // Five gates, in this order, and the order is the design.
-            //
-            // The policy decides whether the call is permitted at all. The
-            // metadata scanner refuses a tool it withheld from tools/list. The
-            // secret scanner, under `arguments: block`, refuses a call carrying a
-            // credential - before approval, so nobody is asked to approve a call
-            // that will be refused, and so a human who approves a harmless-looking
-            // write is not also approving the key buried in its content. Approval
-            // turns a 'require_approval' verdict into a real answer from a real
-            // human - which can only happen before the budget runs, because a
-            // call waiting on a person has not been forwarded and must not be
-            // charged. Budget then decides whether there is anything left to
-            // spend on the call that is finally going out.
-            var decision = policy.Evaluate(facts, explain);
-
-            // Refused, not merely left off the list: a client with a stale list,
-            // or a model that guessed the name, must not reach it.
-            decision = toolMetadata.Apply(decision, toolName);
-
-            decision = secrets.Apply(decision, request.Params?.Arguments);
-
-            // Recorded now as well as at the end, because the approval wait can
-            // end in cancellation - the client hanging up - which propagates as
-            // an exception past the line below. The audit record of an abandoned
-            // call should still say what had been decided (typically
-            // require_approval), not carry no decision at all.
-            GuardrailsCallScope.RecordDecision(decision);
-
-            decision = await ApprovalGate.ApplyAsync(
-                decision,
-                facts,
-                new ApprovalChannelRouter(
-                    approvalChannel(request.Server),
-                    webhook),
-                cancellationToken);
-
-            decision = budget.Apply(decision, resolved);
-
-            // Report upward so the audit record carries the verdict.
-            GuardrailsCallScope.RecordDecision(decision);
-
-            if (!decision.IsBlocked)
-            {
-                return await next(request, cancellationToken);
-            }
-
-            // A refusal is returned as a tool ERROR, not a JSON-RPC protocol
-            // error. Protocol errors are for malformed traffic; this is a result
-            // the model should read and adapt to. That is why the message is
-            // written for the model rather than for a log file.
-            var text = decision.ToModelMessage();
-
-            if (explain && decision.Trail is { Count: > 0 })
-            {
-                text += "\n\nDecision trail:\n  " + string.Join("\n  ", decision.Trail);
-            }
-
-            return new CallToolResult
-            {
-                IsError = true,
-                Content = [new TextContentBlock { Text = text }],
-            };
-        });
-
-        // -------------------------------------------------------------------
-        // SECRET REDACTION - registered after the gates and before the result
-        // scanner, which puts both of its halves where the spec puts them.
-        //
-        // On the way in it runs after every gate has said yes, so the policy
-        // judged the real arguments and only the copy that leaves is redacted.
-        // On the way back it runs after the injection scanner, so it is the last
-        // thing to touch a result before the model reads it - and, like that
-        // scanner, it never sees the proxy's own refusals.
-        // -------------------------------------------------------------------
-        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
-        {
-            if (request.Params is { } parameters &&
-                secrets.RedactForwarded(parameters.Arguments) is { } redacted)
-            {
-                parameters.Arguments = redacted;
-            }
-
-            var result = await next(request, cancellationToken);
-
-            var outcome = secrets.Inspect(result, request.Params?.Name ?? UnnamedTool);
-
-            GuardrailsCallScope.RecordRedaction(outcome);
-
-            return outcome.Result;
-        });
-
-        // -------------------------------------------------------------------
-        // RESULT SCANNER - registered last, so it is the INNERMOST layer.
-        //
-        // Everything above this point guards the way in. This one is the first
-        // guardrail that runs on the way back, and innermost is the only correct
-        // position for it: it must see what a downstream server actually
-        // returned, and must not see the refusals the gates above it produce -
-        // those are the proxy's own words, addressed to the model.
-        // -------------------------------------------------------------------
-        options.Filters.Request.CallToolFilters.Add(next => async (request, cancellationToken) =>
-        {
-            var result = await next(request, cancellationToken);
-
-            // Async because the optional classifier is a network call. Without
-            // one configured this completes synchronously and costs what Inspect
-            // did. Classifier failures never surface here - the gate turns them
-            // into "the heuristic verdict stands" and records why.
-            var outcome = await scanner.InspectAsync(
-                result,
-                request.Params?.Name ?? UnnamedTool,
-                cancellationToken);
-
-            // Report upward so the audit record carries the finding, exactly as
-            // the policy filter reports its decision.
-            GuardrailsCallScope.RecordScan(outcome);
-
-            return outcome.Result;
-        });
+        options.Filters.Request.CallToolFilters.Add(next => (request, cancellationToken) =>
+            pipeline.InvokeAsync(
+                request.Params,
+                approvalChannel(request.Server),
+                forwardToken => next(request, forwardToken),
+                cancellationToken));
     })
     .WithListToolsHandler((_, _) =>
     {
@@ -714,38 +417,8 @@ var mcp = builder.Services
         // the finished value rather than paying for a state machine.
         return ValueTask.FromResult(new ListToolsResult { Tools = tools });
     })
-    .WithCallToolHandler(async (request, cancellationToken) =>
-    {
-        var requestedName = request.Params?.Name;
-
-        if (requestedName is null ||
-            !upstream.TryResolve(requestedName, out var connection, out var downstreamName))
-        {
-            // Return a tool ERROR, not a JSON-RPC protocol error. This is a
-            // deliberate distinction: protocol errors are for malformed traffic,
-            // whereas "that tool does not exist" is a result the model should
-            // read and react to. The same reasoning drives the model-readable
-            // denial messages the policy engine will produce in step 5.
-            return new CallToolResult
-            {
-                IsError = true,
-                Content = [new TextContentBlock { Text = $"Unknown tool '{requestedName}'." }],
-            };
-        }
-
-        // -------------------------------------------------------------------
-        // THE FORWARD. Everything before this line is "on the way in", and
-        // everything after it is "on the way back" - the two halves of the
-        // interceptor pipeline in the spec.
-        // -------------------------------------------------------------------
-        return await connection.Client.CallToolAsync(
-            new CallToolRequestParams
-            {
-                Name = downstreamName,
-                Arguments = request.Params?.Arguments,
-            },
-            cancellationToken);
-    });
+    .WithCallToolHandler((request, cancellationToken) =>
+        pipeline.ForwardAsync(request.Params, cancellationToken));
 
 if (web is not null)
 {
@@ -763,3 +436,22 @@ else
 }
 
 return 0;
+
+// Every log line goes to stderr - see the stdout warning above. list-upstream
+// prints its listing to stdout and wants only warnings beside it.
+void LogToStandardError(ILoggingBuilder logging)
+{
+    logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
+    logging.SetMinimumLevel(listOnly ? LogLevel.Warning : LogLevel.Information);
+}
+
+// The deployment's choice of file, else a stable default under the home
+// directory. Stable matters: launched from Claude Desktop the process has no cwd
+// you can predict, so a relative default would scatter files wherever the client
+// happened to start us.
+static string ConfigPath(string variable, string fileName) =>
+    Environment.GetEnvironmentVariable(variable)
+    ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".mcp-guardrails",
+        fileName);

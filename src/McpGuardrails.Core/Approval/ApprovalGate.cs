@@ -14,7 +14,8 @@ namespace McpGuardrails.Core.Approval;
 /// makes it billable.
 ///
 /// The gate owns the deadline rather than the channel, so every approver - the
-/// client, a webhook, Slack later - inherits the same semantics for "nobody answered".
+/// client, a webhook, any channel added beside them - inherits the same semantics
+/// for "nobody answered".
 /// </remarks>
 public static class ApprovalGate
 {

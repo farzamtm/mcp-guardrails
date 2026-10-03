@@ -40,7 +40,7 @@ public static class ToolNamespacer
     /// Tool is a plain mutable DTO rather than a record, so there is no `with`
     /// expression available and the copy has to be spelled out. Every field is
     /// carried over deliberately - especially Annotations, which is what the
-    /// policy engine matches destructiveHint/readOnlyHint on in step 5.
+    /// policy engine matches destructiveHint/readOnlyHint on.
     /// </remarks>
     public static Tool Qualify(string serverName, Tool tool)
     {

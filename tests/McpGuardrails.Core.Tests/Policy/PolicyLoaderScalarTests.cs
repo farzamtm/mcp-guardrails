@@ -8,9 +8,9 @@ namespace McpGuardrails.Core.Tests.Policy;
 /// <remarks>
 /// The scalar typing rules are exercised through extra keys that the policy
 /// schema ignores. That is deliberate: the conversion runs over the whole
-/// document regardless of schema, and step 6 will introduce real boolean and
-/// numeric fields (annotation matching, JSONPath comparisons) that depend on
-/// these branches being right.
+/// document regardless of schema, and the real boolean and numeric fields
+/// (annotation matching, JSONPath comparisons) depend on these branches being
+/// right.
 /// </remarks>
 public sealed class PolicyLoaderScalarTests : IDisposable
 {
