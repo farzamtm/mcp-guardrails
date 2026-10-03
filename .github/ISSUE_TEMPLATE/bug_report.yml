@@ -1,0 +1,39 @@
+name: Bug report
+description: Something the proxy does wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Found a way past a guardrail?** That is a vulnerability, not a bug.
+        Please report it privately as described in SECURITY.md instead of here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >-
+        The policy file (trimmed to the rules involved), the tool call, and the
+        relevant audit log lines. Remove anything sensitive first.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0, or a commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, install method (binary, dotnet tool, Docker, source), transport, MCP client.
+      placeholder: macOS 15, source build, stdio, Claude Desktop
