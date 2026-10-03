@@ -72,6 +72,8 @@ HTTP_FILE = f"{SANDBOX}/smoke-http.yaml"
 HTTP_PROBE = f"{SANDBOX}/smoke-http.txt"
 HTTP_OVER = f"{SANDBOX}/smoke-http-over.txt"
 HTTP_UNAPPROVED = f"{SANDBOX}/smoke-http-unapproved.txt"
+HTTP_DB = f"{SANDBOX}/smoke-http-budgets.db"
+HTTP_SESSION_FILE = f"{SANDBOX}/smoke-http-session.yaml"
 WEBHOOK_AUDIT = f"{SANDBOX}/audit-webhook.jsonl"
 WEBHOOK_FILE = f"{SANDBOX}/smoke-webhook.yaml"
 WEBHOOK_PROBE = f"{SANDBOX}/smoke-webhook-approved.txt"
@@ -378,11 +380,12 @@ rules:
 # the stdio phases prove those - but that HTTP runs the identical pipeline.
 #
 # max_calls: 3 is reached across separate HTTP requests: in stateless mode every
-# request is a fresh server, so a cap that still bites proves the budget lives in
-# the process, not in a session that no longer exists.
+# request is a fresh server, so a cap that still bites proves the budget is not
+# kept in a per-request server that no longer exists. It is a daily cap because
+# that is the only kind HTTP accepts - see HTTP_SESSION_POLICY.
 HTTP_POLICY = f"""
 budgets:
-  session:
+  daily:
     max_calls: 3
 
 rules:
@@ -414,6 +417,14 @@ rules:
       tool: fs__write_*
     decision: deny
     message: Write inside the sandbox instead.
+"""
+
+# A session cap over stateless HTTP has no session to attach to and would become
+# one pool shared by every client, so the proxy must refuse to start with it.
+HTTP_SESSION_POLICY = """
+budgets:
+  session:
+    max_calls: 3
 """
 
 
@@ -942,7 +953,7 @@ HTTP_CHECKS: list[tuple[dict, str, object]] = [
     (
         call(7, "fs__write_file", {"path": HTTP_OVER, "content": CONTENT}),
         "HTTP: the budget spans stateless requests and refuses the fourth",
-        lambda r: denied_with(r, "session.max_calls"),
+        lambda r: denied_with(r, "daily.max_calls"),
     ),
 ]
 
@@ -983,6 +994,11 @@ def main() -> int:
         HTTP_PROBE,
         HTTP_OVER,
         HTTP_UNAPPROVED,
+        # A day's spend left over from an earlier run today would refuse the
+        # phase's allowed calls before the cap is reached on purpose.
+        HTTP_DB,
+        f"{HTTP_DB}-wal",
+        f"{HTTP_DB}-shm",
         WEBHOOK_AUDIT,
         WEBHOOK_PROBE,
         WEBHOOK_REFUSED,
@@ -1016,6 +1032,8 @@ def main() -> int:
             handle.write(APPROVAL_POLICY)
         with open(HTTP_FILE, "w", encoding="utf-8") as handle:
             handle.write(HTTP_POLICY)
+        with open(HTTP_SESSION_FILE, "w", encoding="utf-8") as handle:
+            handle.write(HTTP_SESSION_POLICY)
         with open(SCAN_BLOCK_FILE, "w", encoding="utf-8") as handle:
             handle.write(SCAN_BLOCK_POLICY)
         with open(SECRET_REDACT_FILE, "w", encoding="utf-8") as handle:
@@ -1182,10 +1200,14 @@ def main() -> int:
             "GUARDRAILS_AUDIT": HTTP_AUDIT,
             "GUARDRAILS_POLICY": HTTP_FILE,
             "GUARDRAILS_HTTP_TOKEN": HTTP_TOKEN,
+            # Its own file, so the phase neither inherits the developer's real
+            # daily spend nor shares the day with the restart phase above.
+            "GUARDRAILS_BUDGET_DB": HTTP_DB,
         },
     )
     failures += http_failures
     failures += check_http_audit_log()
+    failures += check_http_refuses_session_budget()
 
     for path, label in (
         (HTTP_UNAPPROVED, "HTTP: the unapprovable write never reached the disk"),
@@ -1653,7 +1675,7 @@ def check_http_audit_log() -> int:
     )
     rules = {entry.get("rule") for entry in lines if entry.get("decision") == "deny"}
     expect(
-        rules == {"deny-sandbox-escape", "approve-unapproved", "session.max_calls"},
+        rules == {"deny-sandbox-escape", "approve-unapproved", "daily.max_calls"},
         "HTTP: audit names the policy, approval and budget refusals "
         f"(got {sorted(r or '' for r in rules)})",
     )
@@ -1663,6 +1685,43 @@ def check_http_audit_log() -> int:
     )
 
     return failures
+
+
+def check_http_refuses_session_budget() -> int:
+    """A session budget over HTTP must stop the proxy, not quietly go global."""
+    proc = subprocess.run(
+        [BIN, "--transport", "http", "--port", "0"],
+        input="",
+        capture_output=True,
+        text=True,
+        # Generous for the same reason as run_http_session: the refusal comes
+        # after the downstream servers are spawned.
+        timeout=120,
+        env={
+            **os.environ,
+            "GUARDRAILS_SANDBOX": SANDBOX,
+            "GUARDRAILS_AUDIT": HTTP_AUDIT,
+            "GUARDRAILS_POLICY": HTTP_SESSION_FILE,
+            "GUARDRAILS_HTTP_TOKEN": HTTP_TOKEN,
+            "GUARDRAILS_BUDGET_DB": HTTP_DB,
+        },
+        check=False,
+    )
+    refusal = "'budgets.session' cannot be enforced over '--transport http'"
+    ok = (
+        proc.returncode == 2
+        and refusal in proc.stderr
+        and "'budgets.daily'" in proc.stderr
+    )
+    print(
+        f"{'PASS' if ok else 'FAIL'}  "
+        "HTTP: a session budget is a startup error (exit 2) pointing at budgets.daily"
+    )
+    if not ok:
+        print(f"  exit={proc.returncode}")
+        print(proc.stderr[-700:])
+
+    return 0 if ok else 1
 
 
 def check_policy_audit_log() -> int:

@@ -282,7 +282,9 @@ What gets charged, and when:
   (`session.max_cost`) rather than a policy rule.
 
 **`session` means this process.** An stdio proxy is spawned per client session,
-so the counters live in memory and start again with the next session.
+so the counters live in memory and start again with the next session. Over
+[Streamable HTTP](#streamable-http) there is no session to attach them to, so a
+`session:` cap there is a startup error — use `daily:`.
 
 **`daily` means one UTC day, across every session.** A daily cap that reset
 whenever the client reconnected would be a limit an agent defeats by being
@@ -850,8 +852,12 @@ filter, with only the listener swapped — so audit, policy, budget and approval
 apply identically, with two differences worth knowing:
 
 - **Approval cannot ask anyone** (see [Approval](#approval)): it fails closed.
-- **The session budget is per process**, shared by every request and client:
-  stateless HTTP has no session, so "session" means "since the proxy started".
+- **`budgets.session` is refused.** Stateless HTTP has no session, so a session
+  cap could only be one pool shared by every client for the life of the
+  process — not the limit it says it is. The proxy will not start with one; cap
+  HTTP with `budgets.daily` (persisted, and process-wide by design: every proxy
+  pointed at the same `GUARDRAILS_BUDGET_DB` shares it), or serve over stdio.
+  Per-rule `cost:` works with a daily cap alone.
 
 **There is no user authentication. Do not expose it.** Out of the box it binds
 `127.0.0.1` only, and anything that can reach the port can call every
@@ -870,7 +876,7 @@ McpGuardrails.Cli --transport http --bind 0.0.0.0 --port 7300   # still: put TLS
 
 Bad combinations are startup errors (exit code 2), not guesses: `--port` without
 `--transport http`, a repeated flag, a host name instead of an IP, a token that is
-set but too short.
+set but too short, a policy with `budgets.session` under `--transport http`.
 
 ## The audit log
 
@@ -1113,7 +1119,7 @@ Three layers, each covering what the one below cannot:
 | --- | --- |
 | Unit tests | Pure logic — namespacing, config validation, the audit sink |
 | In-process integration | `UpstreamRegistry` against a **real MCP server** over in-memory streams (`InMemoryMcpServer`), so genuine JSON-RPC is exercised without spawning `npx` |
-| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in ten phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give, with the question checked for the path and the redacted key; a poisoned file written, read back, and caught on the way out; a credential forwarded, redacted and refused on the way in and scrubbed or withheld on the way out, with the audit log checked for the raw key; the LLM classifier against a fake API; OpenTelemetry export to a fake collector; and approval through a local webhook receiver that verifies the signature; and the same pipeline over Streamable HTTP (auth, Origin, fail-closed approval, a budget spanning stateless requests) |
+| `scripts/smoke.py` | The whole chain — driver → proxy → spawned Node server → disk → audit log, in ten phases: pure passthrough; a policy that denies by glob, by argument, by annotation, and by failing closed on a guardrail it could not finish checking; a budget running out mid-session; each of the four answers a human can give, with the question checked for the path and the redacted key; a poisoned file written, read back, and caught on the way out; a credential forwarded, redacted and refused on the way in and scrubbed or withheld on the way out, with the audit log checked for the raw key; the LLM classifier against a fake API; OpenTelemetry export to a fake collector; and approval through a local webhook receiver that verifies the signature; and the same pipeline over Streamable HTTP (auth, Origin, fail-closed approval, a daily budget spanning stateless requests, a session budget refused at startup) |
 
 CI runs all three on Linux, macOS and Windows, plus a `lint` job
 (`dotnet format`, `ruff`, `shellcheck`) and a check that every example policy in

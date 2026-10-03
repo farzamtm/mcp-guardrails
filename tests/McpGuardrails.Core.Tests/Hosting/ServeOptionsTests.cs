@@ -1,5 +1,7 @@
 using System.Net;
+using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Hosting;
+using McpGuardrails.Core.Policy;
 
 namespace McpGuardrails.Core.Tests.Hosting;
 
@@ -164,5 +166,88 @@ public sealed class ServeOptionsTests
     public void NullArguments_Throw()
     {
         Assert.Throws<ArgumentNullException>(() => ServeOptions.Parse(null!, null));
+    }
+
+    // -------------------------------------------------------------- budgets
+
+    private static readonly BudgetLimits _limits = new() { MaxCalls = 5 };
+
+    [Fact]
+    public void Http_RefusesASessionBudget_AndSaysWhatToUseInstead()
+    {
+        // Stateless HTTP has no session: the cap would silently become one pool
+        // shared by every client for the life of the process.
+        var message = Assert.Throws<ServeOptionsException>(
+            () => Parse("--transport http").EnsureEnforceable(new BudgetPolicy { Session = _limits })).Message;
+
+        Assert.Contains("'budgets.session' cannot be enforced over '--transport http'", message, StringComparison.Ordinal);
+        Assert.Contains("shared by every client", message, StringComparison.Ordinal);
+        Assert.Contains("'budgets.daily'", message, StringComparison.Ordinal);
+        Assert.Contains("stdio", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Http_RefusesASessionBudget_EvenAlongsideADailyOne()
+    {
+        // The daily cap being fine does not make the session cap mean what it says.
+        Assert.Throws<ServeOptionsException>(
+            () => Parse("--transport http").EnsureEnforceable(
+                new BudgetPolicy { Session = _limits, Daily = _limits }));
+    }
+
+    [Fact]
+    public void Http_AcceptsADailyBudget_OrNone()
+    {
+        var http = Parse("--transport http");
+
+        http.EnsureEnforceable(new BudgetPolicy { Daily = _limits });
+        http.EnsureEnforceable(BudgetPolicy.None);
+    }
+
+    [Fact]
+    public void Stdio_AcceptsASessionBudget()
+    {
+        // One process per client session, so "session" means exactly that.
+        ServeOptions.Default.EnsureEnforceable(new BudgetPolicy { Session = _limits, Daily = _limits });
+    }
+
+    [Fact]
+    public void Http_DailyOnlyPolicy_StillChargesPerRuleCosts()
+    {
+        // The policy an HTTP operator is now pointed at: per-rule `cost:` must
+        // keep working with only a daily cap, or the advice would be a downgrade.
+        var document = PolicyLoader.Parse("""
+            budgets:
+              daily:
+                max_cost: 5
+            rules:
+              - name: reads-are-free
+                match:
+                  tool: fs__read_*
+                decision: allow
+                cost: 0
+              - name: writes-cost
+                match:
+                  tool: fs__write_*
+                decision: allow
+                cost: 3
+            """);
+
+        Parse("--transport http").EnsureEnforceable(document.EffectiveBudgets);
+
+        // An in-memory store standing in for SQLite: the arithmetic is the same.
+        var gate = BudgetGate.For(document.EffectiveBudgets, limits => new InMemoryBudgetStore(limits));
+        var evaluator = new PolicyEvaluator(document);
+        Decision Call(string tool) => gate.Apply(evaluator.Evaluate(new ToolCallFacts(tool)));
+
+        Assert.False(Call("fs__write_file").IsBlocked);
+        Assert.Equal("daily.max_cost", Call("fs__write_file").RuleName);
+        Assert.False(Call("fs__read_text_file").IsBlocked);
+    }
+
+    [Fact]
+    public void NullBudgets_Throw()
+    {
+        Assert.Throws<ArgumentNullException>(() => ServeOptions.Default.EnsureEnforceable(null!));
     }
 }
