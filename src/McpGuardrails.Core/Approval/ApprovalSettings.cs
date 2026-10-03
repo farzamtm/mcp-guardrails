@@ -100,13 +100,22 @@ public sealed record ApprovalSettings
                 $"{DefaultTimeoutSeconds}s default.");
         }
 
+        // Checked apart from the next test so an out-of-range number gets a
+        // policy error instead of reaching ToWireName, which has no spelling
+        // for it and would throw something an operator cannot act on.
+        if (!Enum.IsDefined(EffectiveOnTimeout))
+        {
+            throw new PolicyException(
+                $"Rule '{ruleName}' has an unknown 'on_timeout'. Use allow or deny.");
+        }
+
         // allow and deny are the only coherent answers to "nobody replied".
         // require_approval would mean asking again forever.
         if (EffectiveOnTimeout is not (Verdict.Allow or Verdict.Deny))
         {
             throw new PolicyException(
                 $"Rule '{ruleName}' has an 'on_timeout' of " +
-                $"'{PolicyEvaluator.Describe(EffectiveOnTimeout)}'. Use allow or deny.");
+                $"'{EffectiveOnTimeout.ToWireName()}'. Use allow or deny.");
         }
     }
 }

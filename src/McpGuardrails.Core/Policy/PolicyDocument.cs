@@ -198,7 +198,7 @@ public sealed record PolicyRule
         {
             throw new PolicyException(
                 $"Rule '{Name}' has an 'approval' block but its decision is " +
-                $"'{PolicyEvaluator.Describe(EffectiveDecision)}', so nobody would ever be " +
+                $"'{EffectiveDecision.ToWireName()}', so nobody would ever be " +
                 "asked. Use 'decision: require_approval', or remove the block.");
         }
 

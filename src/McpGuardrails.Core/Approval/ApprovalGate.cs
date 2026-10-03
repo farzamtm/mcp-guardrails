@@ -156,12 +156,18 @@ public static class ApprovalGate
         ApprovalResult = outcome,
     };
 
+    /// <remarks>
+    /// The rule name is kept, so the refusal reads "approval for rule 'x'", and
+    /// the trail gets a line so <c>--explain</c> shows why a call that matched a
+    /// require_approval rule ended up refused.
+    /// </remarks>
     private static Decision Refuse(Decision decision, ApprovalOutcome outcome, string reason) =>
-        decision with
+        decision.RefusedBy(
+            DecisionSource.Approval,
+            decision.RuleName,
+            reason,
+            $"approval for rule '{decision.RuleName}': {outcome.ToWireName()} -> deny") with
         {
-            Verdict = Verdict.Deny,
-            Reason = reason,
-            Source = DecisionSource.Approval,
             ApprovalResult = outcome,
         };
 

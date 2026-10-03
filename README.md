@@ -329,8 +329,10 @@ budgets:
 - **A call has to fit both caps.** A call the daily cap refuses is not charged
   to the session either.
 - **A broken store fails closed.** If the file cannot be opened at startup the
-  proxy exits with an error; if a write fails mid-session the call fails and is
-  not forwarded.
+  proxy exits with an error. If a charge fails mid-session - including another
+  proxy holding the file's write lock for more than 5 seconds - the call is
+  refused as `daily.unavailable`, with the database error in the audit log's
+  `decision_reason`, and is not forwarded.
 
 The daily refusal tells the agent when the budget comes back instead of
 suggesting a new session, which would not help:
@@ -1042,7 +1044,7 @@ it never left the proxy.
 | `gen_ai.tool.name` | Client-visible tool name (semconv) |
 | `mcp_guardrails.server`, `mcp_guardrails.downstream_tool` | Where the call was routed |
 | `mcp_guardrails.decision` | `allow`, `deny`, `require_approval`, as in the audit log |
-| `mcp_guardrails.decision.source` | `policy`, `budget` or `approval` |
+| `mcp_guardrails.decision.source` | `policy`, `budget`, `approval` or `scanner` |
 | `mcp_guardrails.rule` | Rule that decided, or the budget limit (`session.max_cost`) |
 | `mcp_guardrails.budget.cost` | What the call costs against the budget |
 | `mcp_guardrails.approval.outcome` | `approved`, `declined`, `timed_out`, `unavailable`, `failed` |

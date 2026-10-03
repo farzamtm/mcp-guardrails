@@ -513,10 +513,10 @@ var mcp = builder.Services
                     Server = resolved ? connection.Name : null,
                     DownstreamTool = resolved ? downstreamName : null,
                     Arguments = arguments.Redacted,
-                    Decision = decision?.Verdict.ToString().ToLowerInvariant(),
+                    Decision = decision?.Verdict.ToWireName(),
                     Rule = decision?.RuleName,
                     DecisionReason = decision?.Reason,
-                    Approval = Describe(decision?.ApprovalResult),
+                    Approval = decision?.ApprovalResult?.ToWireName(),
                     // Null unless something matched, so a clean result stays one
                     // narrow line and `jq 'select(.scanner_hits)'` is the whole
                     // query for "show me what the scanner caught".
@@ -602,6 +602,13 @@ var mcp = builder.Services
             decision = toolMetadata.Apply(decision, toolName);
 
             decision = secrets.Apply(decision, request.Params?.Arguments);
+
+            // Recorded now as well as at the end, because the approval wait can
+            // end in cancellation - the client hanging up - which propagates as
+            // an exception past the line below. The audit record of an abandoned
+            // call should still say what had been decided (typically
+            // require_approval), not carry no decision at all.
+            GuardrailsCallScope.RecordDecision(decision);
 
             decision = await ApprovalGate.ApplyAsync(
                 decision,
@@ -756,17 +763,3 @@ else
 }
 
 return 0;
-
-// A local function, so the audit filter above can render the approval outcome
-// without either duplicating the mapping or exposing a wire format from Core.
-// snake_case to match every other value in the log, so `jq 'select(.approval ==
-// "timed_out")'` reads the way an operator expects.
-static string? Describe(ApprovalOutcome? outcome) => outcome switch
-{
-    ApprovalOutcome.Approved => "approved",
-    ApprovalOutcome.Declined => "declined",
-    ApprovalOutcome.TimedOut => "timed_out",
-    ApprovalOutcome.Unavailable => "unavailable",
-    ApprovalOutcome.Failed => "failed",
-    _ => null,
-};

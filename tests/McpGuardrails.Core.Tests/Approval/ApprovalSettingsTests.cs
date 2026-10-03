@@ -80,4 +80,16 @@ public sealed class ApprovalSettingsTests
         Assert.Contains("on_timeout", error.Message, StringComparison.Ordinal);
         Assert.Contains("Use allow or deny", error.Message, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void AnUndefinedOnTimeout_IsAPolicyError()
+    {
+        // A number in the YAML deserializes to an out-of-range enum value. It
+        // must surface as a startup error naming the field, not as the
+        // ArgumentOutOfRangeException the wire-name mapping throws.
+        var error = Assert.Throws<PolicyException>(() =>
+            new ApprovalSettings { OnTimeout = (Verdict)99 }.Validate("r"));
+
+        Assert.Contains("unknown 'on_timeout'", error.Message, StringComparison.Ordinal);
+    }
 }

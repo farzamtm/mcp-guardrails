@@ -165,21 +165,6 @@ public sealed class PolicyLoaderScalarTests : IDisposable
 /// </remarks>
 public sealed class PolicyEvaluatorFallbackTests
 {
-    [Theory]
-    [InlineData(Verdict.Allow, "allow")]
-    [InlineData(Verdict.Deny, "deny")]
-    [InlineData(Verdict.RequireApproval, "require_approval")]
-    public void Describe_UsesTheWireSpelling(Verdict verdict, string expected)
-    {
-        Assert.Equal(expected, PolicyEvaluator.Describe(verdict));
-    }
-
-    [Fact]
-    public void Describe_FallsBackForAnUndefinedVerdict()
-    {
-        Assert.Equal("99", PolicyEvaluator.Describe((Verdict)99));
-    }
-
     [Fact]
     public void DefaultMessage_FallsBackForAnUndefinedVerdict()
     {

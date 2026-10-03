@@ -43,6 +43,15 @@ public sealed class SqliteBudgetStore : IBudgetStore, IDisposable
 
     private const string _inMemory = ":memory:";
 
+    // How long a charge waits for another proxy's write lock before giving up.
+    // A charge holds the lock for milliseconds, so a wait this long already
+    // means something is wrong - a stuck process, a network filesystem - and
+    // the call it is holding up is a tool call an agent and possibly a human
+    // are waiting on. Five seconds rides out real contention; past that the
+    // store throws, BudgetGate turns the failure into a refusal, and the call
+    // fails closed in seconds rather than hanging for half a minute.
+    internal const int BusyTimeoutMilliseconds = 5000;
+
     // Serialises use of the one connection within this process. SqliteConnection
     // is not thread-safe, and the transaction below already makes concurrent
     // callers wait for each other, so a connection pool would buy nothing.
@@ -93,7 +102,9 @@ public sealed class SqliteBudgetStore : IBudgetStore, IDisposable
             // WAL lets readers proceed while another proxy holds the write lock.
             // busy_timeout makes a second proxy wait for that lock instead of
             // failing immediately: contention here is a few milliseconds per call.
-            Execute("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 30000;");
+            Execute(
+                "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = " +
+                BusyTimeoutMilliseconds.ToString(CultureInfo.InvariantCulture) + ";");
             Execute(_schema);
         }
         catch

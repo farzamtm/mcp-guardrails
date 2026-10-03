@@ -147,20 +147,14 @@ public sealed class SecretGate
             return decision;
         }
 
-        return new Decision(
-            Verdict.Deny,
+        return decision.RefusedBy(
+            DecisionSource.Scanner,
+            ArgumentRule,
             $"the arguments contain {Count(report)} ({report.Summary}), and this policy does " +
             "not let credentials or personal data leave through tool arguments. Do not retry " +
             "with the value split, encoded or paraphrased; tell the user the call needs a " +
             "secret and let them decide how to proceed.",
-            ArgumentRule,
-            decision.Trail is null
-                ? null
-                : [.. decision.Trail, $"scanner 'secrets': arguments contain {report.Summary} -> deny"])
-        {
-            Source = DecisionSource.Scanner,
-            Cost = decision.Cost,
-        };
+            $"scanner 'secrets': arguments contain {report.Summary} -> deny");
     }
 
     /// <summary>
