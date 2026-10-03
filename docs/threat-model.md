@@ -2,7 +2,7 @@
 
 What the proxy defends against, how, and — at least as important — what it does
 not. Every claim here describes the code as it stands on this branch, with a
-pointer to where it lives. Plans from [the spec](../mcp-guardrails-dotnet-spec.md)
+pointer to where it lives. Plans from [the spec](design-spec.md)
 are listed as plans, in [Not yet](#not-yet-planned), and nowhere else.
 
 [SECURITY.md](../SECURITY.md) has the short version and the reporting process.
@@ -256,8 +256,8 @@ question, and it is the operator's.
 
 ### The scanner is a label, not a filter
 
-The README says this and it is worth repeating with specifics. The heuristics
-match the *shape* of an injection, so:
+[Result scanning](result-scanning.md) says this and it is worth repeating with
+specifics. The heuristics match the *shape* of an injection, so:
 
 - **Wording outside the lists gets through.** The vocabulary is English and
   finite. A paraphrase that avoids every trigger word, or any other language,
