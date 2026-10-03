@@ -567,7 +567,15 @@ var mcp = builder.Services
 
             // The owning server is not matched on, but an out-of-band approver
             // shows it: "fs" or "prod-db" changes what a human says to a delete.
-            var server = upstream.TryResolve(toolName, out var owner, out _) ? owner.Name : null;
+            //
+            // Resolving also tells the budget whether the call can be forwarded
+            // at all: an unknown tool ends at the call handler's error, so it is
+            // not charged. Policy, secrets and approval still see it, and audit
+            // still records it. The registry is immutable after startup, so the
+            // handler cannot resolve a name this lookup did not - no call is
+            // forwarded uncharged.
+            var resolved = upstream.TryResolve(toolName, out var owner, out _);
+            var server = resolved ? owner.Name : null;
 
             var facts = PolicyFacts.ForCall(toolName, request.Params, tool, server);
 
@@ -600,7 +608,7 @@ var mcp = builder.Services
                     webhook),
                 cancellationToken);
 
-            decision = budget.Apply(decision);
+            decision = budget.Apply(decision, resolved);
 
             // Report upward so the audit record carries the verdict.
             GuardrailsCallScope.RecordDecision(decision);

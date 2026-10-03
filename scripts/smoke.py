@@ -176,7 +176,8 @@ rules:
 # A budget small enough to run out inside one session, with costs that differ by
 # tool - which is the whole point of weighting. Two writes cost 4 against a cap
 # of 3, so the second one cannot happen; reads are free and keep working after
-# the budget is gone.
+# the budget is gone. Calls to an unknown tool match no rule (default cost 1) but
+# are never forwarded, so they must not be charged at all.
 BUDGET_POLICY = """
 budgets:
   session:
@@ -510,18 +511,30 @@ POLICY_CHECKS: list[tuple[dict, str, object]] = [
 # The budget is per session, so these run in order against one proxy process and
 # each check depends on the one before it. That is the behaviour under test.
 BUDGET_CHECKS: list[tuple[dict, str, object]] = [
+    # Two unknown-tool calls first. Were they charged at the default cost of 1,
+    # the write below would need 2 + 2 = 4 against a cap of 3 and be refused.
     (
-        call(1, "fs__write_file", {"path": BUDGET_PROBE, "content": CONTENT}),
-        "the first write fits the budget (2 of 3)",
+        call(1, "fs__does_not_exist", {}),
+        "an unknown tool is answered as unknown, not as a budget refusal",
+        lambda r: denied_with(r, "Unknown tool 'fs__does_not_exist'"),
+    ),
+    (
+        call(2, "fs__does_not_exist", {}),
+        "a repeated unknown tool is still not charged",
+        lambda r: denied_with(r, "Unknown tool 'fs__does_not_exist'"),
+    ),
+    (
+        call(3, "fs__write_file", {"path": BUDGET_PROBE, "content": CONTENT}),
+        "the first write still fits the budget (2 of 3): unknown tools cost nothing",
         lambda r: not r.get("isError"),
     ),
     (
-        call(2, "fs__write_file", {"path": BUDGET_OVER, "content": CONTENT}),
+        call(4, "fs__write_file", {"path": BUDGET_OVER, "content": CONTENT}),
         "the second write would exceed it and is refused",
         lambda r: denied_with(r, "Blocked by guardrails budget 'session.max_cost'"),
     ),
     (
-        call(3, "fs__read_text_file", {"path": BUDGET_PROBE}),
+        call(5, "fs__read_text_file", {"path": BUDGET_PROBE}),
         "a cost-0 read still works after the budget is spent",
         lambda r: CONTENT in json.dumps(r.get("content", [])),
     ),
@@ -1923,8 +1936,21 @@ def check_budget_audit_log() -> int:
         "audit records what was spent and what the cap was",
     )
     expect(
-        len(lines) == 3,
+        len(lines) == 5,
         f"every call is logged, refused or not (got {len(lines)})",
+    )
+    # Free is not invisible: the uncharged unknown-tool calls are still policy
+    # decisions on the record, flagged as errors and owned by no server.
+    unknown = [entry for entry in lines if entry.get("tool") == "fs__does_not_exist"]
+    expect(
+        len(unknown) == 2
+        and all(
+            entry.get("decision") == "allow"
+            and entry.get("is_error")
+            and entry.get("server") is None
+            for entry in unknown
+        ),
+        f"uncharged unknown-tool calls are still audited (got {len(unknown)})",
     )
 
     return failures

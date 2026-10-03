@@ -276,6 +276,10 @@ What gets charged, and when:
 
 - A call the **policy refused** costs nothing. It never reached a server.
 - A call **awaiting approval** costs nothing yet, for the same reason.
+- A call to an **unknown tool** costs nothing: no downstream server owns the
+  name, so it ends at the proxy's own "unknown tool" error. It is still
+  evaluated by policy and audited. The flip side is that the budget does not
+  stop an agent looping on a bad name — harmless, since nothing is forwarded.
 - A call that was **forwarded** is charged even if the server then failed.
   Refunding failures would let a broken tool be retried without limit.
 - Refusals are **audited like any other denial**, with `rule` naming the cap
