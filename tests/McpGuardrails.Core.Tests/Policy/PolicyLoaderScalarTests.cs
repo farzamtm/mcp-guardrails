@@ -8,9 +8,9 @@ namespace McpGuardrails.Core.Tests.Policy;
 /// <remarks>
 /// The scalar typing rules are exercised through extra keys that the policy
 /// schema ignores. That is deliberate: the conversion runs over the whole
-/// document regardless of schema, and step 6 will introduce real boolean and
-/// numeric fields (annotation matching, JSONPath comparisons) that depend on
-/// these branches being right.
+/// document regardless of schema, and the real boolean and numeric fields
+/// (annotation matching, JSONPath comparisons) depend on these branches being
+/// right.
 /// </remarks>
 public sealed class PolicyLoaderScalarTests : IDisposable
 {
@@ -165,21 +165,6 @@ public sealed class PolicyLoaderScalarTests : IDisposable
 /// </remarks>
 public sealed class PolicyEvaluatorFallbackTests
 {
-    [Theory]
-    [InlineData(Verdict.Allow, "allow")]
-    [InlineData(Verdict.Deny, "deny")]
-    [InlineData(Verdict.RequireApproval, "require_approval")]
-    public void Describe_UsesTheWireSpelling(Verdict verdict, string expected)
-    {
-        Assert.Equal(expected, PolicyEvaluator.Describe(verdict));
-    }
-
-    [Fact]
-    public void Describe_FallsBackForAnUndefinedVerdict()
-    {
-        Assert.Equal("99", PolicyEvaluator.Describe((Verdict)99));
-    }
-
     [Fact]
     public void DefaultMessage_FallsBackForAnUndefinedVerdict()
     {

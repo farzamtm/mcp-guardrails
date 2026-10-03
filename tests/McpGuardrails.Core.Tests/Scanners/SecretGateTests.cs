@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using ModelContextProtocol.Protocol;
@@ -392,6 +393,35 @@ public sealed class SecretGateTests
         var text = AllText(outcome.Result);
         Assert.StartsWith("Blocked by guardrails scanner 'secrets': the output of 'fs__read_text_file'", text, StringComparison.Ordinal);
         Assert.DoesNotContain(SecretSamples.AwsAccessKey, text, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(SecretResultAction.Redact)]
+    [InlineData(SecretResultAction.Block)]
+    public void Inspect_AReplacedResult_KeepsTheServersResultMetadata(SecretResultAction action)
+    {
+        // _meta is protocol bookkeeping for the client, not content, and
+        // rebuilding the result is no reason to lose it.
+        var result = Result(SecretSamples.AwsAccessKey);
+        result.Meta = new JsonObject { ["trace"] = "abc" };
+
+        var outcome = Gate(results: action).Inspect(result, "fs__read_text_file");
+
+        Assert.NotSame(result, outcome.Result);
+        Assert.Same(result.Meta, outcome.Result.Meta);
+    }
+
+    [Fact]
+    public void Inspect_ARedactedBlock_KeepsItsOwnMetadata()
+    {
+        var meta = new JsonObject { ["source"] = "cache" };
+        var result = new CallToolResult();
+        result.Content.Add(new TextContentBlock { Text = SecretSamples.StripeKey, Meta = meta });
+
+        var outcome = Gate().Inspect(result, "fs__read_text_file");
+
+        Assert.NotSame(result.Content[0], outcome.Result.Content[0]);
+        Assert.Same(meta, outcome.Result.Content[0].Meta);
     }
 
     [Fact]

@@ -141,7 +141,7 @@ public sealed class ToolCallTelemetry : IDisposable
         AddIfPresent(ref common, TelemetryAttributes.Server, server);
 
         var outcome = common;
-        AddIfPresent(ref outcome, TelemetryAttributes.Decision, decision is null ? null : Describe(decision.Verdict));
+        AddIfPresent(ref outcome, TelemetryAttributes.Decision, decision?.Verdict.ToWireName());
         AddIfPresent(ref outcome, TelemetryAttributes.ErrorType, errorType);
 
         _calls.Add(1, outcome);
@@ -155,7 +155,7 @@ public sealed class ToolCallTelemetry : IDisposable
         if (decision.IsBlocked)
         {
             var denial = common;
-            denial.Add(TelemetryAttributes.DecisionSource, Describe(decision.Source));
+            denial.Add(TelemetryAttributes.DecisionSource, decision.Source.ToWireName());
             AddIfPresent(ref denial, TelemetryAttributes.Rule, decision.RuleName);
             _denials.Add(1, denial);
         }
@@ -164,7 +164,7 @@ public sealed class ToolCallTelemetry : IDisposable
         {
             var asked = common;
             AddIfPresent(ref asked, TelemetryAttributes.Rule, decision.RuleName);
-            asked.Add(TelemetryAttributes.ApprovalOutcome, Describe(approval));
+            asked.Add(TelemetryAttributes.ApprovalOutcome, approval.ToWireName());
             _approvals.Add(1, asked);
         }
     }
@@ -179,32 +179,6 @@ public sealed class ToolCallTelemetry : IDisposable
             tags.Add(key, value);
         }
     }
-
-    /// <summary>The audit log's spelling of a verdict.</summary>
-    public static string Describe(Verdict verdict) => verdict switch
-    {
-        Verdict.Allow => "allow",
-        Verdict.Deny => "deny",
-        _ => "require_approval",
-    };
-
-    /// <summary>Which guardrail decided, in snake_case.</summary>
-    public static string Describe(DecisionSource source) => source switch
-    {
-        DecisionSource.Budget => "budget",
-        DecisionSource.Approval => "approval",
-        _ => "policy",
-    };
-
-    /// <summary>The audit log's spelling of an approval outcome.</summary>
-    public static string Describe(ApprovalOutcome outcome) => outcome switch
-    {
-        ApprovalOutcome.Approved => "approved",
-        ApprovalOutcome.Declined => "declined",
-        ApprovalOutcome.TimedOut => "timed_out",
-        ApprovalOutcome.Unavailable => "unavailable",
-        _ => "failed",
-    };
 
     /// <inheritdoc />
     public void Dispose()
@@ -277,14 +251,14 @@ public sealed class ToolCallSpan : IDisposable
 
         if (decision is not null)
         {
-            activity.SetTag(TelemetryAttributes.Decision, ToolCallTelemetry.Describe(decision.Verdict));
-            activity.SetTag(TelemetryAttributes.DecisionSource, ToolCallTelemetry.Describe(decision.Source));
+            activity.SetTag(TelemetryAttributes.Decision, decision.Verdict.ToWireName());
+            activity.SetTag(TelemetryAttributes.DecisionSource, decision.Source.ToWireName());
             activity.SetTag(TelemetryAttributes.Rule, decision.RuleName);
             activity.SetTag(TelemetryAttributes.BudgetCost, decision.Cost);
 
             if (decision.ApprovalResult is { } approval)
             {
-                activity.SetTag(TelemetryAttributes.ApprovalOutcome, ToolCallTelemetry.Describe(approval));
+                activity.SetTag(TelemetryAttributes.ApprovalOutcome, approval.ToWireName());
             }
         }
 
@@ -323,7 +297,7 @@ public static class TelemetryAttributes
     /// <summary>allow, deny or require_approval - same values as the audit log.</summary>
     public const string Decision = "mcp_guardrails.decision";
 
-    /// <summary>Which guardrail decided: policy, budget or approval.</summary>
+    /// <summary>Which guardrail decided: policy, budget, approval or scanner.</summary>
     public const string DecisionSource = "mcp_guardrails.decision.source";
 
     /// <summary>The rule (or budget limit, e.g. session.max_cost) that decided.</summary>

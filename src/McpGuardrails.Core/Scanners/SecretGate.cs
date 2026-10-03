@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text.Json;
 using McpGuardrails.Core.Policy;
 using ModelContextProtocol.Protocol;
@@ -148,20 +147,14 @@ public sealed class SecretGate
             return decision;
         }
 
-        return new Decision(
-            Verdict.Deny,
+        return decision.RefusedBy(
+            DecisionSource.Scanner,
+            ArgumentRule,
             $"the arguments contain {Count(report)} ({report.Summary}), and this policy does " +
             "not let credentials or personal data leave through tool arguments. Do not retry " +
             "with the value split, encoded or paraphrased; tell the user the call needs a " +
             "secret and let them decide how to proceed.",
-            ArgumentRule,
-            decision.Trail is null
-                ? null
-                : [.. decision.Trail, $"scanner 'secrets': arguments contain {report.Summary} -> deny"])
-        {
-            Source = DecisionSource.Scanner,
-            Cost = decision.Cost,
-        };
+            $"scanner 'secrets': arguments contain {report.Summary} -> deny");
     }
 
     /// <summary>
@@ -244,11 +237,11 @@ public sealed class SecretGate
             report = report.Merge(found);
         }
 
-        // Same guard as the injection gate: a default JsonElement is Undefined,
-        // and asking one for anything throws.
+        // Kept as the original property rather than ResultContent.StructuredOf,
+        // so a default (Undefined) payload is forwarded exactly as it arrived.
         var structured = result.StructuredContent;
 
-        if (structured is { ValueKind: not JsonValueKind.Undefined } payload)
+        if (ResultContent.StructuredOf(result) is { } payload)
         {
             var redaction = SecretScanner.RedactJson(payload, null, _settings.IncludePii);
             structured = redaction.Element;
@@ -262,14 +255,17 @@ public sealed class SecretGate
 
         if (_settings.EffectiveResults is SecretResultAction.Block)
         {
-            return new RedactionOutcome(Block(report, toolName), report, RedactionEffect.Blocked);
+            return new RedactionOutcome(Block(result, report, toolName), report, RedactionEffect.Blocked);
         }
 
         content.Add(new TextContentBlock { Text = Notice(report, toolName) });
 
+        // _meta is protocol bookkeeping addressed to the client, not content, so
+        // the rebuilt result carries it through as is.
         var replacement = new CallToolResult
         {
             IsError = result.IsError,
+            Meta = result.Meta,
             StructuredContent = structured,
             Content = content,
         };
@@ -294,52 +290,21 @@ public sealed class SecretGate
     }
 
     /// <remarks>
-    /// The same two shapes the injection gate reads, for the same reason: they are
-    /// where model-readable text arrives. A replacement block copies the original's
-    /// annotations and metadata, so a client that routes on audience or priority
-    /// sees the redacted block exactly where it would have seen the original.
+    /// The same shapes the injection gate reads, for the same reason: they are
+    /// where model-readable text arrives.
     /// </remarks>
     private (ContentBlock Block, SecretReport Report) RedactBlock(ContentBlock block)
     {
-        switch (block)
+        if (ResultContent.TextOf(block) is not { } text)
         {
-            case TextContentBlock text:
-                {
-                    var redaction = SecretScanner.Redact(text.Text, _settings.IncludePii);
-
-                    return redaction.Report.IsClean
-                        ? (block, redaction.Report)
-                        : (new TextContentBlock
-                        {
-                            Text = redaction.Text,
-                            Annotations = text.Annotations,
-                            Meta = text.Meta,
-                        }, redaction.Report);
-                }
-
-            case EmbeddedResourceBlock { Resource: TextResourceContents resource } embedded:
-                {
-                    var redaction = SecretScanner.Redact(resource.Text, _settings.IncludePii);
-
-                    return redaction.Report.IsClean
-                        ? (block, redaction.Report)
-                        : (new EmbeddedResourceBlock
-                        {
-                            Resource = new TextResourceContents
-                            {
-                                Uri = resource.Uri,
-                                MimeType = resource.MimeType,
-                                Meta = resource.Meta,
-                                Text = redaction.Text,
-                            },
-                            Annotations = embedded.Annotations,
-                            Meta = embedded.Meta,
-                        }, redaction.Report);
-                }
-
-            default:
-                return (block, SecretReport.Clean);
+            return (block, SecretReport.Clean);
         }
+
+        var redaction = SecretScanner.Redact(text, _settings.IncludePii);
+
+        return redaction.Report.IsClean
+            ? (block, redaction.Report)
+            : (ResultContent.WithText(block, redaction.Text), redaction.Report);
     }
 
     /// <remarks>
@@ -362,25 +327,15 @@ public sealed class SecretGate
     /// that believes a tool is broken goes looking for another way to read the
     /// same file.
     /// </remarks>
-    private static CallToolResult Block(SecretReport report, string toolName) => new()
-    {
-        IsError = true,
-        Content =
-        [
-            new TextContentBlock
-            {
-                Text =
-                    $"Blocked by guardrails scanner 'secrets': the output of '{toolName}' " +
-                    $"contained {Count(report)} ({report.Summary}), so it was withheld and you " +
-                    "have not seen it. Do not try to read the same content another way; tell " +
-                    "the user the tool returned credentials or personal data that this proxy " +
-                    "is configured not to pass on.",
-            },
-        ],
-    };
+    private static CallToolResult Block(CallToolResult result, SecretReport report, string toolName) =>
+        ResultContent.Blocked(
+            result,
+            "secrets",
+            toolName,
+            $"contained {Count(report)} ({report.Summary})",
+            "Do not try to read the same content another way; tell the user the tool returned " +
+            "credentials or personal data that this proxy is configured not to pass on.");
 
     private static string Count(SecretReport report) =>
-        report.Count == 1
-            ? "1 sensitive value"
-            : $"{report.Count.ToString(CultureInfo.InvariantCulture)} sensitive values";
+        ResultContent.CountOf(report.Count, "sensitive value", "sensitive values");
 }

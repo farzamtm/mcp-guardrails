@@ -14,7 +14,8 @@ namespace McpGuardrails.Core.Approval;
 /// makes it billable.
 ///
 /// The gate owns the deadline rather than the channel, so every approver - the
-/// client, a webhook, Slack later - inherits the same semantics for "nobody answered".
+/// client, a webhook, any channel added beside them - inherits the same semantics
+/// for "nobody answered".
 /// </remarks>
 public static class ApprovalGate
 {
@@ -156,12 +157,18 @@ public static class ApprovalGate
         ApprovalResult = outcome,
     };
 
+    /// <remarks>
+    /// The rule name is kept, so the refusal reads "approval for rule 'x'", and
+    /// the trail gets a line so <c>--explain</c> shows why a call that matched a
+    /// require_approval rule ended up refused.
+    /// </remarks>
     private static Decision Refuse(Decision decision, ApprovalOutcome outcome, string reason) =>
-        decision with
+        decision.RefusedBy(
+            DecisionSource.Approval,
+            decision.RuleName,
+            reason,
+            $"approval for rule '{decision.RuleName}': {outcome.ToWireName()} -> deny") with
         {
-            Verdict = Verdict.Deny,
-            Reason = reason,
-            Source = DecisionSource.Approval,
             ApprovalResult = outcome,
         };
 

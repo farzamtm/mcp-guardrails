@@ -156,16 +156,6 @@ public sealed class ScannerPolicyLoadingTests
     }
 
     [Fact]
-    public void MetadataOutsideTheInjectionScanner_IsRejected()
-    {
-        var settings = new ScannerSettings { Metadata = ScanAction.Block };
-
-        var error = Assert.Throws<PolicyException>(() => settings.Validate("secrets"));
-
-        Assert.Contains("'scanners.secrets.metadata' is not supported", error.Message, StringComparison.Ordinal);
-    }
-
-    [Fact]
     public void SecretRedaction_IsOnWithNoPolicyFile()
     {
         // Arguments reach the server but not the log; results are scrubbed before

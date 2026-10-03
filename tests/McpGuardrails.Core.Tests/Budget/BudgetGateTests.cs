@@ -1,3 +1,4 @@
+using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Policy;
 
@@ -332,15 +333,179 @@ public sealed class BudgetGateTests
     }
 
     [Fact]
-    public void WithBothScopes_AFailingDailyStore_FailsTheCallAndRefundsTheSession()
+    public void WithBothScopes_AFailingDailyStore_DeniesTheCallAndRefundsTheSession()
     {
         var session = new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 5 });
         var gate = new BudgetGate(session, new ThrowingStore());
 
-        // Fails closed: the exception propagates, so the call is not forwarded.
-        Assert.Throws<InvalidOperationException>(() => gate.Apply(Allowed(cost: 2)));
+        // Fails closed, as a refusal rather than an exception: the call is not
+        // forwarded, and the audit log and the model both get a reason.
+        var refused = gate.Apply(Allowed(cost: 2, trail: ["rule 'x': MATCHED -> allow"]));
 
+        Assert.Equal(Verdict.Deny, refused.Verdict);
+        Assert.Equal(DecisionSource.Budget, refused.Source);
+        Assert.Equal("daily.unavailable", refused.RuleName);
+        Assert.Contains("could not be checked (InvalidOperationException: disk on fire)", refused.Reason, StringComparison.Ordinal);
+        Assert.Equal("budget 'daily': store failed -> deny", refused.Trail?[^1]);
         Assert.Equal((0, 0), (session.Calls, session.Cost));
+    }
+
+    [Fact]
+    public void ASingleScopeGate_OverAFailingStore_Denies()
+    {
+        var refused = new BudgetGate(new ThrowingStore(), BudgetGate.DailyScope).Apply(Allowed());
+
+        Assert.Equal(Verdict.Deny, refused.Verdict);
+        Assert.Equal("daily.unavailable", refused.RuleName);
+        Assert.StartsWith("Blocked by guardrails budget 'daily.unavailable':", refused.ToModelMessage(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ARealSqliteFailure_IsADenial_NotAnEscapingException()
+    {
+        // A SqliteException from the real store - here a dropped table, which
+        // fails at once; a busy timeout takes the same path after waiting.
+        var path = Path.Combine(Path.GetTempPath(), $"guardrails-gate-{Guid.NewGuid():N}.db");
+
+        try
+        {
+            using (var daily = new SqliteBudgetStore(path))
+            {
+                using (var sabotage = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={path};Pooling=False"))
+                {
+                    sabotage.Open();
+                    using var drop = sabotage.CreateCommand();
+                    drop.CommandText = "DROP TABLE budget_spend;";
+                    drop.ExecuteNonQuery();
+                }
+
+                var session = new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 5 });
+                var refused = new BudgetGate(session, daily).Apply(Allowed());
+
+                Assert.Equal("daily.unavailable", refused.RuleName);
+                Assert.Contains("SqliteException", refused.Reason, StringComparison.Ordinal);
+                Assert.Equal(0, session.Calls);
+            }
+        }
+        finally
+        {
+            foreach (var file in new[] { path, path + "-wal", path + "-shm" })
+            {
+                File.Delete(file);
+            }
+        }
+    }
+
+    [Fact]
+    public void AHumanApprovedCall_RefusedByTheBudget_KeepsTheApproval()
+    {
+        // Built by hand before, the refusal dropped these: the audit line lost
+        // "approved" and the approvals counter never counted the human's answer.
+        var settings = new ApprovalSettings { TimeoutSeconds = 30 };
+        var approved = Allowed() with
+        {
+            Approval = settings,
+            ApprovalResult = ApprovalOutcome.Approved,
+        };
+
+        var refused = Gate(maxCalls: 0).Apply(approved);
+
+        Assert.Equal(Verdict.Deny, refused.Verdict);
+        Assert.Equal(DecisionSource.Budget, refused.Source);
+        Assert.Same(settings, refused.Approval);
+        Assert.Equal(ApprovalOutcome.Approved, refused.ApprovalResult);
+    }
+
+    [Fact]
+    public async Task WithBothScopes_TheDailyStoreIsNotChargedUnderTheSessionLock()
+    {
+        // One call stuck in a slow daily write must not hold up the next: with
+        // the old lock around the SQLite charge, the second call here would
+        // wait for the first to be released.
+        using var daily = new GatedStore(firstResult: BudgetCharge.Accepted);
+        var gate = new BudgetGate(new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 5 }), daily);
+
+        var first = Task.Run(() => gate.Apply(Allowed()));
+        Assert.True(daily.Entered.Wait(TimeSpan.FromSeconds(10)));
+
+        var second = Task.Run(() => gate.Apply(Allowed()));
+
+        Assert.False((await second.WaitAsync(TimeSpan.FromSeconds(10))).IsBlocked);
+        Assert.False(first.IsCompleted);
+
+        daily.Release.Set();
+        Assert.False((await first).IsBlocked);
+    }
+
+    [Fact]
+    public async Task WithBothScopes_ACallAtTheSessionCap_WaitsForAPendingChargeToSettle()
+    {
+        // The window opened by charging the day outside the lock: the first call
+        // holds the session's only slot while the day decides. When the day
+        // refuses it, that slot comes back - so the second call must not have
+        // been refused for it in the meantime.
+        using var daily = new GatedStore(
+            firstResult: new BudgetCharge(false, BudgetDimension.Cost, Requested: 1, Used: 0, Cap: 0));
+        var session = new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 1 });
+        var gate = new BudgetGate(session, daily);
+
+        var first = Task.Run(() => gate.Apply(Allowed()));
+        Assert.True(daily.Entered.Wait(TimeSpan.FromSeconds(10)));
+
+        var second = Task.Run(() => gate.Apply(Allowed()));
+
+        // Waiting, not refused: the old lock-free version would have answered
+        // "session.max_calls" straight away.
+        await Task.WhenAny(second, Task.Delay(200));
+        Assert.False(second.IsCompleted);
+
+        daily.Release.Set();
+
+        Assert.Equal("daily.max_cost", (await first).RuleName);
+        Assert.False((await second).IsBlocked);
+        Assert.Equal(1, session.Calls);
+    }
+
+    [Fact]
+    public async Task WithBothScopes_ACallAtTheSessionCap_IsRefusedOnceThePendingChargeSticks()
+    {
+        using var daily = new GatedStore(firstResult: BudgetCharge.Accepted);
+        var session = new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 1 });
+        var gate = new BudgetGate(session, daily);
+
+        var first = Task.Run(() => gate.Apply(Allowed()));
+        Assert.True(daily.Entered.Wait(TimeSpan.FromSeconds(10)));
+
+        var second = Task.Run(() => gate.Apply(Allowed()));
+        await Task.WhenAny(second, Task.Delay(200));
+        Assert.False(second.IsCompleted);
+
+        daily.Release.Set();
+
+        Assert.False((await first).IsBlocked);
+        Assert.Equal("session.max_calls", (await second).RuleName);
+    }
+
+    [Fact]
+    public void WithBothScopes_ConcurrentDailyRefusals_NeverCostASessionSlot()
+    {
+        // The day refuses every other call. Each refusal hands its session slot
+        // back, and no concurrent call may be refused for a slot that was only
+        // borrowed - so exactly the session cap gets through.
+        var session = new InMemoryBudgetStore(new BudgetLimits { MaxCalls = 10 });
+        var gate = new BudgetGate(session, new AlternatingStore());
+        var allowed = 0;
+
+        Parallel.For(0, 64, _ =>
+        {
+            if (!gate.Apply(Allowed()).IsBlocked)
+            {
+                Interlocked.Increment(ref allowed);
+            }
+        });
+
+        Assert.Equal(10, allowed);
+        Assert.Equal(10, session.Calls);
     }
 
     [Fact]
@@ -372,6 +537,62 @@ public sealed class BudgetGateTests
         public long Cost => 0;
 
         public BudgetCharge TryCharge(long cost) => throw new InvalidOperationException("disk on fire");
+    }
+
+    /// <summary>
+    /// A daily store whose first charge blocks until the test releases it, and
+    /// whose later charges are accepted at once.
+    /// </summary>
+    private sealed class GatedStore(BudgetCharge firstResult) : IBudgetStore, IDisposable
+    {
+        private int _calls;
+
+        public ManualResetEventSlim Entered { get; } = new();
+
+        public ManualResetEventSlim Release { get; } = new();
+
+        public long Calls => _calls;
+
+        public long Cost => 0;
+
+        public BudgetCharge TryCharge(long cost)
+        {
+            if (Interlocked.Increment(ref _calls) > 1)
+            {
+                return BudgetCharge.Accepted;
+            }
+
+            Entered.Set();
+            Release.Wait(TimeSpan.FromSeconds(30));
+
+            return firstResult;
+        }
+
+        public void Dispose()
+        {
+            Entered.Dispose();
+            Release.Dispose();
+        }
+    }
+
+    /// <summary>A daily store that refuses every other charge.</summary>
+    private sealed class AlternatingStore : IBudgetStore
+    {
+        private int _calls;
+
+        public long Calls => _calls;
+
+        public long Cost => 0;
+
+        public BudgetCharge TryCharge(long cost)
+        {
+            // A yield so charges genuinely overlap instead of running in turn.
+            Thread.Yield();
+
+            return Interlocked.Increment(ref _calls) % 2 == 0
+                ? new BudgetCharge(false, BudgetDimension.Calls, Requested: 1, Used: 0, Cap: 0)
+                : BudgetCharge.Accepted;
+        }
     }
 
     // ------------------------------------------------------------ composition

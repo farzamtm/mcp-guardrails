@@ -259,6 +259,21 @@ public sealed class ToolCallTelemetryTests : IDisposable
         Assert.Equal("session.max_cost", denial.Tags["mcp_guardrails.rule"]);
     }
 
+    [Fact]
+    public void ScannerDenial_IsReportedAsScanner_NotPolicy()
+    {
+        // The old mapping's fallback arm reported this as "policy", so a
+        // dashboard could not tell a leaked credential from a rule refusal.
+        Listen();
+
+        Run(
+            new Decision(Verdict.Deny, "secret", "secrets.arguments") { Source = DecisionSource.Scanner },
+            resultIsError: true);
+
+        Assert.Equal("scanner", Assert.Single(_spans).GetTagItem("mcp_guardrails.decision.source"));
+        Assert.Equal("scanner", Assert.Single(Of("mcp_guardrails.denials")).Tags["mcp_guardrails.decision.source"]);
+    }
+
     [Theory]
     [InlineData(ApprovalOutcome.Approved, Verdict.Allow, "approved")]
     [InlineData(ApprovalOutcome.Declined, Verdict.Deny, "declined")]
@@ -367,24 +382,6 @@ public sealed class ToolCallTelemetryTests : IDisposable
     public void Start_RejectsANullToolName()
     {
         Assert.Throws<ArgumentNullException>(() => _telemetry.Start(null!, "fs", "write_file"));
-    }
-
-    [Theory]
-    [InlineData(Verdict.Allow, "allow")]
-    [InlineData(Verdict.Deny, "deny")]
-    [InlineData(Verdict.RequireApproval, "require_approval")]
-    public void Describe_Verdict_UsesTheAuditLogSpelling(Verdict verdict, string expected)
-    {
-        Assert.Equal(expected, ToolCallTelemetry.Describe(verdict));
-    }
-
-    [Theory]
-    [InlineData(DecisionSource.Policy, "policy")]
-    [InlineData(DecisionSource.Budget, "budget")]
-    [InlineData(DecisionSource.Approval, "approval")]
-    public void Describe_Source_IsSnakeCase(DecisionSource source, string expected)
-    {
-        Assert.Equal(expected, ToolCallTelemetry.Describe(source));
     }
 
     [Fact]

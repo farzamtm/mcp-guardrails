@@ -54,7 +54,7 @@ public sealed class ToolNamespacerTests
     }
 
     /// <summary>
-    /// Regression test for a bug that shipped in step 3.
+    /// Regression test for a bug that shipped in the first pass-through proxy.
     /// </summary>
     /// <remarks>
     /// The first implementation used McpClientTool.WithName(), which renames only
@@ -77,8 +77,8 @@ public sealed class ToolNamespacerTests
     [Fact]
     public void Qualify_Tool_PreservesAnnotationsAndSchema()
     {
-        // Annotations drive policy decisions later, so losing them here would
-        // silently disable the destructive-tool rules in step 5.
+        // Annotations drive policy decisions, so losing them here would
+        // silently disable the destructive-tool rules.
         var source = new Tool
         {
             Name = "write_file",

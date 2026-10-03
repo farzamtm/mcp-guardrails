@@ -211,6 +211,18 @@ one**: `not_prefix` asserts "there is a value and it does not start with this".
 A rule must not fire on evidence that was never supplied, so when a missing
 argument should also be refused, follow the rule with a catch-all.
 
+A value that *is* sent but is not a string — an array, number, object, boolean
+or `null` — **satisfies `not_prefix`**, because it cannot be shown to start
+with the prefix. That keeps a deny rule such as `not_prefix: /workspace/`
+firing on `{"path": ["/etc/passwd"]}`, which a downstream server might well
+accept. The flip side: do not write an allow rule with `not_prefix`, since it
+would allow those values too. Allow with `prefix`, which only a matching string
+satisfies, and deny with `not_prefix`.
+
+`eq` and `in` compare numbers by value and exactly: `1`, `1.0` and `1e0` are
+equal, while `9007199254740993` and `9007199254740992` are not, however far
+past double precision they sit.
+
 `prefix` and `not_prefix` compare the **literal argument string**. Nothing is
 resolved, canonicalised or normalised, so `/workspace/../etc/passwd` starts with
 `/workspace/` as far as a policy is concerned. They are good at classifying what
@@ -317,8 +329,10 @@ budgets:
 - **A call has to fit both caps.** A call the daily cap refuses is not charged
   to the session either.
 - **A broken store fails closed.** If the file cannot be opened at startup the
-  proxy exits with an error; if a write fails mid-session the call fails and is
-  not forwarded.
+  proxy exits with an error. If a charge fails mid-session - including another
+  proxy holding the file's write lock for more than 5 seconds - the call is
+  refused as `daily.unavailable`, with the database error in the audit log's
+  `decision_reason`, and is not forwarded.
 
 The daily refusal tells the agent when the budget comes back instead of
 suggesting a new session, which would not help:
@@ -503,9 +517,10 @@ rejected; the signature is the authentication.
 See [`examples/webhook-approval.yaml`](examples/webhook-approval.yaml), and
 `scripts/smoke.py` for a 40-line receiver that verifies the signature.
 
-**Not implemented yet:** `mode: slack` is rejected at load time rather than
-silently ignored: accepting configuration the proxy does not honour would show
-the operator a safeguard that does nothing. The Tasks/MRTR path the spec prefers
+**Not implemented yet:** Slack approval is planned. Until it exists, `slack` is
+not a recognised `mode`, so `mode: slack` fails at load time like any other
+unknown value rather than being silently ignored: accepting configuration the
+proxy does not honour would show the operator a safeguard that does nothing. The Tasks/MRTR path the spec prefers
 — returning an `input_required` task instead of holding the request open — lands
 behind the same `IApprovalChannel` seam.
 
@@ -748,7 +763,8 @@ from it first, with the same detectors as [secret redaction](#secret-redaction)
 and even when `scanners.secrets.results` is `off`: the classifier never needs a
 real key to recognise an injection. `base_url` must be
 https. Plain http is accepted only for a loopback address, because the API key
-travels in a header.
+travels in a header. Credentials in the URL are rejected; the key belongs in
+the variable named by `api_key_env`.
 
 ## Secret redaction
 
@@ -1028,7 +1044,7 @@ it never left the proxy.
 | `gen_ai.tool.name` | Client-visible tool name (semconv) |
 | `mcp_guardrails.server`, `mcp_guardrails.downstream_tool` | Where the call was routed |
 | `mcp_guardrails.decision` | `allow`, `deny`, `require_approval`, as in the audit log |
-| `mcp_guardrails.decision.source` | `policy`, `budget` or `approval` |
+| `mcp_guardrails.decision.source` | `policy`, `budget`, `approval` or `scanner` |
 | `mcp_guardrails.rule` | Rule that decided, or the budget limit (`session.max_cost`) |
 | `mcp_guardrails.budget.cost` | What the call costs against the budget |
 | `mcp_guardrails.approval.outcome` | `approved`, `declined`, `timed_out`, `unavailable`, `failed` |

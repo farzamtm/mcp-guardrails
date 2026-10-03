@@ -32,7 +32,14 @@ public sealed class BudgetGate
     // has to be the concrete in-memory store rather than any IBudgetStore.
     private readonly InMemoryBudgetStore? _session;
     private readonly IBudgetStore? _daily;
-    private readonly Lock _pair = new();
+
+    // A plain object rather than System.Threading.Lock because ApplyBoth needs
+    // Monitor.Wait/PulseAll, which Lock does not offer. Guards _pending only;
+    // it is never held across a call into the daily store.
+    private readonly object _pair = new();
+
+    // Session charges whose daily charge has not settled yet. See ApplyBoth.
+    private int _pending;
 
     /// <param name="store">Where the running totals live.</param>
     /// <param name="scope">
@@ -146,7 +153,10 @@ public sealed class BudgetGate
             return ApplyBoth(decision, _session, _daily);
         }
 
-        var charge = _store.TryCharge(decision.Cost);
+        if (TryCharge(_store, decision.Cost, out var charge) is { } failure)
+        {
+            return Unavailable(decision, _scope, failure);
+        }
 
         return charge.Allowed ? decision : Refuse(charge, decision, _scope);
     }
@@ -156,56 +166,125 @@ public sealed class BudgetGate
     /// work. The session goes first because it is private to this process and
     /// can be undone exactly. The daily store goes last because it is shared
     /// with other proxies and cannot be: whatever it decides is final, so it
-    /// never needs undoing. If the day refuses, the session charge is handed back.
+    /// never needs undoing. If the day refuses or fails, the session charge is
+    /// handed back.
     ///
-    /// The lock stops another call in this process from seeing the session
-    /// charge in the moment before it is refunded, which would refuse that call
-    /// for budget that was never really spent.
+    /// The daily charge is a SQLite write transaction that can wait seconds for
+    /// another proxy's write lock, so no in-process lock is held across it -
+    /// otherwise one slow disk write would queue every other call in this
+    /// process behind it, including calls the session cap would refuse at once.
+    ///
+    /// That leaves one window to close. Between a call's session charge and its
+    /// refund, a concurrent call could see the session full and be refused for
+    /// budget that was never really spent. So a session refusal while other
+    /// charges are still pending is not final: the caller waits for them to
+    /// settle and tries again, and is refused only once nothing is in flight.
+    /// Only a call already at the session cap ever waits, so the common path
+    /// stays lock-free across I/O. Neither cap can be overshot either way: each
+    /// store's own check-and-charge is atomic, and a refund only returns a charge
+    /// this call made.
     /// </remarks>
     private Decision ApplyBoth(Decision decision, InMemoryBudgetStore session, IBudgetStore daily)
     {
         lock (_pair)
         {
-            var sessionCharge = session.TryCharge(decision.Cost);
+            while (true)
+            {
+                var sessionCharge = session.TryCharge(decision.Cost);
 
-            if (!sessionCharge.Allowed)
-            {
-                return Refuse(sessionCharge, decision, SessionScope);
-            }
+                if (sessionCharge.Allowed)
+                {
+                    _pending++;
+                    break;
+                }
 
-            BudgetCharge dailyCharge;
-            try
-            {
-                dailyCharge = daily.TryCharge(decision.Cost);
+                if (_pending == 0)
+                {
+                    return Refuse(sessionCharge, decision, SessionScope);
+                }
+
+                Monitor.Wait(_pair);
             }
-            catch
+        }
+
+        var failure = TryCharge(daily, decision.Cost, out var dailyCharge);
+
+        lock (_pair)
+        {
+            // Refunded inside the same lock that decrements _pending, so a waiter
+            // that wakes up sees the refund and the settled count together.
+            if (failure is not null || !dailyCharge.Allowed)
             {
-                // The database failed, so the call fails and is not forwarded -
-                // and a call that did not go out must not cost the session.
                 session.Refund(decision.Cost);
-                throw;
             }
 
-            if (dailyCharge.Allowed)
-            {
-                return decision;
-            }
+            _pending--;
+            Monitor.PulseAll(_pair);
+        }
 
-            session.Refund(decision.Cost);
+        if (failure is not null)
+        {
+            return Unavailable(decision, DailyScope, failure);
+        }
 
-            return Refuse(dailyCharge, decision, DailyScope);
+        return dailyCharge.Allowed ? decision : Refuse(dailyCharge, decision, DailyScope);
+    }
+
+    /// <remarks>
+    /// A store that throws - SQLite busy past its timeout, a full disk, a
+    /// corrupt file - is turned into a refusal here rather than allowed to
+    /// escape. Failing closed is the point of the daily store, and a refusal is
+    /// the closed state the rest of the pipeline already understands: it is
+    /// recorded in the audit log with a reason and reaches the model as a
+    /// readable tool error, where an exception would surface as a protocol
+    /// error and leave the audit line without a decision.
+    ///
+    /// Every exception, not only SqliteException: the store is an interface,
+    /// and whatever broke it, a budget that cannot be checked must not let the
+    /// call through.
+    /// </remarks>
+    /// <returns>Null when the store answered, otherwise what it threw.</returns>
+    private static Exception? TryCharge(IBudgetStore store, long cost, out BudgetCharge charge)
+    {
+        try
+        {
+            charge = store.TryCharge(cost);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            // Never read: the caller checks the returned failure first.
+            charge = BudgetCharge.Accepted;
+            return ex;
         }
     }
 
-    private static Decision Refuse(BudgetCharge charge, Decision decision, string scope) => new(
-        Verdict.Deny,
-        Explain(charge, scope),
-        $"{scope}.{LimitName(charge.Exceeded)}",
-        decision.Trail is null ? null : [.. decision.Trail, $"budget '{scope}': exhausted -> deny"])
-    {
-        Source = DecisionSource.Budget,
-        Cost = decision.Cost,
-    };
+    /// <remarks>
+    /// Built on the incoming decision, so a call a human approved and the budget
+    /// then refused still says so in the audit log and the approvals counter.
+    /// </remarks>
+    private static Decision Refuse(BudgetCharge charge, Decision decision, string scope) =>
+        decision.RefusedBy(
+            DecisionSource.Budget,
+            $"{scope}.{LimitName(charge.Exceeded)}",
+            Explain(charge, scope),
+            $"budget '{scope}': exhausted -> deny");
+
+    /// <remarks>
+    /// Says the budget could not be checked rather than that it ran out: the
+    /// operator has a broken store to fix, and the model should stop instead of
+    /// retrying into the same failure. The exception type and message are for
+    /// the operator reading the audit log; a store error carries no tool
+    /// arguments, so nothing the agent sent is replayed.
+    /// </remarks>
+    private static Decision Unavailable(Decision decision, string scope, Exception failure) =>
+        decision.RefusedBy(
+            DecisionSource.Budget,
+            $"{scope}.unavailable",
+            $"the {scope} budget could not be checked ({failure.GetType().Name}: {failure.Message}), " +
+            "so the call is refused rather than let through unmetered. Stop calling tools and " +
+            "tell the user the guardrails budget store is failing.",
+            $"budget '{scope}': store failed -> deny");
 
     private static string LimitName(BudgetDimension? dimension) => dimension switch
     {

@@ -80,7 +80,7 @@ ruff_cmd format --check scripts
 
 step "lint shell (shellcheck)"
 require shellcheck "brew install shellcheck"
-shellcheck scripts/*.sh
+shellcheck scripts/*.sh .githooks/*
 
 step "end-to-end smoke through a real downstream server"
 require node "needed to spawn the downstream MCP server via npx"

@@ -114,7 +114,7 @@ public sealed class ClassifierSettingsTests
     {
         var settings = new ScannerSettings { Classifier = new ClassifierSettings { Mode = (ClassifierMode)42 } };
 
-        var error = Assert.Throws<PolicyException>(() => settings.Validate("injection"));
+        var error = Assert.Throws<PolicyException>(() => settings.Validate());
 
         Assert.Contains("off, confirm or all", error.Message, StringComparison.Ordinal);
     }
@@ -122,9 +122,10 @@ public sealed class ClassifierSettingsTests
     [Theory]
     [InlineData("      model: \"  \"\n", "'scanners.injection.classifier.model' is blank")]
     [InlineData("      api_key_env: \"\"\n", "'scanners.injection.classifier.api_key_env' is blank")]
-    [InlineData("      base_url: not a url\n", "is not an absolute URL")]
-    [InlineData("      base_url: http://api.anthropic.com\n", "must be https")]
-    [InlineData("      base_url: ftp://localhost/\n", "must be https")]
+    [InlineData("      base_url: not a url\n", "'scanners.injection.classifier.base_url' is not an absolute URL")]
+    [InlineData("      base_url: http://api.anthropic.com\n", "accepted only for loopback")]
+    [InlineData("      base_url: ftp://localhost/\n", "uses 'ftp'. Use https")]
+    [InlineData("      base_url: https://key:sk-ant-x@gateway.example.test/\n", "contains credentials")]
     [InlineData("      timeout_ms: 0\n", "'scanners.injection.classifier.timeout_ms' is 0")]
     [InlineData("      timeout_ms: 60001\n", "Use 1 to 60000")]
     [InlineData("      max_chars: -1\n", "'scanners.injection.classifier.max_chars' is -1")]
@@ -137,6 +138,17 @@ public sealed class ClassifierSettingsTests
     }
 
     [Fact]
+    public void CredentialsInTheBaseUrl_AreRejectedWithoutEchoingThem()
+    {
+        // The same rule as the approval webhook: a key in a URL leaks into every
+        // log line and error message that prints the URL.
+        var error = Rejects("      base_url: \"http://user:hunter2@localhost:8080\"\n");
+
+        Assert.Contains("api_key_env", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("hunter2", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TheBoundaryValues_AreAccepted()
     {
         var classifier = Injection(
@@ -144,18 +156,6 @@ public sealed class ClassifierSettingsTests
 
         Assert.Equal(TimeSpan.FromMinutes(1), classifier.EffectiveTimeout);
         Assert.Equal(1, classifier.EffectiveMaxChars);
-    }
-
-    [Fact]
-    public void AClassifierOnAnotherScanner_IsRejected()
-    {
-        // Only reachable in code today - 'scanners.secrets' is refused outright -
-        // but the check must hold once another scanner section is accepted.
-        var settings = new ScannerSettings { Classifier = ClassifierSettings.Default };
-
-        var error = Assert.Throws<PolicyException>(() => settings.Validate("secrets"));
-
-        Assert.Contains("'scanners.secrets.classifier' is not supported", error.Message, StringComparison.Ordinal);
     }
 
     // ------------------------------------------------------------------ report

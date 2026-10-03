@@ -63,8 +63,11 @@ public sealed class ApprovalPolicyLoadingTests
     }
 
     [Fact]
-    public void ASlackApprover_FailsAtLoadTime()
+    public void ASlackApprover_IsAnUnknownModeAtLoadTime()
     {
+        // Slack is planned, not built. With no enum member for it the value
+        // fails like any other typo - the operator learns at startup that
+        // nothing would be notified, instead of trusting an approver nobody asks.
         var error = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""
             rules:
               - name: approve-destructive
@@ -73,7 +76,8 @@ public sealed class ApprovalPolicyLoadingTests
                   mode: slack
             """));
 
-        Assert.Contains("not implemented yet", error.Message, StringComparison.Ordinal);
+        Assert.Contains("Policy file is not valid", error.Message, StringComparison.Ordinal);
+        Assert.Contains("approval.mode", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

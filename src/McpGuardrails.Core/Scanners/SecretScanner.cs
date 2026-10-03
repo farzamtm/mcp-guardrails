@@ -88,6 +88,8 @@ public static class SecretScanner
 
     private const string _secretGroup = "secret";
 
+    private const string _markerPrefix = "[REDACTED:";
+
     private const RegexOptions _options = RegexOptions.NonBacktracking | RegexOptions.CultureInvariant;
 
     /// <param name="Name">What the marker and the audit log call it.</param>
@@ -212,7 +214,7 @@ public static class SecretScanner
     };
 
     /// <summary>The marker a secret of this kind is replaced with.</summary>
-    public static string Marker(string detector) => $"[REDACTED:{detector}]";
+    public static string Marker(string detector) => $"{_markerPrefix}{detector}]";
 
     /// <summary>
     /// Redacts every secret in a piece of text.
@@ -275,20 +277,31 @@ public static class SecretScanner
     /// Only string values are touched. Keys are left alone, and numbers are not
     /// rewritten into marker strings: changing a value's JSON type would break a
     /// schema-checked tool in a way a marker inside a string does not.
+    ///
+    /// Two passes, and the second only on a hit. Nearly every payload is clean,
+    /// and the first pass reads it without a buffer, a writer or a reparse; a hit
+    /// pays for scanning its strings twice, which is the rare path.
     /// </remarks>
     public static JsonRedaction RedactJson(JsonElement element, string? propertyName, bool includePii)
     {
-        var buffer = new ArrayBufferWriter<byte>();
         var report = SecretReport.Clean;
 
-        using (var writer = new Utf8JsonWriter(buffer))
-        {
-            Write(writer, element, propertyName, includePii, ref report);
-        }
+        Write(writer: null, element, propertyName, includePii, ref report);
 
         if (report.IsClean)
         {
             return new JsonRedaction(element, report);
+        }
+
+        var buffer = new ArrayBufferWriter<byte>();
+
+        // The second pass finds exactly what the first did, so its report is
+        // discarded rather than merged into a double count.
+        var rewritten = SecretReport.Clean;
+
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            Write(writer, element, propertyName, includePii, ref rewritten);
         }
 
         // Clone detaches the element from the document, which is disposed here;
@@ -298,8 +311,45 @@ public static class SecretScanner
         return new JsonRedaction(document.RootElement.Clone(), report);
     }
 
+    /// <summary>
+    /// What a human may be shown of one argument value: its secrets replaced,
+    /// as text.
+    /// </summary>
+    /// <param name="value">The argument value.</param>
+    /// <param name="propertyName">The argument's name, so a <c>password</c> is redacted whole.</param>
+    /// <param name="includePii">Also redact email addresses and card numbers.</param>
+    /// <returns>
+    /// A string value unquoted, so a path reads as a path; anything else as JSON,
+    /// so an object or a number is not misrepresented.
+    /// </returns>
+    /// <remarks>
+    /// The same rules the audit log and the forwarded arguments get - sensitive
+    /// field names, decoded strings, PII when configured - so an approver is never
+    /// shown a value the log was not allowed to keep. A non-string value is then
+    /// scanned once more as text, for what <see cref="RedactJson"/> leaves alone
+    /// by design: keys, and a card number sent as a JSON number. Neither changes
+    /// a type here, because this text goes to a person rather than to a tool.
+    /// </remarks>
+    public static string RedactForDisplay(JsonElement value, string? propertyName, bool includePii)
+    {
+        if (value.ValueKind is JsonValueKind.String)
+        {
+            var report = SecretReport.Clean;
+            return RedactString(value.GetString()!, propertyName, includePii, ref report);
+        }
+
+        var json = RedactJson(value, propertyName, includePii).Element.GetRawText();
+
+        return Redact(json, includePii).Text;
+    }
+
+    /// <remarks>
+    /// One walk for both passes: with no writer it only scans, so the scan the
+    /// rewrite depends on cannot drift from the one that decides whether to
+    /// rewrite at all.
+    /// </remarks>
     private static void Write(
-        Utf8JsonWriter writer,
+        Utf8JsonWriter? writer,
         JsonElement element,
         string? propertyName,
         bool includePii,
@@ -308,34 +358,39 @@ public static class SecretScanner
         switch (element.ValueKind)
         {
             case JsonValueKind.Object:
-                writer.WriteStartObject();
+                writer?.WriteStartObject();
                 foreach (var property in element.EnumerateObject())
                 {
-                    writer.WritePropertyName(property.Name);
+                    writer?.WritePropertyName(property.Name);
                     Write(writer, property.Value, property.Name, includePii, ref report);
                 }
 
-                writer.WriteEndObject();
+                writer?.WriteEndObject();
                 break;
 
             case JsonValueKind.Array:
                 // Items inherit the array's key: every entry of "api_keys" or
                 // "authorization" is as sensitive as a single one would be.
-                writer.WriteStartArray();
+                writer?.WriteStartArray();
                 foreach (var item in element.EnumerateArray())
                 {
                     Write(writer, item, propertyName, includePii, ref report);
                 }
 
-                writer.WriteEndArray();
+                writer?.WriteEndArray();
                 break;
 
             case JsonValueKind.String:
-                writer.WriteStringValue(RedactString(element.GetString()!, propertyName, includePii, ref report));
+                var redacted = RedactString(element.GetString()!, propertyName, includePii, ref report);
+                writer?.WriteStringValue(redacted);
                 break;
 
             default:
-                element.WriteTo(writer);
+                if (writer is not null)
+                {
+                    element.WriteTo(writer);
+                }
+
                 break;
         }
     }
@@ -442,6 +497,14 @@ public static class SecretScanner
     /// </remarks>
     private static bool IsCredentialValue(string text, Group span)
     {
+        // Our own marker, from an earlier pass. Without this, re-scanning
+        // redacted JSON relabels "password": "[REDACTED:sensitive-field]" as a
+        // credential assignment, and the reader loses the more specific name.
+        if (text.AsSpan(span.Index, span.Length).StartsWith(_markerPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
         if (text[span.Index - 1] is '"' or '\'')
         {
             return true;
@@ -577,16 +640,6 @@ public sealed record SecretReport(IReadOnlyList<string> Detectors, int Count)
             return other;
         }
 
-        var merged = new List<string>(Detectors);
-
-        foreach (var name in other.Detectors)
-        {
-            if (!merged.Contains(name))
-            {
-                merged.Add(name);
-            }
-        }
-
-        return new SecretReport(merged, Count + other.Count);
+        return new SecretReport(ResultContent.OrderedUnion(Detectors, other.Detectors), Count + other.Count);
     }
 }

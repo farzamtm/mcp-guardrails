@@ -167,11 +167,14 @@ the fastest route to "clean up the repo" is `rm`.
     the model could pad an argument until the rule gave up;
   - a predicate never fires on an argument that was not sent, including
     `not_prefix`, so a rule cannot match on evidence that does not exist;
+  - an argument that is present but not a string (array, number, object,
+    `null`) **satisfies `not_prefix`**, so a deny rule cannot be stepped round
+    by wrapping a path in an array;
   - a malformed policy file, or a policy path that is a directory, **refuses to
     start** rather than falling back to passthrough
     ([`PolicyLoader`](../src/McpGuardrails.Core/Policy/PolicyLoader.cs));
-  - configuration the build cannot honour — `mode: slack` — is a load-time
-    error, not a silent no-op.
+  - configuration the build cannot honour — `mode: slack`, an unrecognised
+    value — is a load-time error, not a silent no-op.
 - **The arguments policy sees are the arguments the server gets.** The call
   handler forwards the same parsed argument dictionary the policy evaluated, so
   there is no second parse for a duplicate key or encoding trick to exploit.
@@ -456,7 +459,7 @@ loader **rejects** it rather than accepting a setting that does nothing.
 
 | Planned | Today |
 | --- | --- |
-| Slack approval (`approval.mode: slack`) | Rejected at load; `in_band` elicitation or a signed webhook |
+| Slack approval (`approval.mode: slack`) | Not a recognised mode, so rejected at load; `in_band` elicitation or a signed webhook |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
 | Configurable upstream servers | One hard-coded filesystem server ([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)) |
 | Policy reload without restart | Read once at startup |

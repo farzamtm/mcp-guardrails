@@ -22,7 +22,7 @@ public enum Verdict
     [JsonStringEnumMemberName("deny")]
     Deny,
 
-    /// <summary>Hold the call until a human approves it. Implemented in step 8.</summary>
+    /// <summary>Hold the call until a human approves it; see ApprovalGate.</summary>
     [JsonStringEnumMemberName("require_approval")]
     RequireApproval,
 }
@@ -48,7 +48,10 @@ public enum DecisionSource
     /// <summary>A human, or the absence of one.</summary>
     Approval,
 
-    /// <summary>A content scanner that found something in the arguments.</summary>
+    /// <summary>
+    /// A content scanner: a secret in the arguments, or a tool whose definition
+    /// was withheld for looking like an injection.
+    /// </summary>
     Scanner,
 }
 
@@ -119,6 +122,36 @@ public sealed record Decision(
     /// different lines to find in an audit log six weeks later.
     /// </remarks>
     public ApprovalOutcome? ApprovalResult { get; init; }
+
+    /// <summary>
+    /// This decision, overturned into a refusal by a later gate.
+    /// </summary>
+    /// <param name="source">The gate refusing.</param>
+    /// <param name="rule">The rule, budget limit or scanner it refused under.</param>
+    /// <param name="reason">Why, written for the model.</param>
+    /// <param name="trailEntry">
+    /// The line <c>--explain</c> shows for the refusal. Appended only when a
+    /// trail is being kept, so a call without <c>--explain</c> allocates nothing.
+    /// </param>
+    /// <remarks>
+    /// Every gate after the policy refuses through here rather than building a
+    /// decision by hand, because the hand-built copies drifted: one dropped the
+    /// approval result, so a call a human approved and the budget then refused
+    /// lost the approval from the audit log and the approvals counter; another
+    /// left the trail empty, so <c>--explain</c> showed nothing for an approval
+    /// refusal. Built with <c>with</c>, so whatever an earlier gate recorded -
+    /// cost, approval settings, the human's answer - survives by default, and a
+    /// property added later survives too without anyone remembering to copy it.
+    /// </remarks>
+    public Decision RefusedBy(DecisionSource source, string? rule, string reason, string trailEntry) =>
+        this with
+        {
+            Verdict = Verdict.Deny,
+            Reason = reason,
+            RuleName = rule,
+            Source = source,
+            Trail = Trail is null ? null : [.. Trail, trailEntry],
+        };
 
     /// <summary>True when the call must not be forwarded as-is.</summary>
     public bool IsBlocked => Verdict is Verdict.Deny or Verdict.RequireApproval;

@@ -30,7 +30,7 @@ public sealed class UpstreamRegistryTests
         {
             Name = "delete_everything",
             // Annotations must survive namespacing - the policy engine matches on
-            // them in step 5.
+            // them.
             Destructive = true,
             ReadOnly = false,
         });

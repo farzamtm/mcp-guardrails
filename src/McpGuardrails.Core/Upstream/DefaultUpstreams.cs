@@ -1,12 +1,13 @@
 namespace McpGuardrails.Core.Upstream;
 
 /// <summary>
-/// Hardcoded upstream servers used while the proxy has no config file yet.
+/// The downstream servers the proxy connects to.
 /// </summary>
 /// <remarks>
-/// Step 5 replaces this with the YAML policy/config loader. It exists so the
-/// earlier steps stay runnable without also building configuration parsing -
-/// one new concept at a time.
+/// Fixed in code: there is no configuration file for upstream servers, and the
+/// policy file deliberately does not describe them - it says what calls may do,
+/// not where they go. The one server is sandboxed by its own launch arguments,
+/// so the policy is a layer above that containment rather than the only one.
 /// </remarks>
 public static class DefaultUpstreams
 {

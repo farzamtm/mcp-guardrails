@@ -88,21 +88,13 @@ public sealed record WebhookApproverSettings
             throw new PolicyException("'approvers.webhook' needs a 'url' to send approval requests to.");
         }
 
-        if (!Uri.TryCreate(Url, UriKind.Absolute, out var uri))
-        {
-            throw new PolicyException(
-                $"'approvers.webhook.url' ('{Url}') is not an absolute URL.");
-        }
-
-        // Credentials in the URL are a secret in the policy file by another name.
-        if (uri.UserInfo.Length > 0)
-        {
-            throw new PolicyException(
-                "'approvers.webhook.url' contains credentials. Keep secrets out of the policy " +
-                "file; the request is authenticated by its signature (see 'secret_env').");
-        }
-
-        ValidateScheme(uri);
+        OutboundUrl.Validate(
+            Url,
+            "approvers.webhook.url",
+            reason: "Approval requests carry the call's arguments and the answer decides whether it runs",
+            credentialHint: "the request is authenticated by its signature (see 'secret_env')",
+            allowLoopbackHttp: AllowInsecureLocalhost is true,
+            optInSetting: "allow_insecure_localhost");
 
         if (string.IsNullOrWhiteSpace(SecretEnv))
         {
@@ -147,36 +139,6 @@ public sealed record WebhookApproverSettings
         }
 
         return Encoding.UTF8.GetBytes(secret);
-    }
-
-    private void ValidateScheme(Uri uri)
-    {
-        if (uri.Scheme == Uri.UriSchemeHttps)
-        {
-            return;
-        }
-
-        if (uri.Scheme != Uri.UriSchemeHttp)
-        {
-            throw new PolicyException(
-                $"'approvers.webhook.url' uses '{uri.Scheme}'. Use https.");
-        }
-
-        if (AllowInsecureLocalhost is not true)
-        {
-            throw new PolicyException(
-                "'approvers.webhook.url' uses plain http. Approval requests carry the call's " +
-                "arguments and the answer decides whether it runs, so use https - or, for a " +
-                "receiver on this machine only, set 'allow_insecure_localhost: true'.");
-        }
-
-        if (!uri.IsLoopback)
-        {
-            throw new PolicyException(
-                $"'approvers.webhook.url' uses plain http to '{uri.Host}', but " +
-                "'allow_insecure_localhost' only permits loopback addresses (localhost, " +
-                "127.0.0.1, ::1). Use https for anything else.");
-        }
     }
 
     private static bool IsEnvironmentVariableName(string name)

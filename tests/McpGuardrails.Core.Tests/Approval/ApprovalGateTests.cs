@@ -117,6 +117,28 @@ public sealed class ApprovalGateTests
     }
 
     [Fact]
+    public async Task UnderExplain_AnApprovalRefusal_IsAppendedToTheTrail()
+    {
+        // Without this line --explain showed the policy matching and then
+        // nothing, leaving "why was an approvable call refused?" unanswered.
+        var decision = new Decision(
+            Verdict.RequireApproval,
+            "a human must approve this",
+            "approve-destructive",
+            ["rule 'approve-destructive': MATCHED -> require_approval"]);
+
+        var result = await ApprovalGate.ApplyAsync(decision, _call, new FakeChannel(ApprovalOutcome.Declined));
+
+        Assert.Equal(
+            [
+                "rule 'approve-destructive': MATCHED -> require_approval",
+                "approval for rule 'approve-destructive': declined -> deny",
+            ],
+            result.Trail);
+        Assert.Equal("approve-destructive", result.RuleName);
+    }
+
+    [Fact]
     public async Task AClientThatCannotAsk_IsADenialThatSaysSo()
     {
         // The fail-closed case, and the one an operator is most likely to meet:

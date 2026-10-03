@@ -174,7 +174,7 @@ public sealed record ClassifierSettings
                 $"or omit it for {DefaultApiKeyEnv}.");
         }
 
-        ValidateBaseUrl(Key);
+        ValidateBaseUrl();
 
         if (TimeoutMs is <= 0 or > MaxTimeoutMs)
         {
@@ -192,31 +192,24 @@ public sealed record ClassifierSettings
     }
 
     /// <remarks>
-    /// The API key travels in a header on every request, so plain HTTP is only
-    /// accepted to a loopback address - a local gateway or a test double. Anywhere
-    /// else it would be sending a credential across the network in the clear.
+    /// Plain http to a loopback address - a local gateway or a test double - needs
+    /// no opt-in here, unlike the approval webhook: configurations (and the smoke
+    /// test's fake Messages API) already rely on it, and the key never leaves the
+    /// machine. Anywhere else it would cross the network in the clear.
     /// </remarks>
-    private void ValidateBaseUrl(string key)
+    private void ValidateBaseUrl()
     {
         if (BaseUrl is null)
         {
             return;
         }
 
-        if (!Uri.TryCreate(BaseUrl, UriKind.Absolute, out var uri))
-        {
-            throw new PolicyException($"{key}.base_url' is not an absolute URL.");
-        }
-
-        var secure = uri.Scheme == Uri.UriSchemeHttps;
-        var local = uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback;
-
-        if (!secure && !local)
-        {
-            throw new PolicyException(
-                $"{key}.base_url' must be https (plain http is accepted only for a loopback " +
-                "address), because the API key is sent with every request.");
-        }
+        OutboundUrl.Validate(
+            BaseUrl,
+            "scanners.injection.classifier.base_url",
+            reason: "The API key is sent with every request",
+            credentialHint: "the API key is read from the variable named in 'api_key_env'",
+            allowLoopbackHttp: true);
     }
 
     private static string Format(int value) => value.ToString(CultureInfo.InvariantCulture);

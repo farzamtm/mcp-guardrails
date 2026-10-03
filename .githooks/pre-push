@@ -26,9 +26,8 @@ is_zero() { case "${1:-}" in '') return 1 ;; *[!0]*) return 1 ;; *) return 0 ;; 
 has_refs=0
 has_commits=0
 
-# shellcheck disable=SC2034  # local_ref is positional; only the shas and the
-# remote ref matter here.
-while read -r local_ref local_sha remote_ref remote_sha; do
+# The local ref is read into _ : only the shas and the remote ref matter here.
+while read -r _ local_sha remote_ref remote_sha; do
   [ -z "${remote_ref:-}" ] && continue
   has_refs=1
 

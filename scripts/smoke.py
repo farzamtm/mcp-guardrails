@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
@@ -440,8 +441,55 @@ def call(rid: int, name: str, args: dict) -> dict:
     return request(rid, "tools/call", {"name": name, "arguments": args})
 
 
-# Each entry: (request, human label, predicate over the `result` object)
-CHECKS: list[tuple[dict, str, object]] = [
+# Each entry: (request, human label, predicate over the `result` object). The
+# predicate returns anything truthy rather than a strict bool so a check can end
+# in an `in` or a `.get()` without wrapping it.
+type Check = tuple[dict, str, Callable[[dict], object]]
+
+
+class Checker:
+    """Prints a PASS/FAIL line per condition and counts the failures.
+
+    Every phase reports the same way and returns its failure count, so the
+    counting lives here once. `failures` starts from a session's own count when
+    a phase adds its checks on top of run_session's.
+    """
+
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+
+    def expect(self, condition: bool, label: str) -> None:
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            self.failures += 1
+
+
+def read_audit_text(path: str, what: str) -> tuple[str, list[dict]] | None:
+    """Return an audit log's raw text and parsed records, or None after a FAIL.
+
+    A missing or unparseable log is itself a failed check: the caller counts it
+    as one failure and skips the assertions that would need the records.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+        lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    except FileNotFoundError:
+        print(f"FAIL  {what} was not created")
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL  {what} unreadable: {exc}")
+        return None
+    return raw, lines
+
+
+def read_audit(path: str, what: str) -> list[dict] | None:
+    """read_audit_text for the callers that only need the parsed records."""
+    audit = read_audit_text(path, what)
+    return None if audit is None else audit[1]
+
+
+CHECKS: list[Check] = [
     (
         request(1, "tools/list"),
         "proxy advertises namespaced downstream tools",
@@ -473,7 +521,7 @@ def denied_with(result: dict, fragment: str) -> bool:
 
 
 # Each entry: (request, human label, predicate over the `result` object)
-POLICY_CHECKS: list[tuple[dict, str, object]] = [
+POLICY_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": PROBE, "content": CONTENT}),
         "glob + argument predicate allows a write inside the sandbox",
@@ -510,7 +558,7 @@ POLICY_CHECKS: list[tuple[dict, str, object]] = [
 
 # The budget is per session, so these run in order against one proxy process and
 # each check depends on the one before it. That is the behaviour under test.
-BUDGET_CHECKS: list[tuple[dict, str, object]] = [
+BUDGET_CHECKS: list[Check] = [
     # Two unknown-tool calls first. Were they charged at the default cost of 1,
     # the write below would need 2 + 2 = 4 against a cap of 3 and be refused.
     (
@@ -543,7 +591,7 @@ BUDGET_CHECKS: list[tuple[dict, str, object]] = [
 
 # Two sessions, two processes, one database: the second must see the first's
 # spend.
-DAILY_FIRST_CHECKS: list[tuple[dict, str, object]] = [
+DAILY_FIRST_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": DAILY_PROBE, "content": CONTENT}),
         "the first write of the day fits the daily budget",
@@ -551,7 +599,7 @@ DAILY_FIRST_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
-DAILY_SECOND_CHECKS: list[tuple[dict, str, object]] = [
+DAILY_SECOND_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": DAILY_OVER, "content": CONTENT}),
         "a restarted proxy still remembers today's spend and refuses",
@@ -568,7 +616,7 @@ DAILY_SECOND_CHECKS: list[tuple[dict, str, object]] = [
 # Four sessions, one per answer a human can give - including not being there at
 # all. Each runs against its own proxy process because the answer is fixed for
 # the session.
-APPROVED_CHECKS: list[tuple[dict, str, object]] = [
+APPROVED_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": APPROVAL_PROBE, "content": CONTENT}),
         "a human approves and the write goes through",
@@ -586,7 +634,7 @@ APPROVED_CHECKS: list[tuple[dict, str, object]] = [
 # for the redaction marker, and for the absence of the key itself.
 APPROVAL_SECRET_CONTENT = f"{CONTENT}\naws_access_key_id = {AWS_KEY}\n"
 
-DECLINED_CHECKS: list[tuple[dict, str, object]] = [
+DECLINED_CHECKS: list[Check] = [
     (
         call(
             1,
@@ -598,7 +646,7 @@ DECLINED_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
-TIMEOUT_CHECKS: list[tuple[dict, str, object]] = [
+TIMEOUT_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
         "nobody answers and silence is refusal",
@@ -606,7 +654,7 @@ TIMEOUT_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
-OTEL_CHECKS: list[tuple[dict, str, object]] = [
+OTEL_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": OTEL_PROBE, "content": OTEL_SECRET}),
         "with OTel export on, an allowed write still goes through",
@@ -619,7 +667,7 @@ OTEL_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
-NO_APPROVER_CHECKS: list[tuple[dict, str, object]] = [
+NO_APPROVER_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": APPROVAL_REFUSED, "content": CONTENT}),
         "a client that cannot ask anyone is refused, and told why",
@@ -630,7 +678,7 @@ NO_APPROVER_CHECKS: list[tuple[dict, str, object]] = [
 
 # One session, no handshake: the client declares no elicitation capability, so
 # a pass here proves the question went to the webhook and not to the client.
-WEBHOOK_CHECKS: list[tuple[dict, str, object]] = [
+WEBHOOK_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": WEBHOOK_PROBE, "content": CONTENT}),
         "a webhook approves and the write goes through",
@@ -671,7 +719,7 @@ def metadata_untouched(result: dict) -> bool:
 
 # No policy file at all, so this is the out-of-the-box behaviour: a proxy nobody
 # configured still refuses to hand a poisoned result to the model unlabelled.
-SCAN_CHECKS: list[tuple[dict, str, object]] = [
+SCAN_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": POISONED, "content": INJECTION}),
         "writing the poisoned file is itself unremarkable",
@@ -730,7 +778,7 @@ SCAN_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
-SCAN_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
+SCAN_BLOCK_CHECKS: list[Check] = [
     (
         call(1, "fs__read_text_file", {"path": POISONED}),
         "with action: block the content is withheld entirely",
@@ -751,7 +799,7 @@ SCAN_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
 # The fake classifier says BENIGN: it can soften the block, never drop the
 # warning, because it read the same attacker-controlled text and may have been
 # talked round.
-CLASSIFIER_BENIGN_CHECKS: list[tuple[dict, str, object]] = [
+CLASSIFIER_BENIGN_CHECKS: list[Check] = [
     (
         call(1, "fs__read_text_file", {"path": POISONED}),
         "a classifier that calls the hit benign softens block to annotate",
@@ -773,7 +821,7 @@ CLASSIFIER_BENIGN_CHECKS: list[tuple[dict, str, object]] = [
 
 # The fake classifier answers HTTP 500: an unavailable second opinion must not
 # break the call, and must not weaken it either.
-CLASSIFIER_FAILED_CHECKS: list[tuple[dict, str, object]] = [
+CLASSIFIER_FAILED_CHECKS: list[Check] = [
     (
         call(1, "fs__read_text_file", {"path": POISONED}),
         "a failing classifier leaves the heuristic block in place",
@@ -844,19 +892,15 @@ def run_webhook_phase() -> tuple[int, list[str]]:
             WEBHOOK_CHECKS, {**env, WEBHOOK_SECRET_ENV: WEBHOOK_SECRET}
         )
 
-        def expect(condition: bool, label: str) -> None:
-            nonlocal failures
-            print(f"{'PASS' if condition else 'FAIL'}  {label}")
-            if not condition:
-                failures += 1
+        check = Checker(failures)
 
         seen = WebhookReceiver.seen
-        expect(len(seen) == 2, f"the receiver was asked twice (got {len(seen)})")
-        expect(
+        check.expect(len(seen) == 2, f"the receiver was asked twice (got {len(seen)})")
+        check.expect(
             all(entry["signed"] for entry in seen),
             "every request carried a valid HMAC-SHA256 signature",
         )
-        expect(
+        check.expect(
             all(
                 entry.get("server") == "fs" and entry.get("rule") == "webhook-writes"
                 for entry in seen
@@ -879,7 +923,7 @@ def run_webhook_phase() -> tuple[int, list[str]]:
             },
             check=False,
         )
-        expect(
+        check.expect(
             unsigned.returncode != 0 and WEBHOOK_SECRET_ENV in unsigned.stderr,
             "a missing signing secret is a startup error that names the variable",
         )
@@ -887,13 +931,13 @@ def run_webhook_phase() -> tuple[int, list[str]]:
         server.shutdown()
         server.server_close()
 
-    return failures, stderr_lines
+    return check.failures, stderr_lines
 
 
 # No policy file: what a proxy nobody configured does with a credential. The
 # write is forwarded - the agent may have been asked to write that file - but the
 # read comes back scrubbed, and the audit log never sees the key at all.
-SECRET_CHECKS: list[tuple[dict, str, object]] = [
+SECRET_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": SECRET_PROBE, "content": CREDENTIALS}),
         "by default a credential in the arguments still reaches the server",
@@ -917,7 +961,7 @@ SECRET_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
-SECRET_REDACT_CHECKS: list[tuple[dict, str, object]] = [
+SECRET_REDACT_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": SECRET_REDACTED, "content": CREDENTIALS}),
         "with arguments: redact the write still succeeds",
@@ -925,7 +969,7 @@ SECRET_REDACT_CHECKS: list[tuple[dict, str, object]] = [
     ),
 ]
 
-SECRET_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
+SECRET_BLOCK_CHECKS: list[Check] = [
     (
         call(1, "fs__write_file", {"path": SECRET_REFUSED, "content": CREDENTIALS}),
         "with arguments: block the write is refused, naming the setting",
@@ -948,7 +992,7 @@ SECRET_BLOCK_CHECKS: list[tuple[dict, str, object]] = [
 
 # Run in order against one HTTP proxy process; the budget check depends on the
 # three successful calls before it.
-HTTP_CHECKS: list[tuple[dict, str, object]] = [
+HTTP_CHECKS: list[Check] = [
     (
         request(1, "tools/list"),
         "HTTP: proxy advertises namespaced downstream tools",
@@ -1284,7 +1328,7 @@ def main() -> int:
 
 
 def run_session(
-    checks: list[tuple[dict, str, object]],
+    checks: list[Check],
     extra_env: dict[str, str],
     *,
     handshake: bool = False,
@@ -1407,7 +1451,7 @@ def run_session(
                 break
 
             result = msg.get("result")
-            ok = result is not None and bool(predicate(result))  # type: ignore[operator]
+            ok = result is not None and bool(predicate(result))
             print(f"{'PASS' if ok else 'FAIL'}  {label}")
             if not ok:
                 failures += 1
@@ -1471,37 +1515,35 @@ def run_otel_phase() -> tuple[int, list[str]]:
     traces = b"".join(received.get("/v1/traces", []))
     metrics = b"".join(received.get("/v1/metrics", []))
 
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker(failures)
 
-    expect(bool(traces), "spans are exported over OTLP")
-    expect(b"guardrails tools/call fs__write_file" in traces, "one span per tool call")
-    expect(
+    check.expect(bool(traces), "spans are exported over OTLP")
+    check.expect(
+        b"guardrails tools/call fs__write_file" in traces, "one span per tool call"
+    )
+    check.expect(
         b"mcp_guardrails.decision" in traces and b"deny-sandbox-escape" in traces,
         "the span carries the decision and the rule that made it",
     )
-    expect(
+    check.expect(
         b"Experimental.ModelContextProtocol" in traces,
         "the MCP SDK's own spans are in the same trace export",
     )
-    expect(
+    check.expect(
         b"mcp_guardrails.denials" in metrics
         and b"mcp_guardrails.tool_call.duration" in metrics,
         "denial counter and latency histogram are exported",
     )
-    expect(
+    check.expect(
         OTEL_SECRET.encode() not in traces + metrics,
         "argument values never reach the telemetry backend",
     )
 
-    return failures, stderr_lines
+    return check.failures, stderr_lines
 
 
 def run_http_session(
-    checks: list[tuple[dict, str, object]],
+    checks: list[Check],
     extra_env: dict[str, str],
 ) -> tuple[int, list[str]]:
     """Drive one proxy process serving Streamable HTTP through a list of checks.
@@ -1537,13 +1579,7 @@ def run_http_session(
 
     threading.Thread(target=drain, daemon=True).start()
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     try:
         # Generous: the downstream server is fetched by npx before we listen.
@@ -1552,16 +1588,16 @@ def run_http_session(
             return 1, stderr_lines
 
         url = endpoint[0]
-        expect(
+        check.expect(
             url.startswith("http://127.0.0.1:"),
             f"HTTP: binds loopback by default ({url})",
         )
 
         status, _ = http_post(url, request(100, "tools/list"), token=None)
-        expect(status == 401, f"HTTP: no bearer token -> 401 (got {status})")
+        check.expect(status == 401, f"HTTP: no bearer token -> 401 (got {status})")
 
         status, _ = http_post(url, request(101, "tools/list"), token="wrong-token")
-        expect(status == 401, f"HTTP: wrong bearer token -> 401 (got {status})")
+        check.expect(status == 401, f"HTTP: wrong bearer token -> 401 (got {status})")
 
         # What a browser sends when someone else's page targets the loopback
         # port, e.g. after DNS rebinding. The right token must not rescue it.
@@ -1571,7 +1607,7 @@ def run_http_session(
             token=HTTP_TOKEN,
             origin="https://attacker.example",
         )
-        expect(status == 403, f"HTTP: foreign Origin -> 403 (got {status})")
+        check.expect(status == 403, f"HTTP: foreign Origin -> 403 (got {status})")
 
         for req, label, predicate in checks:
             started = time.monotonic()
@@ -1580,13 +1616,13 @@ def run_http_session(
 
             result = msg.get("result") if msg else None
             ok = status == 200 and result is not None
-            ok = ok and bool(predicate(result))  # type: ignore[operator]
+            ok = ok and bool(predicate(result))
             # A refusal that only arrives when the 30s approval deadline expires
             # would pass the predicate, but it is the hang this design rules out.
             ok = ok and elapsed < 10
             print(f"{'PASS' if ok else 'FAIL'}  {label}")
             if not ok:
-                failures += 1
+                check.failures += 1
                 print(f"  status={status} elapsed={elapsed:.1f}s")
                 print(json.dumps(msg, indent=2)[:700])
 
@@ -1602,7 +1638,7 @@ def run_http_session(
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    return failures, stderr_lines
+    return check.failures, stderr_lines
 
 
 def wait_for_lines(path: str, count: int, *, timeout: float) -> None:
@@ -1677,43 +1713,31 @@ def http_post(
 
 def check_http_audit_log() -> int:
     """HTTP calls must be audited exactly like stdio ones."""
-    try:
-        with open(HTTP_AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  HTTP audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  HTTP audit log unreadable: {exc}")
+    lines = read_audit(HTTP_AUDIT, "HTTP audit log")
+    if lines is None:
         return 1
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     # Six tool calls; the HTTP requests refused for auth or origin never reached
     # the MCP server, so they are not tool calls and must not appear.
-    expect(
+    check.expect(
         len(lines) == 6,
         "HTTP: one audit line per tools/call, none for refused requests "
         f"(got {len(lines)})",
     )
     rules = {entry.get("rule") for entry in lines if entry.get("decision") == "deny"}
-    expect(
+    check.expect(
         rules == {"deny-sandbox-escape", "approve-unapproved", "daily.max_calls"},
         "HTTP: audit names the policy, approval and budget refusals "
         f"(got {sorted(r or '' for r in rules)})",
     )
-    expect(
+    check.expect(
         any(entry.get("approval") == "unavailable" for entry in lines),
         "HTTP: the unapprovable call is logged as approval 'unavailable'",
     )
 
-    return failures
+    return check.failures
 
 
 def check_http_refuses_session_budget() -> int:
@@ -1755,36 +1779,24 @@ def check_http_refuses_session_budget() -> int:
 
 def check_policy_audit_log() -> int:
     """The audit log must name the rule that refused each call."""
-    try:
-        with open(POLICY_AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  policy audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  policy audit log unreadable: {exc}")
+    lines = read_audit(POLICY_AUDIT, "policy audit log")
+    if lines is None:
         return 1
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     denials = [entry for entry in lines if entry.get("decision") == "deny"]
     rules = {entry.get("rule") for entry in denials}
 
-    expect(len(denials) == 3, f"audit records every denial (got {len(denials)})")
-    expect(
+    check.expect(len(denials) == 3, f"audit records every denial (got {len(denials)})")
+    check.expect(
         rules == {"deny-sandbox-escape", "deny-destructive", "deny-unscannable"},
         f"audit names the rule that refused each call (got {sorted(rules)})",
     )
     # The refusal that matters most to have in the log: a guardrail the proxy
     # could not finish checking is invisible in the call itself, so the record
     # naming the rule is the only trace an operator gets.
-    expect(
+    check.expect(
         any(
             entry.get("rule") == "deny-unscannable"
             and "could not be evaluated" in (entry.get("decision_reason") or "")
@@ -1792,12 +1804,12 @@ def check_policy_audit_log() -> int:
         ),
         "audit explains the undecidable denial rather than logging a bare deny",
     )
-    expect(
+    check.expect(
         all(entry.get("is_error") for entry in denials),
         "denied calls are flagged as errors",
     )
 
-    return failures
+    return check.failures
 
 
 def check_approval_question(questions: list[str]) -> int:
@@ -1808,17 +1820,13 @@ def check_approval_question(questions: list[str]) -> int:
     content has a newline in it, so a JSON parse of the last line also proves
     the value could not break out onto a line of its own.
     """
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     if len(questions) != 1:
-        expect(False, f"the declined call asked exactly once (asked {len(questions)})")
-        return failures
+        check.expect(
+            False, f"the declined call asked exactly once (asked {len(questions)})"
+        )
+        return check.failures
 
     question = questions[0]
     lines = question.split("\n")
@@ -1828,62 +1836,50 @@ def check_approval_question(questions: list[str]) -> int:
     except json.JSONDecodeError:
         shown = {}
 
-    expect(
+    check.expect(
         question.startswith("Allow the agent to write a file in the sandbox?\n"),
         "the approval question still leads with the rule's own prompt",
     )
-    expect(
+    check.expect(
         isinstance(shown, dict) and shown.get("path") == APPROVAL_REFUSED,
         "the approval question shows the path, as JSON on its own line",
     )
-    expect(
+    check.expect(
         isinstance(shown, dict) and AWS_MARKER in str(shown.get("content", "")),
         "the approval question shows the content with the key redacted",
     )
-    expect(AWS_KEY not in question, "the raw key never reaches the approver")
+    check.expect(AWS_KEY not in question, "the raw key never reaches the approver")
 
-    if failures:
+    if check.failures:
         print(question[:700])
 
-    return failures
+    return check.failures
 
 
 def check_approval_audit_log() -> int:
     """Every answer a human can give must be distinguishable in the log."""
-    try:
-        with open(APPROVAL_AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  approval audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  approval audit log unreadable: {exc}")
+    lines = read_audit(APPROVAL_AUDIT, "approval audit log")
+    if lines is None:
         return 1
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     outcomes = {entry.get("approval") for entry in lines if entry.get("approval")}
 
-    expect(
+    check.expect(
         outcomes == {"approved", "declined", "timed_out", "unavailable"},
         f"audit distinguishes all four approval outcomes (got {sorted(outcomes)})",
     )
     # The distinction the verdict alone destroys: an allowed call that a person
     # actually looked at.
-    expect(
+    check.expect(
         any(
             entry.get("approval") == "approved" and entry.get("decision") == "allow"
             for entry in lines
         ),
         "an approved call is logged as allowed AND as approved",
     )
-    expect(
+    check.expect(
         all(
             entry.get("decision") == "deny"
             for entry in lines
@@ -1892,19 +1888,13 @@ def check_approval_audit_log() -> int:
         "every unapproved call is logged as denied",
     )
 
-    return failures
+    return check.failures
 
 
 def check_webhook_audit_log() -> int:
     """A webhook's answers are audited exactly like a human's at the client."""
-    try:
-        with open(WEBHOOK_AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  webhook audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  webhook audit log unreadable: {exc}")
+    lines = read_audit(WEBHOOK_AUDIT, "webhook audit log")
+    if lines is None:
         return 1
 
     pairs = sorted((entry.get("approval"), entry.get("decision")) for entry in lines)
@@ -1917,48 +1907,38 @@ def check_webhook_audit_log() -> int:
 
 def check_budget_audit_log() -> int:
     """A budget refusal must be as traceable as a policy one."""
-    try:
-        with open(BUDGET_AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  budget audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  budget audit log unreadable: {exc}")
+    lines = read_audit(BUDGET_AUDIT, "budget audit log")
+    if lines is None:
         return 1
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     denials = [entry for entry in lines if entry.get("decision") == "deny"]
 
-    expect(len(denials) == 1, f"exactly one call was refused (got {len(denials)})")
-    expect(
+    check.expect(
+        len(denials) == 1, f"exactly one call was refused (got {len(denials)})"
+    )
+    check.expect(
         any(entry.get("rule") == "session.max_cost" for entry in denials),
         "audit names the cap that refused the call, not a policy rule",
     )
     # Which cap, and how much was left: without the numbers an operator cannot
     # tell a budget that was too tight from an agent that ran away.
-    expect(
+    check.expect(
         any(
             "spent 2 of its 3" in (entry.get("decision_reason") or "")
             for entry in denials
         ),
         "audit records what was spent and what the cap was",
     )
-    expect(
+    check.expect(
         len(lines) == 5,
         f"every call is logged, refused or not (got {len(lines)})",
     )
     # Free is not invisible: the uncharged unknown-tool calls are still policy
     # decisions on the record, flagged as errors and owned by no server.
     unknown = [entry for entry in lines if entry.get("tool") == "fs__does_not_exist"]
-    expect(
+    check.expect(
         len(unknown) == 2
         and all(
             entry.get("decision") == "allow"
@@ -1969,49 +1949,37 @@ def check_budget_audit_log() -> int:
         f"uncharged unknown-tool calls are still audited (got {len(unknown)})",
     )
 
-    return failures
+    return check.failures
 
 
 def check_scan_audit_log() -> int:
     """A finding the model was warned about must be findable afterwards too."""
-    try:
-        with open(SCAN_AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  scan audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  scan audit log unreadable: {exc}")
+    lines = read_audit(SCAN_AUDIT, "scan audit log")
+    if lines is None:
         return 1
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     flagged = [entry for entry in lines if entry.get("scanner_hits")]
 
     # Four annotated reads in the default session, one blocked read in the
     # strict one. The write that planted the file is not among them: its own
     # result said only that it succeeded.
-    expect(
+    check.expect(
         len(flagged) == 5,
         f"every poisoned read is recorded, not just the first (got {len(flagged)})",
     )
     # Every one of those reads returned structuredContent, and none of it was
     # passed on - the client got an error flag the server never set, and the
     # log has to explain that.
-    expect(
+    check.expect(
         all(
             entry.get("scanner_structured_content_withheld") is True
             for entry in flagged
         ),
         "audit records that the structured payload was withheld",
     )
-    expect(
+    check.expect(
         all(
             "instruction-override" in entry["scanner_hits"]
             and "exfiltration" in entry["scanner_hits"]
@@ -2019,7 +1987,7 @@ def check_scan_audit_log() -> int:
         ),
         "audit names the heuristics rather than a bare 'suspicious'",
     )
-    expect(
+    check.expect(
         {entry.get("scanner_action") for entry in flagged} == {"annotated", "blocked"},
         "audit distinguishes an annotated result from a withheld one",
     )
@@ -2031,19 +1999,19 @@ def check_scan_audit_log() -> int:
     # WROTE the poisoned file has the payload in its `arguments`: redaction
     # removes credentials, not instructions, and someone investigating an attack
     # needs to see what was planted.
-    expect(
+    check.expect(
         not any("exfiltration agent" in json.dumps(entry) for entry in flagged),
         "audit records heuristic names, never the matched content",
     )
     # The downstream's definitions are clean, so the metadata scanner must not
     # have written a startup line in either session.
-    expect(
+    check.expect(
         not any(entry.get("event") == "tool_metadata" for entry in lines),
         "clean tool definitions add no tool_metadata audit lines",
     )
     # A clean call says nothing at all, so the field means "something matched"
     # rather than "a scanner ran".
-    expect(
+    check.expect(
         any(
             entry.get("tool") == "fs__write_file" and not entry.get("scanner_hits")
             for entry in lines
@@ -2051,18 +2019,12 @@ def check_scan_audit_log() -> int:
         "a clean result adds no scanner fields",
     )
 
-    return failures
+    return check.failures
 
 
 def check_secret_files() -> int:
     """What actually reached the disk under each argument setting."""
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     def read(path: str) -> str | None:
         try:
@@ -2074,83 +2036,71 @@ def check_secret_files() -> int:
     # The default is a trade made on purpose and documented: the log is clean,
     # the server is not. Asserted so that changing it is a visible decision.
     forwarded = read(SECRET_PROBE)
-    expect(
+    check.expect(
         forwarded is not None and AWS_KEY in forwarded,
         "redact_audit forwards the real key to the server",
     )
 
     redacted = read(SECRET_REDACTED)
-    expect(
+    check.expect(
         redacted is not None and AWS_MARKER in redacted and AWS_KEY not in redacted,
         "redact sends the server a marker instead of the key",
     )
 
-    expect(
+    check.expect(
         not os.path.exists(SECRET_REFUSED),
         "a write blocked for its arguments never touched the disk",
     )
 
-    return failures
+    return check.failures
 
 
 def check_secret_audit_log() -> int:
     """The audit log must say what happened to a secret without containing it."""
-    try:
-        with open(SECRET_AUDIT, encoding="utf-8") as handle:
-            raw = handle.read()
-        lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  secret audit log was not created")
+    audit = read_audit_text(SECRET_AUDIT, "secret audit log")
+    if audit is None:
         return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  secret audit log unreadable: {exc}")
-        return 1
+    raw, lines = audit
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     # The raw file, not the parsed records: a key that leaked into any field,
     # including one nobody thought to check, fails this.
-    expect(AWS_KEY not in raw, "the key appears nowhere in the audit log")
+    check.expect(AWS_KEY not in raw, "the key appears nowhere in the audit log")
 
     writes = [entry for entry in lines if entry.get("tool") == "fs__write_file"]
     reads = [entry for entry in lines if entry.get("tool") == "fs__read_text_file"]
 
-    expect(
+    check.expect(
         {entry.get("argument_secrets_action") for entry in writes}
         == {"forwarded", "redacted", "blocked"},
         "audit distinguishes a forwarded, a redacted and a blocked secret",
     )
-    expect(
+    check.expect(
         all(entry.get("argument_secrets") == ["aws-access-key"] for entry in writes),
         "audit names the detector for every write that carried the key",
     )
-    expect(
+    check.expect(
         all(
             AWS_MARKER in (entry.get("arguments") or {}).get("content", "")
             for entry in writes
         ),
         "the logged arguments hold the marker in place of the key",
     )
-    expect(
+    check.expect(
         any(
             entry.get("rule") == "secrets.arguments" and entry.get("decision") == "deny"
             for entry in writes
         ),
         "the blocked write is logged as a denial by the secrets setting",
     )
-    expect(
+    check.expect(
         {entry.get("result_secrets_action") for entry in reads}
         == {"redacted", "blocked"},
         "audit distinguishes a redacted result from a withheld one",
     )
 
-    return failures
+    return check.failures
 
 
 def run_classifier_phase() -> tuple[int, list[str]]:
@@ -2204,129 +2154,109 @@ def check_classifier_needs_key(env: dict[str, str]) -> int:
 
 def check_classifier_requests(fake: FakeAnthropic) -> int:
     """What went over the wire: one call, the right headers, the content fenced."""
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     # Confirm mode: only the flagged read is sent, not the clean one.
-    expect(
+    check.expect(
         len(fake.requests) == 1,
         f"confirm mode asks only about the flagged result (got {len(fake.requests)})",
     )
     if not fake.requests:
-        return failures
+        return check.failures
 
     path, headers, body = fake.requests[0]
     lowered = {k.lower(): v for k, v in headers.items()}
-    expect(path == "/v1/messages", "the request goes to /v1/messages")
-    expect(
+    check.expect(path == "/v1/messages", "the request goes to /v1/messages")
+    check.expect(
         lowered.get("x-api-key") == CLASSIFIER_KEY
         and lowered.get("anthropic-version") == "2023-06-01",
         "the request carries the key and the API version",
     )
     content = (body.get("messages") or [{}])[0].get("content", "")
-    expect(
+    check.expect(
         "exfiltration agent" in content and "</tool_output_" in content,
         "the tool output is sent fenced inside nonce-named tags",
     )
 
-    return failures
+    return check.failures
 
 
 def check_classifier_audit_log() -> int:
     """The verdict is audited; the text never is."""
-    try:
-        with open(CLASSIFIER_AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  classifier audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  classifier audit log unreadable: {exc}")
+    lines = read_audit(CLASSIFIER_AUDIT, "classifier audit log")
+    if lines is None:
         return 1
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     judged = [entry for entry in lines if entry.get("classifier")]
-    expect(
+    check.expect(
         [(e.get("classifier"), e.get("scanner_action")) for e in judged]
         == [("benign", "annotated"), ("failed", "blocked")],
         "audit records each verdict next to the action it led to",
     )
-    expect(
+    check.expect(
         any("HTTP 500" in entry.get("classifier_error", "") for entry in judged),
         "a failed classification says why",
     )
-    expect(
+    check.expect(
         not any("exfiltration agent" in json.dumps(entry) for entry in judged),
         "audit records the verdict, never the classified text",
     )
 
-    return failures
+    return check.failures
 
 
 def check_audit_log() -> int:
     """Verify the audit filter recorded every call, including the rejected one."""
-    try:
-        with open(AUDIT, encoding="utf-8") as handle:
-            lines = [json.loads(line) for line in handle if line.strip()]
-    except FileNotFoundError:
-        print("FAIL  audit log was not created")
-        return 1
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"FAIL  audit log unreadable: {exc}")
+    lines = read_audit(AUDIT, "audit log")
+    if lines is None:
         return 1
 
-    failures = 0
-
-    def expect(condition: bool, label: str) -> None:
-        nonlocal failures
-        print(f"{'PASS' if condition else 'FAIL'}  {label}")
-        if not condition:
-            failures += 1
+    check = Checker()
 
     by_tool = {entry.get("tool"): entry for entry in lines}
 
-    expect(len(lines) == 3, f"audit log has one line per tools/call (got {len(lines)})")
+    check.expect(
+        len(lines) == 3, f"audit log has one line per tools/call (got {len(lines)})"
+    )
 
     write = by_tool.get("fs__write_file")
-    expect(write is not None, "audit records the forwarded write_file call")
+    check.expect(write is not None, "audit records the forwarded write_file call")
     if write:
-        expect(write.get("server") == "fs", "audit resolves the downstream server")
-        expect(
+        check.expect(
+            write.get("server") == "fs", "audit resolves the downstream server"
+        )
+        check.expect(
             write.get("downstream_tool") == "write_file",
             "audit records the un-namespaced tool",
         )
-        expect(not write.get("is_error"), "successful call is not flagged as an error")
-        expect(
+        check.expect(
+            not write.get("is_error"), "successful call is not flagged as an error"
+        )
+        check.expect(
             isinstance(write.get("duration_ms"), (int, float)),
             "audit records a duration",
         )
-        expect(
+        check.expect(
             write.get("arguments", {}).get("path") == PROBE,
             "audit captures call arguments",
         )
 
     # The whole point of putting audit outermost: it must see rejected calls too.
     unknown = by_tool.get("fs__does_not_exist")
-    expect(unknown is not None, "audit records the REJECTED call, not just successes")
+    check.expect(
+        unknown is not None, "audit records the REJECTED call, not just successes"
+    )
     if unknown:
-        expect(bool(unknown.get("is_error")), "rejected call is flagged as an error")
-        expect(
+        check.expect(
+            bool(unknown.get("is_error")), "rejected call is flagged as an error"
+        )
+        check.expect(
             unknown.get("server") is None, "unresolved call has no downstream server"
         )
 
-    return failures
+    return check.failures
 
 
 if __name__ == "__main__":

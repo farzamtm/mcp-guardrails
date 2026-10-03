@@ -179,8 +179,8 @@ for the MRTR approval channel.
   ([`IApprovalChannel.cs`](../src/McpGuardrails.Core/Approval/IApprovalChannel.cs)).
   The `ModelContextProtocol.Extensions.Tasks` package the spec names is not
   referenced.
-- **Out-of-band approval** (`mode: slack`, `mode: webhook`) — rejected at load
-  time today.
+- **Slack approval** (`mode: slack`) — not a recognised mode, so rejected at
+  load time today. Out-of-band approval through `mode: webhook` is implemented.
 - **Streamable HTTP.** Not hosted. When it is, note that the SDK refuses
   `ElicitAsync` on stateless servers, which includes every 2026-07-28 HTTP
   request — so over HTTP the current channel would fail closed for modern

@@ -54,7 +54,7 @@ public sealed class PolicyEvaluator
 
             if (outcome.IsMatch)
             {
-                trail?.Add($"rule '{rule.Name}': MATCHED -> {Describe(rule.EffectiveDecision)}");
+                trail?.Add($"rule '{rule.Name}': MATCHED -> {rule.EffectiveDecision.ToWireName()}");
 
                 return new Decision(
                     rule.EffectiveDecision,
@@ -136,13 +136,5 @@ public sealed class PolicyEvaluator
         Verdict.Allow =>
             $"Explicitly allowed by rule '{rule.Name}'.",
         _ => $"Rule '{rule.Name}' applied.",
-    };
-
-    internal static string Describe(Verdict verdict) => verdict switch
-    {
-        Verdict.Allow => "allow",
-        Verdict.Deny => "deny",
-        Verdict.RequireApproval => "require_approval",
-        _ => verdict.ToString(),
     };
 }

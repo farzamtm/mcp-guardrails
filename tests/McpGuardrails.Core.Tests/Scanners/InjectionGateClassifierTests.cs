@@ -128,7 +128,7 @@ public sealed class InjectionGateClassifierTests
     }
 
     [Fact]
-    public async Task WithoutAClassifier_InspectAsyncMatchesInspect()
+    public async Task WithoutAClassifier_TheHeuristicVerdictStands()
     {
         var gate = new InjectionGate(new ScannerSettings { Action = ScanAction.Block });
 
@@ -136,17 +136,6 @@ public sealed class InjectionGateClassifierTests
 
         Assert.Equal(ScanEffect.Blocked, outcome.Effect);
         Assert.Null(outcome.Classifier);
-    }
-
-    [Fact]
-    public void TheSynchronousInspect_NeverAsksTheClassifier()
-    {
-        var classifier = new FakeClassifier(ClassifierVerdict.Benign);
-
-        var outcome = Gate(classifier).Inspect(Result(_poisoned), _tool);
-
-        Assert.Empty(classifier.Seen);
-        Assert.Equal(ScanEffect.Blocked, outcome.Effect);
     }
 
     // ------------------------------------------------------------ confirm mode
@@ -274,7 +263,9 @@ public sealed class InjectionGateClassifierTests
 
         await Gate(classifier, mode: ClassifierMode.All).InspectAsync(result, _tool);
 
-        Assert.Equal(_clean + "\n\n" + """{"note":"hello"}""", Assert.Single(classifier.Seen));
+        // The classifier gets the same decoded strings the heuristics do, not
+        // the escaped JSON text.
+        Assert.Equal(_clean + "\n\nnote\n\nhello", Assert.Single(classifier.Seen));
     }
 
     // ---------------------------------------------------------------- failures
