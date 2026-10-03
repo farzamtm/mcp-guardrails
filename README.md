@@ -211,6 +211,18 @@ one**: `not_prefix` asserts "there is a value and it does not start with this".
 A rule must not fire on evidence that was never supplied, so when a missing
 argument should also be refused, follow the rule with a catch-all.
 
+A value that *is* sent but is not a string — an array, number, object, boolean
+or `null` — **satisfies `not_prefix`**, because it cannot be shown to start
+with the prefix. That keeps a deny rule such as `not_prefix: /workspace/`
+firing on `{"path": ["/etc/passwd"]}`, which a downstream server might well
+accept. The flip side: do not write an allow rule with `not_prefix`, since it
+would allow those values too. Allow with `prefix`, which only a matching string
+satisfies, and deny with `not_prefix`.
+
+`eq` and `in` compare numbers by value and exactly: `1`, `1.0` and `1e0` are
+equal, while `9007199254740993` and `9007199254740992` are not, however far
+past double precision they sit.
+
 `prefix` and `not_prefix` compare the **literal argument string**. Nothing is
 resolved, canonicalised or normalised, so `/workspace/../etc/passwd` starts with
 `/workspace/` as far as a policy is concerned. They are good at classifying what

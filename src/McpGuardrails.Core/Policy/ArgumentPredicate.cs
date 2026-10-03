@@ -78,7 +78,10 @@ public sealed record ArgumentPredicate
     [JsonPropertyName("prefix")]
     public string? Prefix { get; init; }
 
-    /// <summary>The string value exists and does NOT start with this.</summary>
+    /// <summary>
+    /// The value exists and is not a string starting with this. Present
+    /// non-strings (arrays, numbers, objects, null) satisfy it.
+    /// </summary>
     [JsonPropertyName("not_prefix")]
     public string? NotPrefix { get; init; }
 
@@ -228,8 +231,8 @@ public sealed record ArgumentPredicate
                 "operator. Write one condition per list entry so a failing one can be named.");
 
     /// <remarks>
-    /// An empty prefix is always true and an empty not_prefix is never true, so
-    /// both are rules that quietly do nothing - the worst outcome available to a
+    /// An empty prefix is true of every string and an empty not_prefix of none,
+    /// so both are rules that quietly do nothing - the worst outcome available to a
     /// policy engine, because the operator believes a guardrail exists.
     /// </remarks>
     private string RequireNonEmpty(string value, string operatorName, string ruleName) =>
@@ -239,7 +242,7 @@ public sealed record ArgumentPredicate
                 $"Rule '{ruleName}' has an empty '{operatorName}' on '{Path}'. " +
                 (operatorName == "prefix"
                     ? "It would match every string value."
-                    : "It can never match."));
+                    : "It can never match a string value."));
 
     /// <remarks>
     /// Compiled at load rather than on the first tool call: an invalid pattern
@@ -290,13 +293,28 @@ internal abstract class PredicateOperation
         {
             (JsonValueKind.String, JsonValueKind.String) =>
                 string.Equals(value.GetString(), expected.GetString(), StringComparison.Ordinal),
-            (JsonValueKind.Number, JsonValueKind.Number) =>
-                value.GetDouble() == expected.GetDouble(),
+            (JsonValueKind.Number, JsonValueKind.Number) => NumberEquals(value, expected),
             (JsonValueKind.True, JsonValueKind.True) => true,
             (JsonValueKind.False, JsonValueKind.False) => true,
             (JsonValueKind.Null, JsonValueKind.Null) => true,
             _ => false,
         };
+
+    /// <remarks>
+    /// Exact where the numbers allow it. A double holds integers exactly only up
+    /// to 2^53, so comparing through it makes 9007199254740993 equal
+    /// 9007199254740992 - and an id- or amount-keyed <c>eq</c>/<c>in</c> rule
+    /// fire on, or miss, a value it was never written for. Decimal holds every
+    /// Int64 and every short fraction exactly, so no separate integer step is
+    /// needed, and it keeps <c>500</c> equal to <c>500.0</c> and <c>1e2</c>.
+    /// Double is the fallback only for magnitudes decimal cannot represent
+    /// (beyond about 7.9e28), where System.Text.Json yields infinity rather
+    /// than throwing.
+    /// </remarks>
+    private static bool NumberEquals(JsonElement value, JsonElement expected) =>
+        value.TryGetDecimal(out var left) && expected.TryGetDecimal(out var right)
+            ? left == right
+            : value.GetDouble() == expected.GetDouble();
 
     /// <remarks>
     /// No coercion: a string that looks like a number is still a string, and
@@ -340,10 +358,18 @@ internal sealed class PrefixOperation(string prefix) : PredicateOperation
              value.GetString()!.StartsWith(prefix, StringComparison.Ordinal));
 }
 
+/// <remarks>
+/// A value that is present but not a string - an array, number, object, bool
+/// or null - satisfies <c>not_prefix</c>: it cannot be shown to start with the
+/// prefix, and the operator asserts the value is not known to be inside it.
+/// The opposite answer let <c>{"path": ["/etc/passwd"]}</c> walk past a deny
+/// rule written as "not_prefix: /workspace/" to a server that may well accept
+/// the array. An absent argument still satisfies nothing; see the README.
+/// </remarks>
 internal sealed class NotPrefixOperation(string prefix) : PredicateOperation
 {
     internal override PredicateResult Apply(JsonElement value) =>
-        From(value.ValueKind is JsonValueKind.String &&
+        From(value.ValueKind is not JsonValueKind.String ||
              !value.GetString()!.StartsWith(prefix, StringComparison.Ordinal));
 }
 

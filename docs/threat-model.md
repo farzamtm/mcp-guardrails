@@ -167,6 +167,9 @@ the fastest route to "clean up the repo" is `rm`.
     the model could pad an argument until the rule gave up;
   - a predicate never fires on an argument that was not sent, including
     `not_prefix`, so a rule cannot match on evidence that does not exist;
+  - an argument that is present but not a string (array, number, object,
+    `null`) **satisfies `not_prefix`**, so a deny rule cannot be stepped round
+    by wrapping a path in an array;
   - a malformed policy file, or a policy path that is a directory, **refuses to
     start** rather than falling back to passthrough
     ([`PolicyLoader`](../src/McpGuardrails.Core/Policy/PolicyLoader.cs));

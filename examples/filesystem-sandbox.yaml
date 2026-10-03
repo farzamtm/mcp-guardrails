@@ -115,7 +115,9 @@ rules:
   # One operator per entry - eq, gt, lt, matches, prefix, not_prefix, in - so
   # that --explain can name the condition that failed. A path the model did not
   # send never satisfies a predicate, including a negated one, so pair these
-  # with a catch-all when a missing argument should also be refused.
+  # with a catch-all when a missing argument should also be refused. A value
+  # that is sent but is not a string (an array, number, null) satisfies
+  # not_prefix, so use not_prefix in deny rules and prefix in allow rules.
   #
   # Writes cost 5, so this sandbox tolerates twenty of them before the budget is
   # gone, however many reads happen in between.

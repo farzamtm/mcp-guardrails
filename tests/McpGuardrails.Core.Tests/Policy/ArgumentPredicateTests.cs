@@ -109,9 +109,56 @@ public sealed class ArgumentPredicateTests
     public void NotPrefix_MatchesAStringThatDoesNotStartWithIt(string prefix, bool expected) =>
         Assert.Equal(expected, Evaluate(new ArgumentPredicate { Path = "$.path", NotPrefix = prefix }));
 
+    [Theory]
+    [InlineData("$.limit")]
+    [InlineData("$.tags")]
+    [InlineData("$.options")]
+    [InlineData("$.nothing")]
+    [InlineData("$.dry_run")]
+    public void NotPrefix_MatchesAPresentNonString(string path)
+    {
+        // Fail closed: a value that is not a string cannot be shown to start
+        // with the prefix, so a deny rule built on not_prefix must still fire.
+        // Otherwise {"path": ["/etc/passwd"]} walks past it to a server that may
+        // happily take the first element.
+        Assert.True(Evaluate(new ArgumentPredicate { Path = path, NotPrefix = "/workspace/" }));
+    }
+
     [Fact]
-    public void NotPrefix_DoesNotMatchNonStrings() =>
-        Assert.False(Evaluate(new ArgumentPredicate { Path = "$.limit", NotPrefix = "/workspace/" }));
+    public void NotPrefix_MatchesAnArrayWhoseElementWouldPass()
+    {
+        // Even an array holding an allowed path is not an allowed string: the
+        // operator judges the value the server receives, not a guess at how the
+        // server will unwrap it.
+        var arguments = TestArguments.From("""{"path": ["/workspace/notes.txt"]}""");
+
+        Assert.Equal(
+            "Satisfied",
+            Outcome(new ArgumentPredicate { Path = "$.path", NotPrefix = "/workspace/" }, arguments));
+    }
+
+    [Theory]
+    [InlineData("9007199254740993", "9007199254740992", false)]
+    [InlineData("9007199254740993", "9007199254740993", true)]
+    [InlineData("-9223372036854775808", "-9223372036854775807", false)]
+    [InlineData("1", "1.0", true)]
+    [InlineData("1", "1e0", true)]
+    [InlineData("0.1", "0.10", true)]
+    [InlineData("0.1", "0.2", false)]
+    [InlineData("1e400", "1e400", true)]
+    [InlineData("5", "1e400", false)]
+    [InlineData("1e400", "5", false)]
+    public void Eq_ComparesNumbersExactly(string actual, string expected, bool matches)
+    {
+        // Through a double, integers above 2^53 collide: an eq or in rule keyed
+        // on an id would fire on its neighbour. Numerically equal spellings must
+        // still agree, and magnitudes past decimal's range must not throw.
+        var arguments = TestArguments.From($$"""{"n": {{actual}}}""");
+
+        Assert.Equal(
+            matches ? "Satisfied" : "NotSatisfied",
+            Outcome(new ArgumentPredicate { Path = "$.n", Eq = Json(expected) }, arguments));
+    }
 
     // --------------------------------------------------------------------- in
 
@@ -137,6 +184,20 @@ public sealed class ArgumentPredicateTests
         };
 
         Assert.False(Evaluate(predicate));
+    }
+
+    [Fact]
+    public void In_DoesNotConfuseLargeIntegers()
+    {
+        var predicate = new ArgumentPredicate
+        {
+            Path = "$.id",
+            In = [Json("9007199254740992")],
+        };
+
+        Assert.Equal(
+            "NotSatisfied",
+            Outcome(predicate, TestArguments.From("""{"id": 9007199254740993}""")));
     }
 
     // -------------------------------------------------------- absent arguments
