@@ -1,0 +1,20 @@
+name: Feature request
+description: A guardrail, integration or improvement you need
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to protect against or achieve? The use case matters more than the proposed solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: How you imagine it working, for example as a policy snippet.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

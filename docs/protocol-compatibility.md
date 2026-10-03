@@ -91,7 +91,7 @@ silently dropped.
 - **Not forwarded:** request `_meta`, including a progress token. Progress from
   the upstream does not reach the client.
 - **Returned:** the upstream's result, possibly rewritten by the
-  [result scanner](../README.md#result-scanning). An annotated result keeps
+  [result scanner](result-scanning.md). An annotated result keeps
   `content` and `isError`; result-level `_meta` is not carried over. If the
   original had `structuredContent`, the annotated result does not: the payload
   is delivered as text inside the fence instead and `isError` is set, so a
