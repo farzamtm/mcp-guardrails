@@ -54,7 +54,8 @@ your agent actually does.
 The same program ships three ways. Pick by what is already on the machine.
 
 The downstream servers are still the hardcoded filesystem server started with
-`npx` (configurable upstreams are on the roadmap), so wherever the proxy runs
+`npx`, pinned to an exact npm version (configurable upstreams are on the
+roadmap), so wherever the proxy runs
 needs **Node.js** on `PATH` too.
 
 ### Native binary — nothing else to install

@@ -98,10 +98,13 @@ send it somewhere, call a destructive tool, hide what it did from the user.
 ### A2. Compromised or malicious downstream server
 
 **Who:** the author of an MCP server, or whoever compromised its package. Note
-the default upstream is fetched with `npx -y @modelcontextprotocol/server-filesystem`
-— **unpinned**, so "whoever compromised its package" includes whoever publishes
-the next version to npm
-([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)).
+the default upstream is fetched with `npx -y @modelcontextprotocol/server-filesystem@<version>`,
+pinned to one exact release
+([`DefaultUpstreams.FilesystemServerVersion`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)),
+so a newly published version is not picked up silently on the next start. The
+pin narrows the window rather than closing it: whoever compromised the package
+*at that version* still runs as the user, and there is no lockfile or integrity
+hash checking what npm serves for it.
 
 **Goal:** anything. It is code running as the user.
 

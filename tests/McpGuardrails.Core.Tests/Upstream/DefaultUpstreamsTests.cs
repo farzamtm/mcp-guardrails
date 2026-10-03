@@ -20,6 +20,18 @@ public sealed class DefaultUpstreamsTests
     }
 
     [Fact]
+    public void Create_PinsTheFilesystemServerToAnExactVersion()
+    {
+        // A bare package name lets npx run whatever npm publishes next. The literal
+        // here is deliberate: a bump should be a visible two-line change, not a
+        // constant edited in one place and silently echoed back by the test.
+        var arguments = Assert.Single(DefaultUpstreams.Create("/tmp/sandbox")).Arguments;
+
+        Assert.Contains("@modelcontextprotocol/server-filesystem@2026.8.31", arguments);
+        Assert.DoesNotContain("@modelcontextprotocol/server-filesystem", arguments);
+    }
+
+    [Fact]
     public void Create_SandboxesTheServerToTheGivenPath()
     {
         // The sandbox path is the only thing standing between the agent and the
