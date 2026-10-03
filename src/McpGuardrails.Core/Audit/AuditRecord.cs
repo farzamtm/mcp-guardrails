@@ -97,6 +97,19 @@ public sealed record AuditRecord
     public string? ScannerAction { get; init; }
 
     /// <summary>
+    /// True when the server returned <c>structuredContent</c> and the scanner did
+    /// not pass it on.
+    /// </summary>
+    /// <remarks>
+    /// Recorded because an annotated result is otherwise assumed to be the
+    /// original plus a warning. When the structured payload was withheld, the
+    /// client got the data as text only and an error flag the server never set,
+    /// and someone debugging a client that broke on that needs to see why.
+    /// </remarks>
+    [JsonPropertyName("scanner_structured_content_withheld")]
+    public bool? ScannerStructuredContentWithheld { get; init; }
+
+    /// <summary>
     /// What the LLM classifier said, when it was consulted: injection, benign,
     /// timed_out or failed.
     /// </summary>

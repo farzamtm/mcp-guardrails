@@ -92,12 +92,16 @@ silently dropped.
   the upstream does not reach the client.
 - **Returned:** the upstream's result, possibly rewritten by the
   [result scanner](../README.md#result-scanning). An annotated result keeps
-  `content`, `isError` and `structuredContent`; result-level `_meta` is not
-  carried over. A blocked result is replaced entirely.
+  `content` and `isError`; result-level `_meta` is not carried over. If the
+  original had `structuredContent`, the annotated result does not: the payload
+  is delivered as text inside the fence instead and `isError` is set, so a
+  client that validates against the tool's `outputSchema` accepts it. A blocked
+  result is replaced entirely.
 
 Older clients and `structuredContent`: structured output arrived in 2025-06-18,
 and a client that predates it reads `content` only. The scanner's fence goes in
-`content`, so those clients see the warning. Whether the SDK strips newer
+`content`, so those clients see the warning — and since a flagged result's
+`structuredContent` is withheld, so does every newer client. Whether the SDK strips newer
 fields (`title`, `icons`, `structuredContent`, …) when an older revision was
 negotiated, or sends them for the client to ignore, is **(unverified)**.
 

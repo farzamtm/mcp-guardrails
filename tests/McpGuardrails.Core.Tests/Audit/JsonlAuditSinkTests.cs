@@ -145,12 +145,14 @@ public sealed class JsonlAuditSinkTests : IDisposable
             {
                 ScannerHits = ["instruction-override", "exfiltration"],
                 ScannerAction = "annotated",
+                ScannerStructuredContentWithheld = true,
             });
         }
 
         var entry = (await ReadLogAsync())[0];
 
         Assert.Equal("annotated", entry.GetProperty("scanner_action").GetString());
+        Assert.True(entry.GetProperty("scanner_structured_content_withheld").GetBoolean());
         Assert.Equal(
             ["instruction-override", "exfiltration"],
             entry.GetProperty("scanner_hits").EnumerateArray().Select(hit => hit.GetString()));
@@ -190,6 +192,7 @@ public sealed class JsonlAuditSinkTests : IDisposable
 
         Assert.False(entry.TryGetProperty("scanner_hits", out _));
         Assert.False(entry.TryGetProperty("scanner_action", out _));
+        Assert.False(entry.TryGetProperty("scanner_structured_content_withheld", out _));
         Assert.False(entry.TryGetProperty("argument_secrets", out _));
         Assert.False(entry.TryGetProperty("result_secrets", out _));
     }
