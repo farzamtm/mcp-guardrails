@@ -141,6 +141,15 @@ hash checking what npm serves for it.
   [`scan`](scan.md) flags a "read-only" tool named or described like a write,
   before the server is put behind the proxy. That's a heuristic over English
   verbs, not a check the proxy enforces at runtime.
+- **Text it chooses is printed to terminals.** Tool names, schema keys and the
+  error messages a server answers with reach the operator's terminal through
+  `scan`, `pins`, `list-upstream`, failure messages and the log. Every such
+  line goes through one sanitizer
+  ([`TerminalText`](../src/McpGuardrails.Core/Text/TerminalText.cs)) that
+  replaces control, bidirectional-override and zero-width characters, so a
+  server cannot clear the screen, forge a verdict line, retitle the window or
+  write the clipboard (OSC 52) of whoever runs these commands. The JSON forms
+  are escaped by the serializer.
 - **The result scanner** applies to its output exactly as in A1.
 - **The metadata scanner** applies the same heuristics to the tool definitions
   it advertises

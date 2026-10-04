@@ -1,3 +1,5 @@
+using McpGuardrails.Core.Text;
+
 namespace McpGuardrails.Cli.Commands;
 
 /// <summary>One subcommand of the CLI.</summary>
@@ -61,8 +63,12 @@ internal static class CommandTable
         }
         catch (CommandFailedException ex)
         {
-            // Console.Error, not stdout: stdout is the JSON-RPC wire.
-            await Console.Error.WriteLineAsync(ex.Message);
+            // Console.Error, not stdout: stdout is the JSON-RPC wire. Sanitized
+            // because a failure message can carry a server's own words - a
+            // JSON-RPC error from a server that refused to list its tools - and
+            // it is printed to a terminal. Line breaks stay: the proxy's own
+            // messages list errors one per line.
+            await Console.Error.WriteLineAsync(TerminalText.PrintableLines(ex.Message));
             return ex.ExitCode;
         }
     }

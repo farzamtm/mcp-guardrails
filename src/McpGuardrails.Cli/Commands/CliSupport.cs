@@ -1,5 +1,9 @@
+using McpGuardrails.Core.Text;
 using McpGuardrails.Core.Upstream;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging.Console;
 
 namespace McpGuardrails.Cli.Commands;
 
@@ -43,9 +47,72 @@ internal static class CliLogging
     /// </param>
     public static void ToStandardError(ILoggingBuilder logging, bool listing)
     {
-        logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
+        logging.AddConsole(options =>
+        {
+            options.LogToStandardErrorThreshold = LogLevel.Trace;
+            options.FormatterName = PrintableConsoleFormatter.FormatterName;
+        });
+
+        // Registered as a service rather than with AddConsoleFormatter, which
+        // binds options by reflection that Native AOT cannot keep.
+        logging.Services.AddSingleton<ConsoleFormatter, PrintableConsoleFormatter>();
         logging.SetMinimumLevel(listing ? LogLevel.Warning : LogLevel.Information);
     }
+}
+
+/// <summary>
+/// The console log layout, with every message passed through
+/// <see cref="TerminalText.PrintableLines"/>.
+/// </summary>
+/// <remarks>
+/// Log lines quote downstream servers: the SDK logs a failed request with the
+/// server's own error text. A hostile server could otherwise put an escape
+/// sequence in the operator's terminal through the log, around every guard the
+/// commands put on their own output. Same shape as the default "simple"
+/// formatter - <c>warn: Category[id]</c>, then the message indented - minus the
+/// colours, which are escape sequences too.
+/// </remarks>
+internal sealed class PrintableConsoleFormatter() : ConsoleFormatter(FormatterName)
+{
+    public const string FormatterName = "printable";
+
+    private const string _indent = "      ";
+
+    public override void Write<TState>(in LogEntry<TState> logEntry, IExternalScopeProvider? scopeProvider, TextWriter textWriter)
+    {
+        var message = logEntry.Formatter(logEntry.State, logEntry.Exception);
+        if (message is null && logEntry.Exception is null)
+        {
+            return;
+        }
+
+        textWriter.Write(Level(logEntry.LogLevel));
+        textWriter.Write(": ");
+        textWriter.Write(logEntry.Category);
+        textWriter.Write('[');
+        textWriter.Write(logEntry.EventId.Id);
+        textWriter.WriteLine(']');
+
+        foreach (var text in new[] { message, logEntry.Exception?.ToString() })
+        {
+            if (!string.IsNullOrEmpty(text))
+            {
+                textWriter.Write(_indent);
+                textWriter.WriteLine(TerminalText.PrintableLines(text).Replace("\n", Environment.NewLine + _indent, StringComparison.Ordinal));
+            }
+        }
+    }
+
+    private static string Level(LogLevel level) => level switch
+    {
+        LogLevel.Trace => "trce",
+        LogLevel.Debug => "dbug",
+        LogLevel.Information => "info",
+        LogLevel.Warning => "warn",
+        LogLevel.Error => "fail",
+        LogLevel.Critical => "crit",
+        _ => "none",
+    };
 }
 
 /// <summary>The real machine, as the Core loaders see it.</summary>
