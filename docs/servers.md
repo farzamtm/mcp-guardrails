@@ -137,7 +137,7 @@ servers:                        # "mcpServers" is accepted as an alias
 | `headers` | http, sse | Static, sent with every request. |
 | `optional` | all | Start without this server if it can't be reached. Its tools are then absent for the session. |
 | `disabled` | all | Skipped entirely: not validated, not connected. |
-| `x-guardrails` | all | Reserved for proxy-only options in later versions. |
+| `x-guardrails` | all | Options only the proxy reads. Today: `oauth` (remote servers), see [Logging in with OAuth](#logging-in-with-oauth). Unknown keys inside it are errors too. |
 
 **Unknown keys are errors.** Silently ignoring a misspelt security option is the
 fail-open this project exists to avoid. Keys that only configure a client
@@ -152,6 +152,65 @@ uses it.
 **A remote server that is down stops the proxy from starting** unless it is
 marked `optional: true`. A proxy that quietly serves a subset of the tools you
 configured is serving a tool set nobody reviewed.
+
+## Logging in with OAuth
+
+Many remote servers (GitHub, Atlassian, Linear) want an OAuth login rather than
+a static token. Mark them with an `x-guardrails.oauth` block:
+
+```yaml
+servers:
+  linear:
+    type: http
+    url: https://mcp.linear.app/mcp
+    x-guardrails:
+      oauth: {}                  # or { scopes: [read, write] }
+```
+
+Then log in once, from a terminal:
+
+```bash
+mcp-guardrails auth login linear     # opens a browser; --no-browser prints the URL
+mcp-guardrails auth status           # who is logged in, and until when
+mcp-guardrails auth logout linear    # deletes the tokens
+```
+
+`auth login` follows the MCP authorization spec: it finds the server's
+authorization server from its protected resource metadata, registers itself
+(dynamic client registration) unless you give a `client_id`, and runs the
+authorization code flow with PKCE through your browser, which comes back to a
+listener on `127.0.0.1`.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `scopes` | the server's suggestion | Scopes to ask for. |
+| `client_id` | dynamic registration | A client registered in advance, for servers without dynamic registration. |
+| `redirect_port` | any free port | The loopback port for the redirect, for a `client_id` registered with a fixed one. |
+
+**When the proxy serves, it never opens a browser.** It uses the stored tokens
+and refreshes them when they expire. A server with no usable login does not stop
+the proxy: its tools are absent, a warning names the server, and a call to one
+of them tells the model to have you run `auth login`. The same happens when a
+login expires mid-session and cannot be refreshed. A server that was never
+logged in is not contacted at all, so starting the proxy registers no clients.
+
+**Where the tokens live**, never in the servers file or the audit log:
+
+| Platform | Store |
+| --- | --- |
+| macOS | The login Keychain, through `security` (the secret is passed on stdin, never on a command line) |
+| Linux | The Secret Service (GNOME Keyring, KWallet) through libsecret's `secret-tool`; without one, files as below, with a warning |
+| Windows | Files encrypted with DPAPI for your user |
+| Anywhere, with `GUARDRAILS_TOKEN_STORE=file` | `~/.mcp-guardrails/tokens/<server>.json` (or `GUARDRAILS_TOKENS`), created `0600` in a `0700` directory |
+
+`GUARDRAILS_TOKEN_STORE` also accepts `keychain`, `secret-service` and `dpapi`.
+
+**Tokens are bound to the server's URL.** If you point a server name at a
+different URL, the old login is not sent there; `auth status` says so, and you
+log in again.
+
+A server with `x-guardrails.oauth` cannot also send a static `Authorization`
+header, and stdio servers cannot use it.
 
 ## Variables
 

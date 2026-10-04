@@ -49,7 +49,7 @@ guardrails go.
 | **Secret redaction** | API keys, tokens, private keys and passwords are replaced with markers in results, in the audit log and optionally in outgoing arguments. | [secret redaction](docs/secret-redaction.md) |
 | **Any servers** | Front any number of stdio and remote (Streamable HTTP, SSE) servers from one servers file, in the format your client already uses. `wrap` puts the proxy in front of a client's whole server list in one command, and `unwrap` restores it byte for byte. Secrets stay out of the file, and child processes can be isolated from the proxy's environment. | [servers](docs/servers.md) |
 | **Transports** | stdio, or stateless Streamable HTTP (loopback by default, bearer token, Origin check). | [Streamable HTTP](docs/streamable-http.md) |
-| **OAuth** | Over HTTP, the proxy is an OAuth protected resource: it validates JWT access tokens from your authorization server (Entra ID, Okta, Auth0, Keycloak), and each caller's identity feeds `principal:` / `groups:` rules, per-caller budgets and the audit log. | [OAuth](docs/oauth.md) |
+| **OAuth** | Over HTTP, the proxy is an OAuth protected resource: it validates JWT access tokens from your authorization server (Entra ID, Okta, Auth0, Keycloak), and each caller's identity feeds `principal:` / `groups:` rules, per-caller budgets and the audit log. Toward remote servers that want OAuth, `auth login` logs in once through your browser and the proxy refreshes the tokens from the OS credential store. | [OAuth](docs/oauth.md), [servers](docs/servers.md#logging-in-with-oauth) |
 | **OpenTelemetry** | Opt-in spans and metrics over OTLP, with no argument values in any attribute. | [OpenTelemetry](docs/opentelemetry.md) |
 
 What it looks like to the agent when a rule fires:
@@ -295,7 +295,6 @@ locally.
 
 ## Roadmap
 
-- **OAuth to remote servers**, beyond the static headers supported today
 - **Published releases:** signed binaries, nuget.org, a container image
 - **Slack approval**, and the Tasks/MRTR approval path for clients on the
   2026-07-28 protocol revision
