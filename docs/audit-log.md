@@ -94,6 +94,30 @@ was done, and its `arguments` hold markers rather than the values:
 reach the server. The others are `redacted` and `blocked`; results use
 `result_secrets` and `result_secrets_action` (`redacted` or `blocked`).
 
+A call whose arguments matched an [argument detector](argument-scanning.md)
+names the detectors and what was done:
+
+```json
+{"ts":"2026-10-04T11:02:17.330412+00:00","event":"tool_call","tool":"web__fetch",
+ "server":"web","downstream_tool":"fetch","decision":"allow",
+ "arguments":{"url":"http://169.254.169.254/latest/meta-data/"},
+ "argument_hits":["ssrf"],"argument_hits_action":"audited",
+ "duration_ms":212.4,"is_error":false}
+```
+
+`argument_hits` lists detector names: `ssrf`, `sensitive-path`,
+`path-traversal`, `shell-metachar`, and `argument-too-large` when the arguments
+were too big to read in full. `argument_hits_action` is `audited` (forwarded
+unchanged), `approval` (put to a human; `approval` says what they answered) or
+`blocked` (`rule` is then `arguments.<detector>`). Hits are recorded on refused
+calls too. When an earlier gate had already refused the call there was nothing
+left to do, so `argument_hits_action` is absent.
+
+```bash
+# What would `action: block` have refused? Run this before switching it on.
+jq -r 'select(.argument_hits) | [.ts, .tool, (.argument_hits | join(","))] | @tsv' ~/.mcp-guardrails/audit.jsonl
+```
+
 When the classifier ran, there are up to three more fields:
 
 - `classifier`: `benign`, `injection`, `timed_out` or `failed`
