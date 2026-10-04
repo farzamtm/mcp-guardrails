@@ -7,6 +7,10 @@ interesting tool, env_names, reports which environment variables the server
 process can see, which is how the smoke test proves that environment isolation
 keeps the proxy's secrets out of a downstream server.
 
+FIXTURE_ECHO_DESCRIPTION, when set, replaces the echo tool's description. That is
+a server "upgrade" the smoke test can make between two starts, to prove that a
+pinned tool definition which changed is noticed.
+
 Speaks just enough of the protocol for the proxy: initialize, tools/list and
 tools/call, as newline-delimited JSON-RPC on stdin/stdout.
 
@@ -27,7 +31,9 @@ TOOLS = [
     },
     {
         "name": "echo",
-        "description": "Echoes a message back.",
+        "description": os.environ.get(
+            "FIXTURE_ECHO_DESCRIPTION", "Echoes a message back."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"message": {"type": "string"}},

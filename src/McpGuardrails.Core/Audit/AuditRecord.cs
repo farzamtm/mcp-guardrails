@@ -31,7 +31,8 @@ public sealed record AuditRecord
     /// <summary>Client-visible tool name, e.g. "fs__write_file".</summary>
     /// <remarks>
     /// Present on every per-tool event. Absent on <c>upstream_connected</c>,
-    /// which is about a server rather than one of its tools.
+    /// <c>pin_created</c> and <c>pin_reset</c>, which are about a server rather
+    /// than one of its tools.
     /// </remarks>
     [JsonPropertyName("tool")]
     public string? Tool { get; init; }
@@ -158,13 +159,14 @@ public sealed record AuditRecord
     [JsonPropertyName("transport")]
     public string? Transport { get; init; }
 
-    /// <summary>How many tools the server advertised. <c>upstream_connected</c> only.</summary>
+    /// <summary>How many tools the server advertised. <c>upstream_connected</c> and <c>pin_created</c> only.</summary>
     [JsonPropertyName("tool_count")]
     public int? ToolCount { get; init; }
 
     /// <summary>
     /// What was connected to, as written in the servers file: the command line
-    /// or the URL, with <c>${VAR}</c> references unexpanded. <c>upstream_connected</c> only.
+    /// or the URL, with <c>${VAR}</c> references unexpanded. <c>upstream_connected</c>,
+    /// <c>pin_created</c> and, on a changed identity, <c>pin_changed</c>.
     /// </summary>
     /// <remarks>
     /// The template rather than the expanded value, so a token passed as
@@ -173,6 +175,14 @@ public sealed record AuditRecord
     /// </remarks>
     [JsonPropertyName("identity")]
     public string? Identity { get; init; }
+
+    /// <summary>
+    /// Why a tool differs from its pin: changed, added or identity_changed, on
+    /// <c>pin_changed</c>; removed, on a <c>pin_accepted</c> that dropped the pin
+    /// of a tool the server no longer serves.
+    /// </summary>
+    [JsonPropertyName("pin_change")]
+    public string? PinChange { get; init; }
 
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }

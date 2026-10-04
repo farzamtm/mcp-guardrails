@@ -1,3 +1,4 @@
+using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Upstream;
 
@@ -61,6 +62,8 @@ internal sealed class ValidateCommand : ICliCommand
             {
                 Console.WriteLine($"warning: policy rule '{rule}' has a 'server:' pattern that matches no configured server, so it never applies.");
             }
+
+            errors += CheckPins(policy, policyPath);
         }
         catch (PolicyException ex)
         {
@@ -70,5 +73,36 @@ internal sealed class ValidateCommand : ICliCommand
 
         Console.WriteLine(errors == 0 ? "valid" : $"invalid: {errors} error(s)");
         return Task.FromResult(errors == 0 ? 0 : 1);
+    }
+
+    /// <summary>Checks the pins file parses, when pinning is on and there is one.</summary>
+    /// <remarks>
+    /// The proxy refuses to start on a pins file it cannot read, so validate
+    /// should say so first. Only parsed: comparing it needs the servers running.
+    /// </remarks>
+    private static int CheckPins(PolicyDocument policy, string policyPath)
+    {
+        var settings = policy.EffectiveScanners.EffectivePins;
+        if (settings.IsOff)
+        {
+            Console.WriteLine("pins: off");
+            return 0;
+        }
+
+        var path = PinsFile.ResolvePath(
+            settings, policyPath, Environment.GetEnvironmentVariable, CliHost.Environment.HomeDirectory);
+        try
+        {
+            var document = PinsFile.Load(path);
+            Console.WriteLine(document is null
+                ? $"pins: no file at {path} yet; servers are pinned the first time the proxy serves."
+                : $"pins: {path} ({document.EffectiveServers.Count} servers pinned)");
+            return 0;
+        }
+        catch (PinsException ex)
+        {
+            Console.WriteLine($"error: {ex.Message}");
+            return 1;
+        }
     }
 }

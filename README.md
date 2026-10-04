@@ -42,6 +42,7 @@ guardrails go.
 | **Budgets** | Session and daily caps on calls and on weighted cost; daily caps persist in SQLite and survive restarts. | [budgets](docs/budgets.md) |
 | **Human approval** | Holds a call until a person answers, at the client (MCP elicitation) or via an HMAC-signed webhook. Silence means no. | [approval](docs/approval.md) |
 | **Injection scanning** | Tool results and tool definitions are checked for prompt injection and fenced as untrusted data, on by default. An optional Claude classifier can act as a second opinion. | [result scanning](docs/result-scanning.md) |
+| **Pinned tool definitions** | Every server's tool definitions are pinned on first use. A tool that changes across an upgrade (a "rug pull") is flagged with a warning or withheld until someone reviews the diff and accepts it. | [pins](docs/pins.md) |
 | **Secret redaction** | API keys, tokens, private keys and passwords are replaced with markers in results, in the audit log and optionally in outgoing arguments. | [secret redaction](docs/secret-redaction.md) |
 | **Any servers** | Front any number of stdio and remote (Streamable HTTP, SSE) servers from one servers file, in the format your client already uses. `wrap` puts the proxy in front of a client's whole server list in one command, and `unwrap` restores it byte for byte. Secrets stay out of the file, and child processes can be isolated from the proxy's environment. | [servers](docs/servers.md) |
 | **Transports** | stdio, or stateless Streamable HTTP (loopback by default, bearer token, Origin check). | [Streamable HTTP](docs/streamable-http.md) |
@@ -267,7 +268,7 @@ in [docs/design-decisions.md](docs/design-decisions.md).
 | --- | --- |
 | Unit tests | Pure logic: policy evaluation, scanners, budgets, config validation, the audit sink |
 | In-process integration | The proxy against a **real MCP server** over in-memory streams, so genuine JSON-RPC is exercised without spawning `npx` |
-| [`scripts/smoke.py`](scripts/smoke.py) | The whole chain over stdio and Streamable HTTP: policy, budgets, all four approval outcomes, a webhook receiver that verifies signatures, a poisoned file caught on the way out, credentials redacted both ways, the LLM classifier against a fake API, OpenTelemetry to a fake collector, and a servers file with several stdio servers, an isolated environment and a remote upstream, plus `validate` and `wrap`/`unwrap` |
+| [`scripts/smoke.py`](scripts/smoke.py) | The whole chain over stdio and Streamable HTTP: policy, budgets, all four approval outcomes, a webhook receiver that verifies signatures, a poisoned file caught on the way out, credentials redacted both ways, the LLM classifier against a fake API, OpenTelemetry to a fake collector, a servers file with several stdio servers, an isolated environment and a remote upstream, plus `validate` and `wrap`/`unwrap`, and a server whose tool changes between restarts, caught by its pin and accepted with `pins accept` |
 
 CI runs all three on Linux, macOS and Windows, plus `dotnet format`, `ruff`,
 `shellcheck` and a load check of every example policy. Core coverage is held at

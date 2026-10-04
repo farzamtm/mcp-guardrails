@@ -56,6 +56,29 @@ with the same two fields:
  "duration_ms":0,"is_error":false}
 ```
 
+[Pinning](pins.md) writes its own events at startup and from the `pins`
+commands: `pin_created` when a server is pinned on first use, `pin_changed`
+for each tool that differs from its pin, `pin_removed` for each pinned tool
+that is gone, and `pin_accepted` / `pin_reset` when someone reviews a change.
+`pin_change` says why a tool differs (`changed`, `added` or `identity_changed`)
+and `scanner_action` what was done about it:
+
+```json
+{"ts":"2026-10-04T10:00:00.130000+00:00","event":"pin_changed","tool":"github__create_issue",
+ "server":"github","downstream_tool":"create_issue","pin_change":"changed",
+ "scanner_action":"blocked","duration_ms":0,"is_error":false}
+```
+
+```bash
+# Which tools changed since they were pinned, and what was done about it?
+jq -r 'select(.event == "pin_changed") | [.ts, .tool, .pin_change, .scanner_action] | @tsv' ~/.mcp-guardrails/audit.jsonl
+
+# What was accepted, and when?
+jq -r 'select(.event == "pin_accepted") | [.ts, .tool] | @tsv' ~/.mcp-guardrails/audit.jsonl
+```
+
+These are names and verdicts only, never the text of a definition.
+
 A call that carried or returned a secret says which detectors fired and what
 was done, and its `arguments` hold markers rather than the values:
 

@@ -2,6 +2,7 @@ using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Hosting;
+using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Upstream;
@@ -59,6 +60,7 @@ internal sealed class ServeCommand : ICliCommand
         var serve = startup.Serve;
         var document = startup.Document;
         var toolMetadata = startup.ToolMetadata;
+        var toolPins = startup.Pins.Gate;
 
         // Both builders implement IHostApplicationBuilder, so everything below -
         // logging, and above all the MCP server with its guardrail filters - is
@@ -156,6 +158,27 @@ internal sealed class ServeCommand : ICliCommand
             await startup.Audit.WriteAsync(finding.ToAuditRecord(DateTimeOffset.UtcNow), CancellationToken.None);
         }
 
+        // What pinning found: servers trusted on first use (only when the pins
+        // were really written - a pin that was never saved was never created),
+        // every tool that differs from its pin, and every pinned tool that is gone.
+        foreach (var report in startup.Pins.Result.Reports)
+        {
+            if (report.FirstSeen && startup.Pins.Saved)
+            {
+                await startup.Audit.WriteAsync(PinAudit.Created(report, DateTimeOffset.UtcNow), CancellationToken.None);
+            }
+
+            foreach (var removed in PinAudit.Removed(report, DateTimeOffset.UtcNow))
+            {
+                await startup.Audit.WriteAsync(removed, CancellationToken.None);
+            }
+        }
+
+        foreach (var finding in toolPins.Findings)
+        {
+            await startup.Audit.WriteAsync(PinAudit.Changed(finding, DateTimeOffset.UtcNow), CancellationToken.None);
+        }
+
         // -------------------------------------------------------------------
         // The webhook approver, if the policy configures one.
         //
@@ -200,6 +223,7 @@ internal sealed class ServeCommand : ICliCommand
             telemetry,
             startup.Policy,
             toolMetadata,
+            toolPins,
             startup.Secrets,
             budget,
             startup.Scanner,
@@ -231,10 +255,10 @@ internal sealed class ServeCommand : ICliCommand
             {
                 // Built once at startup, already qualified with the same namer
                 // the call handler resolves through - so the client never sees a
-                // tool it cannot invoke - and already scanned. A fresh list per
-                // request because the result DTO is mutable and must not be
-                // shared between clients.
-                var tools = toolMetadata.Tools.ToList();
+                // tool it cannot invoke - already scanned and already compared
+                // with its pins. A fresh list per request because the result DTO
+                // is mutable and must not be shared between clients.
+                var tools = toolPins.Tools.ToList();
 
                 // The handler is synchronous, but the delegate returns ValueTask,
                 // so wrap the finished value rather than paying for a state machine.

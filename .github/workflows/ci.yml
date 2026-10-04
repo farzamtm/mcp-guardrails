@@ -192,7 +192,10 @@ jobs:
       - name: Validate the example policies
         run: |
           BIN=src/McpGuardrails.Cli/bin/Release/net10.0/McpGuardrails.Cli
+          # A pins file that does not exist: listing never writes one, and
+          # nothing on the runner should be compared against.
+          PINS="$RUNNER_TEMP/no-pins/pins.json"
           for policy in examples/*.yaml; do
             echo "checking $policy"
-            GUARDRAILS_SERVERS="" GUARDRAILS_POLICY="$policy" "$BIN" list-upstream > /dev/null
+            GUARDRAILS_SERVERS="" GUARDRAILS_PINS="$PINS" GUARDRAILS_POLICY="$policy" "$BIN" list-upstream > /dev/null
           done

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
+using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
@@ -48,6 +49,7 @@ public sealed class GuardrailsCallPipeline
     private readonly ToolCallTelemetry _telemetry;
     private readonly PolicyEvaluator _policy;
     private readonly ToolMetadataGate _toolMetadata;
+    private readonly ToolPinGate _toolPins;
     private readonly SecretGate _secrets;
     private readonly BudgetGate _budget;
     private readonly InjectionGate _scanner;
@@ -58,7 +60,8 @@ public sealed class GuardrailsCallPipeline
     /// <param name="audit">Where every call is recorded, refused or not.</param>
     /// <param name="telemetry">Spans and metrics; inert when nothing listens.</param>
     /// <param name="policy">The rules.</param>
-    /// <param name="toolMetadata">Refuses tools withheld from tools/list.</param>
+    /// <param name="toolMetadata">Refuses tools withheld from tools/list for looking poisoned.</param>
+    /// <param name="toolPins">Refuses tools withheld from tools/list for differing from their pins.</param>
     /// <param name="secrets">Argument blocking and redaction, result redaction.</param>
     /// <param name="budget">Caps on what an approved call may spend.</param>
     /// <param name="scanner">The prompt-injection result scanner.</param>
@@ -73,6 +76,7 @@ public sealed class GuardrailsCallPipeline
         ToolCallTelemetry telemetry,
         PolicyEvaluator policy,
         ToolMetadataGate toolMetadata,
+        ToolPinGate toolPins,
         SecretGate secrets,
         BudgetGate budget,
         InjectionGate scanner,
@@ -84,6 +88,7 @@ public sealed class GuardrailsCallPipeline
         ArgumentNullException.ThrowIfNull(telemetry);
         ArgumentNullException.ThrowIfNull(policy);
         ArgumentNullException.ThrowIfNull(toolMetadata);
+        ArgumentNullException.ThrowIfNull(toolPins);
         ArgumentNullException.ThrowIfNull(secrets);
         ArgumentNullException.ThrowIfNull(budget);
         ArgumentNullException.ThrowIfNull(scanner);
@@ -93,6 +98,7 @@ public sealed class GuardrailsCallPipeline
         _telemetry = telemetry;
         _policy = policy;
         _toolMetadata = toolMetadata;
+        _toolPins = toolPins;
         _secrets = secrets;
         _budget = budget;
         _scanner = scanner;
@@ -306,7 +312,7 @@ public sealed class GuardrailsCallPipeline
     }
 
     /// <summary>
-    /// Policy, tool metadata, argument secrets, approval and budget - in that order.
+    /// Policy, tool metadata, tool pins, argument secrets, approval and budget - in that order.
     /// </summary>
     /// <remarks>
     /// Inside audit, so when this refuses a call by not invoking <c>next</c>,
@@ -339,12 +345,14 @@ public sealed class GuardrailsCallPipeline
 
         var facts = PolicyFacts.ForCall(toolName, parameters, tool, server);
 
-        // Five gates, in this order, and the order is the design.
+        // Six gates, in this order, and the order is the design.
         //
         // The policy decides whether the call is permitted at all. The metadata
         // scanner refuses a tool it withheld from tools/list - refused, not merely
         // left off the list, because a client with a stale list or a model that
-        // guessed the name must not reach it. The secret scanner, under
+        // guessed the name must not reach it - and the pin gate does the same for
+        // a tool whose definition changed since it was reviewed, naming both
+        // reasons when both apply. The secret scanner, under
         // `arguments: block`, refuses a call carrying a credential - before
         // approval, so nobody is asked to approve a call that will be refused,
         // and so a human who approves a harmless-looking write is not also
@@ -356,6 +364,7 @@ public sealed class GuardrailsCallPipeline
         // finally going out.
         var decision = _policy.Evaluate(facts, _explain);
         decision = _toolMetadata.Apply(decision, toolName);
+        decision = _toolPins.Apply(decision, toolName);
         decision = _secrets.Apply(decision, parameters?.Arguments);
 
         // Recorded now as well as at the end, because the approval wait can end

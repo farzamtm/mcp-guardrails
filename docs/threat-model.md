@@ -50,6 +50,7 @@ This is the long version.
 | **Proxy ↔ remote server** | The same, over Streamable HTTP or SSE, with the static headers from the servers file | Semi-trusted, like a stdio server, and reached over the network: https is required except to loopback, redirects are not followed (a 3xx would carry the `Authorization` header elsewhere), and the transport is never auto-detected, so nothing silently downgrades to SSE. |
 | **Servers file** | Read once at startup from `--servers`, `GUARDRAILS_SERVERS` or `~/.mcp-guardrails/servers.yaml` ([servers.md](servers.md)) | Trusted, and **it is code execution**: whoever can write it chooses what the proxy launches and where it sends headers. Unknown keys are errors, unset variables stop the start, and on Unix the proxy warns when the file is group- or world-writable. |
 | **Policy file** | Read once at startup from `GUARDRAILS_POLICY` or `~/.mcp-guardrails/policy.yaml` | Trusted. Anyone who can write it has already won. |
+| **Pins file** | Read at startup, written on a server's first use and by `pins accept` / `pins reset`, at `GUARDRAILS_PINS`, `scanners.pins.file` or `~/.mcp-guardrails/pins.json` ([pins.md](pins.md)) | Trusted: whoever can write it can accept any tool change. A file that exists but cannot be parsed stops the proxy rather than being re-pinned from what the servers serve now. |
 | **Audit log** | Appended to `GUARDRAILS_AUDIT` or `~/.mcp-guardrails/audit.jsonl` | Trusted by whoever reads it, protected only by filesystem permissions. |
 | **Environment** | `GUARDRAILS_*` variables, API keys, other servers' tokens | Trusted. Under `env_isolation: true` a stdio server receives only an allowlist, its `env_passthrough` and its own `env`; otherwise it inherits everything, which this release warns about at startup. See [environment isolation](servers.md#environment-isolation). |
 
@@ -145,6 +146,16 @@ hash checking what npm serves for it.
   it, as a scanner decision before approval, so a stale client list or a guessed
   name does not reach it. Each flagged tool is logged once at startup, to stderr
   and as a `tool_metadata` audit line.
+- **Pinned definitions**
+  ([`ToolPinGate`](../src/McpGuardrails.Core/Pins/ToolPinGate.cs),
+  [`PinCheck`](../src/McpGuardrails.Core/Pins/PinCheck.cs)). Every server's tool
+  definitions are hashed on first use and compared on every later start, so an
+  update that changes a description, a schema or an annotation — a rug pull —
+  is noticed even when it does not look like an injection, and so is a server
+  name that now launches a different program. Under `warn` (the default) the
+  changed tool carries a warning; under `block` it is withheld and refused
+  until someone runs `pins accept`. Pins never update themselves after first
+  use.
 - **Environment isolation**
   ([`EnvironmentIsolation`](../src/McpGuardrails.Core/Upstream/EnvironmentIsolation.cs)).
   With `env_isolation: true` a stdio server starts with only the variables
@@ -152,9 +163,10 @@ hash checking what npm serves for it.
   never sees the classifier's API key, the HTTP bearer token or another server's
   token. Opt-in for this release, with a startup warning listing the variable
   names a server would lose; it becomes the default later.
-- **The audit log** records every call it received and how long it took, and an
+- **The audit log** records every call it received and how long it took, an
   `upstream_connected` line per server at startup naming what was launched (the
-  unexpanded template), so a later edit to the servers file shows up.
+  unexpanded template), so a later edit to the servers file shows up, and a
+  `pin_changed` line for every tool that differs from its pin.
 
 **What it can still do:** see [what a downstream server can still do](#what-a-downstream-server-can-still-do).
 
@@ -241,6 +253,8 @@ already won. Concretely, so nobody mistakes this for a defended boundary:
 - **Write to the sandbox directory** → plant files for the agent to read: this
   is A1 delivered locally.
 - **Control `PATH` or the npm cache** → replace what `npx` launches.
+- **Write to the pins file** → accept any tool change, or **delete it** → the
+  next start trusts whatever every server serves, as on first use.
 
 The audit file and its directory are created with the process's default
 permissions (umask); the proxy does not tighten them. That is a filesystem
@@ -342,10 +356,35 @@ so it inherits every gap in [the scanner section](#the-scanner-is-a-label-not-a-
   is not addressed to the model and an icon is a URL.
 - **Startup only.** The list is read once at connect time, so a server cannot
   change a scanned definition later through the proxy — but whatever it said at
-  startup is what was judged.
+  startup is what was judged. A change *between* starts is what
+  [pinning](#pins-detect-change-not-malice) is for.
 - **Policy on the call is still the stronger defence.** A description that slips
   past the heuristics still has to turn into a `tools/call` that policy,
   approval and budget allow.
+
+### Pins detect change, not malice
+
+[Pinning](pins.md) remembers what each server's tools looked like and flags any
+difference on a later start. Its limits:
+
+- **Trust on first use.** The first start pins whatever a server serves. A
+  server that is hostile from day one is pinned hostile; catching that is the
+  metadata scanner's job and the operator's review.
+- **`warn` delivers the change.** The default puts a warning in front of the new
+  description and still advertises the tool, for the reason result scanning
+  annotates: a guardrail that breaks every upgrade gets switched off. `block`
+  is the setting that keeps a changed tool away from the model until review.
+- **Definitions, not behaviour.** A tool whose definition is byte-for-byte the
+  same can still do something different on the server side.
+- **Identity is the command line, not the code.** The identity hash covers the
+  expanded command and arguments of a stdio server and the URL of a remote one.
+  An unpinned `npx -y package` that silently resolves to a new version keeps the
+  same identity; only its tools' hashes notice the change. Environment values
+  are left out on purpose, so a secret in `env` never feeds a committed hash —
+  but a secret in `args` does, as one input to a SHA-256.
+- **No canonical Unicode normalization.** Strings are compared by code point,
+  so a server that re-encodes accents raises a false alarm rather than a missed
+  change.
 
 ### Approval has limits of its own
 
