@@ -36,13 +36,19 @@ internal static class CommandTable
         ("import", () => new ImportCommand()),
         ("wrap", () => new WrapCommand()),
         ("unwrap", () => new UnwrapCommand()),
+        ("pins", () => new PinsCommand()),
     ];
 
     /// <summary>Runs the named subcommand, or serves when none is named.</summary>
     public static async Task<int> RunAsync(string[] args)
     {
+        // The command named earliest on the line wins, not the first in the
+        // table: 'pins accept fs import' names a tool called import, and must
+        // not run the import command.
         var command = _commands
-            .Where(entry => args.Contains(entry.Name, StringComparer.Ordinal))
+            .Select(entry => (entry.Create, Index: Array.IndexOf(args, entry.Name)))
+            .Where(entry => entry.Index >= 0)
+            .OrderBy(entry => entry.Index)
             .Select(entry => entry.Create())
             .FirstOrDefault() ?? new ServeCommand();
 

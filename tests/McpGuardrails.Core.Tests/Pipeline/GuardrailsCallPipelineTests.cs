@@ -3,6 +3,7 @@ using System.Text.Json;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
+using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
@@ -76,12 +77,26 @@ public sealed class GuardrailsCallPipelineTests
             InMemoryMcpServer server,
             UpstreamRegistry registry,
             PolicyDocument document,
-            bool explain)
+            bool explain,
+            PinsDocument? pins)
         {
             _server = server;
             Registry = registry;
 
             var injection = document.EffectiveScanners.EffectiveInjection;
+            var metadata = ToolMetadataGate.Build(
+                injection,
+                registry.Connections.SelectMany(connection =>
+                    connection.Tools.Select(tool => (connection.Name, tool.ProtocolTool))));
+
+            // Pins only when a test supplies a pins file, so every other test sees
+            // the tools exactly as the metadata scanner left them.
+            Pins = pins is null
+                ? ToolPinGate.Build(PinSettings.Disabled, [], metadata.Tools)
+                : ToolPinGate.Build(
+                    document.EffectiveScanners.EffectivePins,
+                    PinCheck.Run(pins, registry.Connections.Select(PinSubject.From), DateTimeOffset.UnixEpoch).Reports,
+                    metadata.Tools);
             Budget = BudgetGate.For(
                 document.EffectiveBudgets,
                 _ => throw new InvalidOperationException("no daily store in these tests"));
@@ -99,10 +114,8 @@ public sealed class GuardrailsCallPipelineTests
                 Sink,
                 Telemetry,
                 new PolicyEvaluator(document),
-                ToolMetadataGate.Build(
-                    injection,
-                    registry.Connections.SelectMany(connection =>
-                        connection.Tools.Select(tool => (connection.Name, tool.ProtocolTool)))),
+                metadata,
+                Pins,
                 new SecretGate(document.EffectiveScanners.EffectiveSecrets),
                 Budget,
                 new InjectionGate(injection),
@@ -113,6 +126,8 @@ public sealed class GuardrailsCallPipelineTests
         public UpstreamRegistry Registry { get; }
 
         public GuardrailsCallPipeline Pipeline { get; }
+
+        public ToolPinGate Pins { get; }
 
         public RecordingSink Sink { get; } = new();
 
@@ -129,7 +144,7 @@ public sealed class GuardrailsCallPipelineTests
 
         public AuditRecord Record => Assert.Single(Sink.Records);
 
-        public static async Task<Harness> StartAsync(string yaml = "", bool explain = false)
+        public static async Task<Harness> StartAsync(string yaml = "", bool explain = false, PinsDocument? pins = null)
         {
             var server = InMemoryMcpServer.Start("fixture", Echo(), Delete(), PoisonedTool());
             var registry = await UpstreamRegistry.ConnectAsync(
@@ -137,7 +152,7 @@ public sealed class GuardrailsCallPipelineTests
                 NullLoggerFactory.Instance,
                 server.TransportFactory);
 
-            return new Harness(server, registry, PolicyLoader.Parse(yaml), explain);
+            return new Harness(server, registry, PolicyLoader.Parse(yaml), explain, pins);
         }
 
         public ValueTask<CallToolResult> CallAsync(
@@ -198,7 +213,7 @@ public sealed class GuardrailsCallPipelineTests
 
     private static GuardrailsCallPipeline Bare(UpstreamRegistry registry, IAuditSink sink, ToolCallTelemetry telemetry) =>
         new(registry, sink, telemetry, PolicyEvaluator.Empty, ToolMetadataGate.Build(ScannerSettings.Disabled, []),
-            SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off);
+            ToolPinGate.Build(PinSettings.Disabled, [], []), SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off);
 
     private const string _approveEcho = """
         rules:
@@ -290,6 +305,71 @@ public sealed class GuardrailsCallPipelineTests
         // Nothing came back, so nothing was scanned: absent, not "clean".
         Assert.Null(record.ScannerAction);
         Assert.Null(record.ResultSecretsAction);
+    }
+
+    /// <summary>
+    /// Pins for the harness's server in which the named tools have a hash no
+    /// definition produces, so each reads as changed; the others are absent and
+    /// read as added.
+    /// </summary>
+    private static PinsDocument PinsWithChanged(params string[] tools) =>
+        PinsDocument.Empty.With("fs", new PinnedServer
+        {
+            Identity = ServerIdentity.Fingerprint(new UpstreamServerConfig { Name = "fs", Command = "unused" }),
+            IdentityHint = "unused",
+            PinnedAt = DateTimeOffset.UnixEpoch,
+            Tools = new SortedDictionary<string, PinnedTool>(
+                tools.ToDictionary(t => t, _ => new PinnedTool { Hash = "sha256:" + new string('0', 64) }),
+                StringComparer.Ordinal),
+        });
+
+    [Fact]
+    public async Task AToolThatChangedSinceItWasPinned_IsRefusedBeforeApproval_UnderBlock()
+    {
+        await using var h = await Harness.StartAsync(
+            """
+            scanners:
+              pins:
+                mode: block
+                on_new_tool: allow
+            rules:
+              - name: approve-everything
+                match:
+                  tool: "*"
+                decision: require_approval
+            """,
+            pins: PinsWithChanged("echo"));
+
+        var result = await h.CallAsync("fs__echo");
+
+        Assert.True(result.IsError);
+        Assert.Contains("pins diff fs echo", Text(result));
+        Assert.Equal(0, h.InBand.Asked);
+        Assert.Equal(0, h.Forwarded);
+        Assert.Equal(ToolPinGate.ChangedRule, h.Record.Rule);
+        Assert.DoesNotContain(h.Pins.Tools, tool => tool.Name == "fs__echo");
+    }
+
+    [Fact]
+    public async Task AToolWithheldForPoisoningAndForAPinChange_IsRefusedNamingBoth()
+    {
+        await using var h = await Harness.StartAsync(
+            """
+            scanners:
+              injection:
+                metadata: block
+              pins:
+                mode: block
+            """,
+            pins: PinsWithChanged("poisoned", "echo", "delete"));
+
+        var result = await h.CallAsync("fs__poisoned", message: null);
+
+        Assert.True(result.IsError);
+        Assert.Equal($"{ToolMetadataGate.MetadataRule}, {ToolPinGate.ChangedRule}", h.Record.Rule);
+        Assert.Contains("injection", Text(result));
+        Assert.Contains("Separately", Text(result));
+        Assert.Equal(0, h.Forwarded);
     }
 
     [Fact]
@@ -683,23 +763,26 @@ public sealed class GuardrailsCallPipelineTests
         var sink = h.Sink;
         var telemetry = h.Telemetry;
         var metadata = ToolMetadataGate.Build(ScannerSettings.Disabled, []);
+        var pins = ToolPinGate.Build(PinSettings.Disabled, [], []);
 
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            null!, sink, telemetry, PolicyEvaluator.Empty, metadata, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            null!, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, null!, telemetry, PolicyEvaluator.Empty, metadata, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, null!, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, null!, PolicyEvaluator.Empty, metadata, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, null!, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, null!, metadata, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, telemetry, null!, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, null!, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, telemetry, PolicyEvaluator.Empty, null!, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, null!, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, null!, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, SecretGate.Off, null!, InjectionGate.Off));
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, null!, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, SecretGate.Off, BudgetGate.Unlimited, null!));
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, null!, InjectionGate.Off));
+        Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, null!));
 
         var pipeline = Bare(registry, sink, telemetry);
         Assert.Throws<ArgumentNullException>(() =>

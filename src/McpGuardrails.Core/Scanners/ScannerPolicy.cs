@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 
 namespace McpGuardrails.Core.Scanners;
@@ -61,6 +62,10 @@ public sealed record ScannerPolicy
     [JsonPropertyName("secrets")]
     public SecretScannerSettings? Secrets { get; init; }
 
+    /// <summary>Pinning of tool definitions across restarts.</summary>
+    [JsonPropertyName("pins")]
+    public PinSettings? Pins { get; init; }
+
     /// <summary>
     /// The defaults: injection scanning annotating what it finds, and secrets
     /// redacted from the audit log and from results.
@@ -80,11 +85,16 @@ public sealed record ScannerPolicy
     [JsonIgnore]
     public SecretScannerSettings EffectiveSecrets => Secrets ?? SecretScannerSettings.Default;
 
+    /// <summary>The pin settings, or the defaults when the file omits them.</summary>
+    [JsonIgnore]
+    public PinSettings EffectivePins => Pins ?? PinSettings.Default;
+
     /// <summary>Validates the section, throwing with a message naming the problem.</summary>
     public void Validate()
     {
         EffectiveInjection.Validate();
         EffectiveSecrets.Validate();
+        EffectivePins.Validate();
     }
 }
 
