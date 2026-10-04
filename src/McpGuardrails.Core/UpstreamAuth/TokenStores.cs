@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 
 namespace McpGuardrails.Core.UpstreamAuth;
@@ -77,6 +78,12 @@ public sealed class KeychainTokenStore(ProcessRunner run, string service = Keych
         };
     }
 
+    /// <remarks>
+    /// Read back and compared afterwards: <c>security -i</c> reads its command
+    /// as one line, and a large login (two JWTs, hex-encoded) may exceed what it
+    /// accepts. A truncated item would otherwise be reported as a successful
+    /// login and then read as one this proxy cannot use, on every start.
+    /// </remarks>
     public void Write(string server, string secret)
     {
         var result = run(
@@ -87,6 +94,23 @@ public sealed class KeychainTokenStore(ProcessRunner run, string service = Keych
         if (result.ExitCode != 0)
         {
             throw Failed("write", result);
+        }
+
+        string? stored;
+        try
+        {
+            stored = Read(server);
+        }
+        catch (TokenStoreException)
+        {
+            stored = null;
+        }
+
+        if (!string.Equals(stored, secret, StringComparison.Ordinal))
+        {
+            throw new TokenStoreException(
+                $"The macOS Keychain did not store the {secret.Length}-character login intact. " +
+                $"Use {TokenStoreSelection.Variable}=file to keep the tokens in an owner-only file instead.");
         }
     }
 
@@ -203,9 +227,16 @@ public sealed class FileTokenStore(string directory, bool unixPermissions, ISecr
 
     private const UnixFileMode _ownerOnlyFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
 
-    public string Description => protector is null
-        ? $"files readable only by you in {directory}"
-        : $"{protector.Name}-encrypted files in {directory}";
+    public string Description => (protector, unixPermissions) switch
+    {
+        ({ } encrypted, _) => $"{encrypted.Name}-encrypted files in {directory}",
+        (null, true) => $"files readable only by you in {directory}",
+
+        // No owner-only mode to set on Windows: the files get the folder's
+        // permissions, which under the profile are the user's own but anywhere
+        // else may be wider. Said as it is rather than promised.
+        (null, false) => $"unencrypted files in {directory}, protected only by that folder's permissions",
+    };
 
     public string? Read(string server)
     {
@@ -232,15 +263,11 @@ public sealed class FileTokenStore(string directory, bool unixPermissions, ISecr
         var path = PathFor(server);
         var temporary = $"{path}.{Guid.NewGuid():N}.tmp";
 
-        // CA1416: the Unix-mode APIs throw on Windows, and the caller asks for
-        // them only elsewhere - the platform is the CLI's decision, made once,
-        // rather than an OS check here whose other branch no test run can reach.
-#pragma warning disable CA1416
         try
         {
             if (unixPermissions)
             {
-                Directory.CreateDirectory(directory, _ownerOnlyDirectory);
+                CreateOwnerOnlyDirectory(directory);
             }
             else
             {
@@ -250,7 +277,7 @@ public sealed class FileTokenStore(string directory, bool unixPermissions, ISecr
             var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
             if (unixPermissions)
             {
-                options.UnixCreateMode = _ownerOnlyFile;
+                MakeOwnerOnly(options);
             }
 
             var bytes = Encoding.UTF8.GetBytes(secret);
@@ -272,8 +299,19 @@ public sealed class FileTokenStore(string directory, bool unixPermissions, ISecr
 
             throw new TokenStoreException($"Cannot write '{path}': {ex.Message}");
         }
-#pragma warning restore CA1416
     }
+
+    // The two Unix-mode calls, kept to themselves so the suppression covers
+    // nothing else. They throw on Windows; unixPermissions is true only when the
+    // CLI has established a non-Windows host - one decision, made once, rather
+    // than an OS check here whose other branch no single-OS test run reaches.
+    [SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = _unixOnly)]
+    private static void CreateOwnerOnlyDirectory(string path) => Directory.CreateDirectory(path, _ownerOnlyDirectory);
+
+    [SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = _unixOnly)]
+    private static void MakeOwnerOnly(FileStreamOptions options) => options.UnixCreateMode = _ownerOnlyFile;
+
+    private const string _unixOnly = "Called only when unixPermissions is true, which the CLI sets only off Windows.";
 
     public bool Delete(string server)
     {
@@ -332,14 +370,22 @@ public static class TokenStoreSelection
             "OAuth tokens are stored in files only your user can read, not in an OS credential store. " +
             "Anyone who can read your home directory as you can use them.";
 
+        // An explicit choice this platform cannot honour is refused here, at
+        // once, rather than failing later as "security exited 127".
         switch (requested)
         {
-            case "keychain":
+            case "keychain" when isMacOS:
                 return (TokenStoreKind.Keychain, null);
-            case "secret-service":
+            case "secret-service" when !isMacOS && !isWindows:
                 return (TokenStoreKind.SecretService, null);
-            case "dpapi":
+            case "dpapi" when isWindows:
                 return (TokenStoreKind.Dpapi, null);
+            case "keychain":
+                throw Unavailable(requested, "macOS");
+            case "secret-service":
+                throw Unavailable(requested, "Linux and other Unix systems");
+            case "dpapi":
+                throw Unavailable(requested, "Windows");
             case "file":
                 return (TokenStoreKind.File, fileWarning);
             case not null:
@@ -361,6 +407,9 @@ public static class TokenStoreSelection
             ? (TokenStoreKind.SecretService, null)
             : (TokenStoreKind.File, "No Secret Service was found (install libsecret's secret-tool and run a keyring). " + fileWarning);
     }
+
+    private static TokenStoreException Unavailable(string requested, string platforms) =>
+        new($"{Variable}={requested} is only available on {platforms}. Use file, or leave it unset to use this system's store.");
 }
 
 internal static class Hex

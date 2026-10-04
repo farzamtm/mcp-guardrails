@@ -143,6 +143,9 @@ servers:                        # "mcpServers" is accepted as an alias
 fail-open this project exists to avoid. Keys that only configure a client
 (`timeout`, `alwaysLoad`, `oauth`, `auth`, `headersHelper`, `dev`,
 `sandboxEnabled`, `transportType`) are ignored, with a warning that says so.
+A client's `oauth` key configures the client's own login; to have the proxy log
+in to a remote server, use `x-guardrails: { oauth: {} }` and `auth login`
+([below](#logging-in-with-oauth)).
 
 **A remote server is never auto-detected.** `type: http` means Streamable HTTP
 and `type: sse` means the older transport. The SDK's auto-detection falls back
@@ -191,7 +194,10 @@ listener on `127.0.0.1`.
 and refreshes them when they expire. A server with no usable login does not stop
 the proxy: its tools are absent, a warning names the server, and a call to one
 of them tells the model to have you run `auth login`. The same happens when a
-login expires mid-session and cannot be refreshed. A server that was never
+login expires mid-session and cannot be refreshed, and when the credential store
+cannot be read (a locked Keychain or keyring): one server's credential trouble
+never stops the others. A refresh that returns no new refresh token keeps the
+stored one, as servers that do not rotate them expect. A server that was never
 logged in is not contacted at all, so starting the proxy registers no clients.
 
 **Where the tokens live**, never in the servers file or the audit log:
@@ -203,7 +209,18 @@ logged in is not contacted at all, so starting the proxy registers no clients.
 | Windows | Files encrypted with DPAPI for your user |
 | Anywhere, with `GUARDRAILS_TOKEN_STORE=file` | `~/.mcp-guardrails/tokens/<server>.json` (or `GUARDRAILS_TOKENS`), created `0600` in a `0700` directory |
 
-`GUARDRAILS_TOKEN_STORE` also accepts `keychain`, `secret-service` and `dpapi`.
+`GUARDRAILS_TOKEN_STORE` also accepts `keychain`, `secret-service` and `dpapi`,
+each only on its own platform. On Windows, `file` writes unencrypted files
+protected only by the folder's permissions; prefer the DPAPI default.
+
+The macOS Keychain items are readable by any process running as you, through the
+same `security` tool, without a prompt. Against other software running as your
+user they protect no more than the `0600` file; what they add is that the tokens
+are not a file to copy, back up or commit by accident.
+
+`auth login` reads the item back after writing it and fails if it differs, so a
+login too large for the store is an error at login rather than a broken login
+later.
 
 **Tokens are bound to the server's URL.** If you point a server name at a
 different URL, the old login is not sent there; `auth status` says so, and you

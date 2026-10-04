@@ -11,11 +11,7 @@ namespace McpGuardrails.Core.UpstreamAuth;
 /// <param name="server">The server's name.</param>
 /// <param name="why">What happened, as a clause: "has never been logged in".</param>
 public sealed class UpstreamLoginRequiredException(string server, string why)
-    : Exception($"Server '{server}' {why}: run 'mcp-guardrails auth login {server}'.")
-{
-    /// <summary>The server's name.</summary>
-    public string Server { get; } = server;
-}
+    : UpstreamNeedsOperatorException(server, $"Server '{server}' {why}: run 'mcp-guardrails auth login {server}'.");
 
 /// <summary>
 /// The SDK's OAuth client settings for a remote server, for the two ways the
@@ -46,17 +42,20 @@ public static class UpstreamOAuth
         ArgumentNullException.ThrowIfNull(store);
 
         var oauth = config.OAuth ?? throw new ArgumentException($"Server '{config.Name}' has no OAuth settings.", nameof(config));
-        var cache = new StoredTokenCache(store, config.Name, config.Url!);
+        var cache = new StoredTokenCache(store, config.Name, config.Url!) { ForServing = true };
 
         // Checked before connecting rather than left to the SDK: with no tokens it
         // would register a new client with the authorization server on every
         // start, only to stop at the step that needs a person.
-        switch (cache.Status().State)
+        var status = cache.Status();
+        switch (status.State)
         {
             case LoginState.None:
                 throw new UpstreamLoginRequiredException(config.Name, "has never been logged in");
             case LoginState.OtherUrl:
                 throw new UpstreamLoginRequiredException(config.Name, "was logged in at a different URL");
+            case LoginState.Unreadable when status.Problem is { } problem:
+                throw new UpstreamLoginRequiredException(config.Name, $"has a stored login that could not be read ({problem})");
             case LoginState.Unreadable:
                 throw new UpstreamLoginRequiredException(config.Name, "has a stored login this proxy cannot read");
         }
@@ -114,28 +113,5 @@ public static class UpstreamOAuth
         return (config, loggerFactory) => config.OAuth is null
             ? UpstreamRegistry.CreateTransport(config, loggerFactory)
             : UpstreamRegistry.CreateTransport(config, loggerFactory, ForServing(config, store));
-    }
-
-    /// <summary>The login-required failure somewhere in <paramref name="error"/>, if there is one.</summary>
-    /// <remarks>
-    /// Searched through inner exceptions because the SDK wraps what a callback
-    /// throws on its way out of a request.
-    /// </remarks>
-    public static UpstreamLoginRequiredException? LoginRequired(Exception? error)
-    {
-        for (var current = error; current is not null; current = current.InnerException)
-        {
-            if (current is UpstreamLoginRequiredException login)
-            {
-                return login;
-            }
-
-            if (current is AggregateException aggregate)
-            {
-                return aggregate.InnerExceptions.Select(LoginRequired).FirstOrDefault(found => found is not null);
-            }
-        }
-
-        return null;
     }
 }

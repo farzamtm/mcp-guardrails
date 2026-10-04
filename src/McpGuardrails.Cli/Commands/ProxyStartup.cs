@@ -159,12 +159,7 @@ internal sealed class ProxyStartup : IAsyncDisposable
             UpstreamTransportFactory? transports = null;
             if (servers.Servers.Any(server => server.OAuth is not null))
             {
-                var (store, warning) = CliTokenStore.Create();
-                if (warning is not null)
-                {
-                    serversLog.LogWarning("{Warning}", warning);
-                }
-
+                var store = CliTokenStore.Create(warning => serversLog.LogWarning("{Warning}", warning));
                 transports = UpstreamOAuth.ServingTransports(store);
             }
 

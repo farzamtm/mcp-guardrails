@@ -29,21 +29,78 @@ public sealed class TokenStoresTests
 
     // ------------------------------------------------------------ keychain
 
+    /// <summary>
+    /// A stand-in for <c>security</c> that keeps items in a dictionary, so
+    /// the write-then-read-back path runs end to end. <paramref name="lineLimit"/>
+    /// models an interactive line buffer that cuts long commands short.
+    /// </summary>
+    private sealed class FakeKeychain(int lineLimit = int.MaxValue)
+    {
+        private readonly Dictionary<string, string> _items = new(StringComparer.Ordinal);
+
+        public ProcessResult Run(string file, IReadOnlyList<string> args, string? input)
+        {
+            if (args is ["-i"])
+            {
+                var line = input![..Math.Min(input!.Length, lineLimit)].TrimEnd('\n');
+                var parts = line.Split(' ');
+                _items[parts[3]] = parts[^1];
+                return Ok();
+            }
+
+            return _items.TryGetValue(args[2], out var hex) ? Ok(hex + "\n") : Exit(44);
+        }
+    }
+
     [Fact]
     public void Keychain_WritesTheSecretThroughStdin_NeverOnTheCommandLine()
     {
-        var runner = new FakeRunner(Ok());
+        const string secret = "{\"access_token\":\"secret value\"}";
+        var runner = new FakeRunner(Ok(), Ok(Convert.ToHexString(Encoding.UTF8.GetBytes(secret)) + "\n"));
         var store = new KeychainTokenStore(runner.Run);
 
-        store.Write("linear", "{\"access_token\":\"secret value\"}");
+        store.Write("linear", secret);
 
-        var (file, args, input) = Assert.Single(runner.Calls);
+        Assert.Equal(2, runner.Calls.Count);
+        var (file, args, input) = runner.Calls[0];
         Assert.Equal("security", file);
         Assert.Equal(["-i"], args);
         Assert.DoesNotContain("secret", string.Join(' ', args), StringComparison.Ordinal);
         Assert.StartsWith("add-generic-password -U -a linear -s mcp-guardrails -w ", input, StringComparison.Ordinal);
         Assert.DoesNotContain("secret value", input, StringComparison.Ordinal);
         Assert.Equal("the macOS Keychain", store.Description);
+    }
+
+    [Fact]
+    public void Keychain_RoundTripsALargeLogin()
+    {
+        // About what two provider JWTs and a client registration come to. The
+        // real `security -i` line limit was not measured; this pins only that
+        // the write path itself does not cut a large secret short.
+        var secret = new string('x', 6 * 1024);
+        var store = new KeychainTokenStore(new FakeKeychain().Run);
+
+        store.Write("linear", secret);
+
+        Assert.Equal(secret, store.Read("linear"));
+    }
+
+    [Fact]
+    public void Keychain_ThatStoresALoginShortened_FailsTheWriteLoudly()
+    {
+        var store = new KeychainTokenStore(new FakeKeychain(lineLimit: 4096).Run);
+
+        var ex = Assert.Throws<TokenStoreException>(() => store.Write("linear", new string('x', 6 * 1024)));
+        Assert.Contains("did not store", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("GUARDRAILS_TOKEN_STORE=file", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Keychain_ThatCannotReadBackWhatItWrote_FailsTheWrite()
+    {
+        var store = new KeychainTokenStore(new FakeRunner(Ok(), Exit(51, "locked")).Run);
+
+        Assert.Throws<TokenStoreException>(() => store.Write("linear", "secret"));
     }
 
     [Fact]
@@ -167,7 +224,17 @@ public sealed class TokenStoresTests
         store.Write("linear", "two");
 
         Assert.Equal("two", store.Read("linear"));
-        Assert.Contains("files readable only by you", store.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void File_DescribesWhatProtectsIt()
+    {
+        // On Windows without DPAPI there is no owner-only mode to set, so the
+        // description does not promise one.
+        Assert.Equal("files readable only by you in /t", new FileTokenStore("/t", unixPermissions: true).Description);
+        Assert.Equal(
+            "unencrypted files in C:\\t, protected only by that folder's permissions",
+            new FileTokenStore("C:\\t", unixPermissions: false).Description);
     }
 
     [Fact]
@@ -275,15 +342,31 @@ public sealed class TokenStoresTests
     // ----------------------------------------------------------- selection
 
     [Theory]
-    [InlineData("keychain", TokenStoreKind.Keychain)]
-    [InlineData("secret-service", TokenStoreKind.SecretService)]
-    [InlineData("dpapi", TokenStoreKind.Dpapi)]
-    public void AnExplicitStore_IsUsed_WithoutAWarning(string requested, TokenStoreKind expected)
+    [InlineData("keychain", true, false, TokenStoreKind.Keychain)]
+    [InlineData("secret-service", false, false, TokenStoreKind.SecretService)]
+    [InlineData("dpapi", false, true, TokenStoreKind.Dpapi)]
+    public void AnExplicitStore_IsUsed_WithoutAWarning(string requested, bool isMacOS, bool isWindows, TokenStoreKind expected)
     {
-        var (kind, warning) = TokenStoreSelection.Choose(requested, false, false, () => throw new InvalidOperationException("not asked"));
+        var (kind, warning) = TokenStoreSelection.Choose(requested, isMacOS, isWindows, () => throw new InvalidOperationException("not asked"));
 
         Assert.Equal(expected, kind);
         Assert.Null(warning);
+    }
+
+    [Theory]
+    [InlineData("keychain", false, false, "macOS")]
+    [InlineData("keychain", false, true, "macOS")]
+    [InlineData("secret-service", true, false, "Linux")]
+    [InlineData("secret-service", false, true, "Linux")]
+    [InlineData("dpapi", true, false, "Windows")]
+    [InlineData("dpapi", false, false, "Windows")]
+    public void AnExplicitStoreThisPlatformLacks_IsRefusedAtOnce(string requested, bool isMacOS, bool isWindows, string platform)
+    {
+        // Otherwise it fails later, as "security exited 127".
+        var ex = Assert.Throws<TokenStoreException>(
+            () => TokenStoreSelection.Choose(requested, isMacOS, isWindows, () => true));
+
+        Assert.Contains($"only available on {platform}", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

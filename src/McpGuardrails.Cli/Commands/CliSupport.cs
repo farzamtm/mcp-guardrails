@@ -134,6 +134,29 @@ internal static class CliArgs
         return args[index + 1];
     }
 
+    /// <summary>
+    /// The positional words after <paramref name="command"/>: everything that is
+    /// not a flag, skipping the value of each flag in <paramref name="valueFlags"/>.
+    /// </summary>
+    public static List<string> Operands(string[] args, string command, params string[] valueFlags)
+    {
+        var operands = new List<string>();
+
+        for (var i = Array.IndexOf(args, command) + 1; i < args.Length; i++)
+        {
+            if (valueFlags.Contains(args[i], StringComparer.Ordinal))
+            {
+                i++;
+            }
+            else if (!args[i].StartsWith("--", StringComparison.Ordinal))
+            {
+                operands.Add(args[i]);
+            }
+        }
+
+        return operands;
+    }
+
     /// <summary>Every value given to a repeatable flag, in order.</summary>
     /// <exception cref="CommandFailedException">An occurrence of the flag has no value after it.</exception>
     public static IReadOnlyList<string> Values(string[] args, string flag)

@@ -3737,6 +3737,10 @@ def run_oauth_upstream_phase() -> tuple[int, list[str]]:
             time.sleep(3)
             return not result.get("isError")
 
+        # The first refresh answers without a new refresh_token, as servers
+        # that do not rotate them do: the stored one must survive it, or the
+        # second refresh below would have nothing to send.
+        issuer.rotate_refresh_tokens = False
         failures, session_stderr = run_session(
             [
                 (
@@ -3747,10 +3751,15 @@ def run_oauth_upstream_phase() -> tuple[int, list[str]]:
                 (
                     echo(2),
                     "oauth upstream: an expired access token is refreshed silently",
-                    then_revoke,
+                    then_expire,
                 ),
                 (
                     echo(3),
+                    "oauth upstream: a refresh with no new refresh_token keeps the old",
+                    then_revoke,
+                ),
+                (
+                    echo(4),
                     "oauth upstream: a login that cannot be refreshed mid-session "
                     "is refused, naming auth login",
                     lambda r: (
@@ -3766,8 +3775,8 @@ def run_oauth_upstream_phase() -> tuple[int, list[str]]:
         check.failures += failures
         stderr += session_stderr
         check.expect(
-            issuer.token_requests["refresh_token"] >= 1,
-            "oauth upstream: the token endpoint saw a refresh",
+            issuer.token_requests["refresh_token"] >= 2,
+            "oauth upstream: the token endpoint saw two refreshes",
         )
 
         wait_for_lines(f"{d}/upstream-audit.jsonl", 2, timeout=10)

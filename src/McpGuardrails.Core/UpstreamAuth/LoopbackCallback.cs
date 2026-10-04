@@ -25,6 +25,13 @@ public static class LoopbackCallback
             : "The login did not complete. Return to the terminal for details.") +
         "</p>";
 
+    /// <summary>
+    /// True when <paramref name="requestLine"/> is a GET for the callback path
+    /// exactly. Anything else - a favicon, <c>/callbackx</c> - is not the login
+    /// coming back, and the listener answers 404 and keeps waiting.
+    /// </summary>
+    public static bool IsCallback(string? requestLine) => Target(requestLine) is not null;
+
     /// <summary>Reads the authorization response out of an HTTP request line.</summary>
     /// <param name="requestLine">E.g. <c>GET /callback?code=...&amp;state=... HTTP/1.1</c>.</param>
     /// <exception cref="InvalidOperationException">
@@ -33,14 +40,8 @@ public static class LoopbackCallback
     /// </exception>
     public static AuthorizationResult Parse(string? requestLine)
     {
-        var parts = requestLine?.Split(' ');
-
-        if (parts is not [var method, var target, _] || method != "GET" ||
-            !Uri.TryCreate(new Uri("http://127.0.0.1"), target, out var uri) ||
-            uri.AbsolutePath != Path)
-        {
-            throw new InvalidOperationException("The browser came back with something that is not a login callback.");
-        }
+        var uri = Target(requestLine)
+                  ?? throw new InvalidOperationException("The browser came back with something that is not a login callback.");
 
         var query = Query(uri.Query);
 
@@ -66,6 +67,12 @@ public static class LoopbackCallback
             Iss = query.GetValueOrDefault("iss"),
         };
     }
+
+    private static Uri? Target(string? requestLine) =>
+        requestLine?.Split(' ') is [var method, var target, _] && method == "GET" &&
+        Uri.TryCreate(new Uri("http://127.0.0.1"), target, out var uri) && uri.AbsolutePath == Path
+            ? uri
+            : null;
 
     private static Dictionary<string, string> Query(string query)
     {

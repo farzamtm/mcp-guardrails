@@ -37,10 +37,24 @@ public sealed class LoopbackCallbackTests
     [InlineData("POST /callback?code=a HTTP/1.1")]
     [InlineData("GET /other?code=a HTTP/1.1")]
     [InlineData("GET http://[bad/callback HTTP/1.1")]
+    [InlineData("GET /callbackx?code=a HTTP/1.1")]
+    [InlineData("GET /favicon.ico HTTP/1.1")]
     public void SomethingElse_IsNotACallback(string? line)
     {
+        Assert.False(LoopbackCallback.IsCallback(line));
         var ex = Assert.Throws<InvalidOperationException>(() => LoopbackCallback.Parse(line));
         Assert.Contains("not a login callback", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("GET /callback?code=a HTTP/1.1")]
+    [InlineData("GET /callback?error=access_denied HTTP/1.1")]
+    [InlineData("GET /callback HTTP/1.1")]
+    public void TheCallbackPath_IsACallback_WhateverItCarries(string line)
+    {
+        // The listener's question, asked before Parse: an error or a missing
+        // code is still the login coming back, and ends it with a message.
+        Assert.True(LoopbackCallback.IsCallback(line));
     }
 
     [Fact]

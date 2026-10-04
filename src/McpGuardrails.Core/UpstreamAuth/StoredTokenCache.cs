@@ -74,7 +74,9 @@ public enum LoginState
 /// <param name="State">Whether there is a usable login.</param>
 /// <param name="ExpiresAt">When the access token expires, if the server said.</param>
 /// <param name="CanRefresh">Whether a refresh token was issued, so the login outlives the access token.</param>
-public sealed record LoginStatus(LoginState State, DateTimeOffset? ExpiresAt = null, bool CanRefresh = false);
+/// <param name="Problem">Why the store could not be read, when that is why the state is <see cref="LoginState.Unreadable"/>.</param>
+public sealed record LoginStatus(
+    LoginState State, DateTimeOffset? ExpiresAt = null, bool CanRefresh = false, string? Problem = null);
 
 /// <summary>
 /// The SDK's token cache, kept in a credential store and bound to one server URL.
@@ -88,6 +90,9 @@ public sealed record LoginStatus(LoginState State, DateTimeOffset? ExpiresAt = n
 ///
 /// Anything unreadable also reads as no login: the proxy then refuses the
 /// server's tools and says to run <c>auth login</c>, which is the closed state.
+/// That includes a store that cannot be read right now - a locked keychain, a
+/// keyring that did not unlock - so one server's credential trouble never stops
+/// the proxy serving the others.
 /// </remarks>
 public sealed class StoredTokenCache : ITokenCache
 {
@@ -117,17 +122,24 @@ public sealed class StoredTokenCache : ITokenCache
         _ignoreStored = ignoreStored;
     }
 
+    /// <summary>
+    /// Set when serving: a refresh whose tokens cannot be stored then fails as
+    /// "needs a new login" - a tool error the model passes on - instead of an
+    /// exception from deep inside the SDK's request.
+    /// </summary>
+    public bool ForServing { get; init; }
+
     /// <summary>What is stored for this server.</summary>
     public LoginStatus Status()
     {
-        var (state, tokens) = Load();
+        var (state, tokens, problem) = Load();
 
         return state is LoginState.LoggedIn
             ? new LoginStatus(
                 state,
                 tokens!.ExpiresIn is { } seconds ? tokens.ObtainedAt.AddSeconds(seconds) : null,
                 !string.IsNullOrEmpty(tokens.RefreshToken))
-            : new LoginStatus(state);
+            : new LoginStatus(state, Problem: problem);
     }
 
     public ValueTask<TokenContainer?> GetTokensAsync(CancellationToken cancellationToken = default)
@@ -137,7 +149,7 @@ public sealed class StoredTokenCache : ITokenCache
             return ValueTask.FromResult<TokenContainer?>(null);
         }
 
-        var (state, tokens) = Load();
+        var (state, tokens, _) = Load();
 
         return ValueTask.FromResult(state is LoginState.LoggedIn
             ? new TokenContainer
@@ -160,28 +172,48 @@ public sealed class StoredTokenCache : ITokenCache
     {
         ArgumentNullException.ThrowIfNull(tokens);
 
-        var json = JsonSerializer.Serialize(
-            new StoredTokens
-            {
-                ServerUrl = _url,
-                TokenType = tokens.TokenType,
-                AccessToken = tokens.AccessToken,
-                RefreshToken = tokens.RefreshToken,
-                ExpiresIn = tokens.ExpiresIn,
-                Scope = tokens.Scope,
-                ObtainedAt = tokens.ObtainedAt,
-                ClientId = tokens.ClientId,
-                ClientSecret = tokens.ClientSecret,
-                TokenEndpointAuthMethod = tokens.TokenEndpointAuthMethod,
-                AuthorizationServer = tokens.AuthorizationServer,
-            },
-            StoredTokensJsonContext.Default.StoredTokens);
-
         // One writer at a time: a refresh racing a refresh would otherwise be
         // decided by whichever store write landed last.
         lock (_writing)
         {
-            _store.Write(_server, json);
+            // RFC 6749 section 6 lets a refresh response leave out refresh_token
+            // when the server does not rotate them, and the SDK passes that on as
+            // null. Storing it as given would throw the refresh token away on the
+            // first refresh and turn "refreshed automatically" into a one-hour
+            // login. Only ever carried over from this server's own login.
+            var refreshToken = tokens.RefreshToken;
+            if (string.IsNullOrEmpty(refreshToken) && !_ignoreStored &&
+                Load() is (LoginState.LoggedIn, { } stored, _))
+            {
+                refreshToken = stored.RefreshToken;
+            }
+
+            var json = JsonSerializer.Serialize(
+                new StoredTokens
+                {
+                    ServerUrl = _url,
+                    TokenType = tokens.TokenType,
+                    AccessToken = tokens.AccessToken,
+                    RefreshToken = refreshToken,
+                    ExpiresIn = tokens.ExpiresIn,
+                    Scope = tokens.Scope,
+                    ObtainedAt = tokens.ObtainedAt,
+                    ClientId = tokens.ClientId,
+                    ClientSecret = tokens.ClientSecret,
+                    TokenEndpointAuthMethod = tokens.TokenEndpointAuthMethod,
+                    AuthorizationServer = tokens.AuthorizationServer,
+                },
+                StoredTokensJsonContext.Default.StoredTokens);
+
+            try
+            {
+                _store.Write(_server, json);
+            }
+            catch (TokenStoreException ex) when (ForServing)
+            {
+                throw new UpstreamLoginRequiredException(
+                    _server, $"could not save its refreshed tokens ({ex.Message}) and needs a new login");
+            }
 
             // Once something is stored, later reads see it: the login has happened.
             _ignoreStored = false;
@@ -190,11 +222,21 @@ public sealed class StoredTokenCache : ITokenCache
         return ValueTask.CompletedTask;
     }
 
-    private (LoginState State, StoredTokens? Tokens) Load()
+    private (LoginState State, StoredTokens? Tokens, string? Problem) Load()
     {
-        if (_store.Read(_server) is not { } json)
+        string? json;
+        try
         {
-            return (LoginState.None, null);
+            json = _store.Read(_server);
+        }
+        catch (TokenStoreException ex)
+        {
+            return (LoginState.Unreadable, null, ex.Message);
+        }
+
+        if (json is null)
+        {
+            return (LoginState.None, null, null);
         }
 
         StoredTokens? tokens;
@@ -204,16 +246,16 @@ public sealed class StoredTokenCache : ITokenCache
         }
         catch (JsonException)
         {
-            return (LoginState.Unreadable, null);
+            return (LoginState.Unreadable, null, null);
         }
 
         if (tokens is null || string.IsNullOrEmpty(tokens.AccessToken) || string.IsNullOrEmpty(tokens.TokenType))
         {
-            return (LoginState.Unreadable, null);
+            return (LoginState.Unreadable, null, null);
         }
 
         return string.Equals(tokens.ServerUrl, _url, StringComparison.Ordinal)
-            ? (LoginState.LoggedIn, tokens)
-            : (LoginState.OtherUrl, null);
+            ? (LoginState.LoggedIn, tokens, null)
+            : (LoginState.OtherUrl, null, null);
     }
 }

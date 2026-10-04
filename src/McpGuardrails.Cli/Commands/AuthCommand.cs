@@ -27,9 +27,12 @@ internal sealed class AuthCommand : ICliCommand
     /// <summary>How long a login may take, from the URL being shown to the browser coming back.</summary>
     private static readonly TimeSpan _loginTimeout = TimeSpan.FromMinutes(5);
 
+    /// <summary>How long one connection to the listener may take to send its request line.</summary>
+    private static readonly TimeSpan _requestReadTimeout = TimeSpan.FromSeconds(10);
+
     public async Task<int> RunAsync(string[] args)
     {
-        var operands = Operands(args);
+        var operands = CliArgs.Operands(args, "auth", "--servers");
 
         return operands switch
         {
@@ -43,11 +46,7 @@ internal sealed class AuthCommand : ICliCommand
     private static async Task<int> LoginAsync(string[] args, string name)
     {
         var config = OAuthServer(args, name);
-        var (store, warning) = CliTokenStore.Create();
-        if (warning is not null)
-        {
-            Console.Error.WriteLine($"warning: {warning}");
-        }
+        var store = CliTokenStore.Create();
 
         // The loopback listener is opened before anything is sent, so the port
         // is known for the redirect URI - and bound to 127.0.0.1 only, never to
@@ -89,6 +88,17 @@ internal sealed class AuthCommand : ICliCommand
                 cancellationToken: timeout.Token);
 
             var tools = await client.ListToolsAsync(cancellationToken: timeout.Token);
+
+            // A server that lets initialize and tools/list through without a
+            // 401 never starts the login, so nothing was stored; saying "logged
+            // in" would contradict the next 'serve', which finds no login.
+            if (new StoredTokenCache(store, name, config.Url!).Status().State is not LoginState.LoggedIn)
+            {
+                throw new CommandFailedException(
+                    1, $"'{name}' answered without asking for a login, so no tokens were stored. " +
+                       "If it does not need OAuth, remove 'x-guardrails.oauth' from it; otherwise check its 'url'.");
+            }
+
             Console.WriteLine($"Logged in to '{name}' ({tools.Count} tools). The tokens are in {store.Description}.");
             return 0;
         }
@@ -111,11 +121,7 @@ internal sealed class AuthCommand : ICliCommand
             return 0;
         }
 
-        var (store, warning) = CliTokenStore.Create();
-        if (warning is not null)
-        {
-            Console.Error.WriteLine($"warning: {warning}");
-        }
+        var store = CliTokenStore.Create();
 
         Console.WriteLine($"tokens: {store.Description}");
         foreach (var server in servers)
@@ -129,7 +135,7 @@ internal sealed class AuthCommand : ICliCommand
     private static int Logout(string[] args, string name)
     {
         OAuthServer(args, name);
-        var (store, _) = CliTokenStore.Create();
+        var store = CliTokenStore.Create();
 
         try
         {
@@ -151,6 +157,7 @@ internal sealed class AuthCommand : ICliCommand
             (status.ExpiresAt is { } expires ? $", access token expires {expires.ToUniversalTime():u}" : string.Empty) +
             (status.CanRefresh ? ", refreshed automatically" : ", no refresh token: log in again when it expires"),
         LoginState.OtherUrl => "logged in at a different URL; those tokens are not used. Run 'auth login' again",
+        LoginState.Unreadable when status.Problem is { } problem => $"the token store could not be read ({problem})",
         LoginState.Unreadable => "the stored login cannot be read. Run 'auth login' again",
         _ => "not logged in",
     };
@@ -160,9 +167,10 @@ internal sealed class AuthCommand : ICliCommand
     /// server's redirect arrives, and answers the browser.
     /// </summary>
     /// <remarks>
-    /// A browser may ask for other things first (a favicon); those get a 404
-    /// and the wait goes on. The request is read to its blank line and never
-    /// further: a callback has no body.
+    /// A browser may ask for other things first (a favicon), or open a spare
+    /// connection it never uses; those get a 404, or are dropped after a few
+    /// seconds of silence, and the wait goes on. The request is read to its
+    /// blank line and never further: a callback has no body.
     /// </remarks>
     private static async Task<AuthorizationResult?> WaitForCallbackAsync(TcpListener listener, CancellationToken cancellationToken)
     {
@@ -172,13 +180,24 @@ internal sealed class AuthCommand : ICliCommand
             await using var stream = connection.GetStream();
             using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
 
-            var requestLine = await reader.ReadLineAsync(cancellationToken);
-            while (await reader.ReadLineAsync(cancellationToken) is { Length: > 0 })
+            string? requestLine;
+            using (var reading = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
             {
+                reading.CancelAfter(_requestReadTimeout);
+                try
+                {
+                    requestLine = await reader.ReadLineAsync(reading.Token);
+                    while (await reader.ReadLineAsync(reading.Token) is { Length: > 0 })
+                    {
+                    }
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    continue;
+                }
             }
 
-            if (requestLine?.Split(' ') is not [_, var target, _] ||
-                !target.StartsWith(LoopbackCallback.Path, StringComparison.Ordinal))
+            if (!LoopbackCallback.IsCallback(requestLine))
             {
                 await RespondAsync(stream, "404 Not Found", string.Empty, cancellationToken);
                 continue;
@@ -250,25 +269,5 @@ internal sealed class AuthCommand : ICliCommand
         }
 
         return result.Servers;
-    }
-
-    private static List<string> Operands(string[] args)
-    {
-        var operands = new List<string>();
-        var start = Array.IndexOf(args, "auth") + 1;
-
-        for (var i = start; i < args.Length; i++)
-        {
-            if (args[i] is "--servers")
-            {
-                i++;
-            }
-            else if (!args[i].StartsWith("--", StringComparison.Ordinal))
-            {
-                operands.Add(args[i]);
-            }
-        }
-
-        return operands;
     }
 }

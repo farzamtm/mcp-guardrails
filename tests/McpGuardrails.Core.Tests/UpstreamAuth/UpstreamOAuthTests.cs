@@ -40,6 +40,16 @@ public sealed class UpstreamOAuthTests
     }
 
     [Fact]
+    public void Serving_WithAStoreThatCannotBeRead_NeedsALogin_AndSaysWhy()
+    {
+        var ex = Assert.Throws<UpstreamLoginRequiredException>(
+            () => UpstreamOAuth.ForServing(Remote(), new FailingTokenStore()));
+
+        Assert.Contains("could not be read", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("locked", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Serving_WithNoScopesConfigured_LeavesThemToTheServer()
     {
         Assert.Null(UpstreamOAuth.ForServing(Remote(), LoggedIn()).Scopes);
@@ -144,11 +154,11 @@ public sealed class UpstreamOAuthTests
     {
         var login = new UpstreamLoginRequiredException("linear", "x");
 
-        Assert.Same(login, UpstreamOAuth.LoginRequired(login));
-        Assert.Same(login, UpstreamOAuth.LoginRequired(new HttpRequestException("outer", new InvalidOperationException("mid", login))));
-        Assert.Same(login, UpstreamOAuth.LoginRequired(new AggregateException(new InvalidOperationException(), login)));
-        Assert.Null(UpstreamOAuth.LoginRequired(new AggregateException(new InvalidOperationException())));
-        Assert.Null(UpstreamOAuth.LoginRequired(new InvalidOperationException()));
-        Assert.Null(UpstreamOAuth.LoginRequired(null));
+        Assert.Same(login, UpstreamNeedsOperatorException.Find(login));
+        Assert.Same(login, UpstreamNeedsOperatorException.Find(new HttpRequestException("outer", new InvalidOperationException("mid", login))));
+        Assert.Same(login, UpstreamNeedsOperatorException.Find(new AggregateException(new InvalidOperationException(), login)));
+        Assert.Null(UpstreamNeedsOperatorException.Find(new AggregateException(new InvalidOperationException())));
+        Assert.Null(UpstreamNeedsOperatorException.Find(new InvalidOperationException()));
+        Assert.Null(UpstreamNeedsOperatorException.Find(null));
     }
 }
