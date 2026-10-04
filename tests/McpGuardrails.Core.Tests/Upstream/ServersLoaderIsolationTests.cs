@@ -557,9 +557,12 @@ public sealed class ServersLoaderIsolationTests
     {
         var host = new FakeHost { IsWindows = false, UserAndGroup = null };
 
-        // A Unix host finds commands without an extension, even when the tests
-        // themselves run on Windows.
-        host.Files.Add(Path.Combine(FakeHost.Bin, "docker"));
+        // A Unix host splits PATH on ':' and finds commands without an
+        // extension, so when the tests themselves run on Windows the fake bin
+        // directory loses its drive letter and docker its ".exe".
+        var bin = OperatingSystem.IsWindows() ? FakeHost.Bin[2..] : FakeHost.Bin;
+        host.Variables["PATH"] = bin;
+        host.Files.Add(Path.Combine(bin, "docker"));
 
         var result = Parse($"""
                     image: {_image}
