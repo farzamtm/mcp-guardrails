@@ -31,6 +31,10 @@ public sealed class OAuthSettingsTests
         Assert.Equal(TimeSpan.FromSeconds(60), oauth.ClockSkew);
         Assert.Equal(TimeSpan.FromHours(1), oauth.JwksRefresh);
         Assert.Equal(TimeSpan.FromDays(1), oauth.JwksMaxAge);
+        Assert.Null(oauth.RequireAtJwt);
+
+        // No required scope: valid, but worth a line in the startup log.
+        Assert.Contains("'access.oauth.required_scopes' is empty", Assert.Single(oauth.Warnings), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -46,6 +50,7 @@ public sealed class OAuthSettingsTests
                 clock_skew_s: 30
                 jwks_refresh_s: 600
                 jwks_max_age_s: 3600
+                require_at_jwt: true
             """).EffectiveAccess.OAuth!;
 
         Assert.Equal(new Uri("https://mcp.example.com/mcp"), oauth.ResourceUri);
@@ -56,6 +61,8 @@ public sealed class OAuthSettingsTests
         Assert.Equal(TimeSpan.FromSeconds(30), oauth.ClockSkew);
         Assert.Equal(TimeSpan.FromMinutes(10), oauth.JwksRefresh);
         Assert.Equal(TimeSpan.FromHours(1), oauth.JwksMaxAge);
+        Assert.True(oauth.RequireAtJwt);
+        Assert.Empty(oauth.Warnings);
     }
 
     [Fact]

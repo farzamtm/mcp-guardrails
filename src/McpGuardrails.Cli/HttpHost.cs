@@ -1,4 +1,3 @@
-using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Hosting;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -47,39 +46,27 @@ internal static class HttpHost
     /// <param name="oauth">The access-token guard, when the policy configures <c>access.oauth</c>.</param>
     public static async Task RunAsync(WebApplication app, ServeOptions options, OAuthAccessGuard? oauth)
     {
-        var guard = new HttpAccessGuard(options.BearerToken);
+        IHttpAccessGuard guard = oauth ?? (IHttpAccessGuard)new HttpAccessGuard(options.BearerToken);
 
         // Ahead of the endpoint, so a refused request never reaches the MCP
         // handler - or the audit log, which records tool calls, not HTTP noise.
+        // Every decision, including which paths are the OAuth metadata, is the
+        // guard's; this only carries the request in and the answer out.
         app.Use(async (context, next) =>
         {
-            var authorization = Header(context.Request.Headers.Authorization);
-            var origin = Header(context.Request.Headers.Origin);
+            var request = context.Request;
+            var result = await guard.CheckAsync(
+                new HttpAccessRequest(
+                    request.Method,
+                    request.Path.Value ?? "",
+                    request.Scheme,
+                    request.Host.HasValue ? request.Host.Value : null,
+                    Endpoint,
+                    Header(request.Headers.Authorization),
+                    Header(request.Headers.Origin)),
+                context.RequestAborted);
 
-            if (oauth is null)
-            {
-                await Respond(context, next, new HttpAccessResult(guard.Check(authorization, origin), Challenge: "Bearer"));
-                return;
-            }
-
-            var resource = oauth.Resource(
-                context.Request.Scheme,
-                context.Request.Host.HasValue ? context.Request.Host.Value : "localhost",
-                Endpoint);
-
-            // The metadata is public by definition: it is how a client without
-            // a token finds out where to get one.
-            if (IsMetadataRequest(context.Request, resource))
-            {
-                context.Response.ContentType = "application/json";
-                await context.Response.WriteAsync(oauth.MetadataDocument(resource), context.RequestAborted);
-                return;
-            }
-
-            await Respond(
-                context,
-                next,
-                await oauth.CheckAsync(authorization, origin, resource, context.RequestAborted));
+            await Respond(context, next, result);
         });
 
         app.MapMcp(Endpoint);
@@ -136,18 +123,14 @@ internal static class HttpHost
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
                 break;
 
+            case HttpAccessVerdict.Metadata:
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(result.Document!, context.RequestAborted);
+                break;
+
             default:
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 break;
         }
     }
-
-    /// <remarks>
-    /// Both RFC 9728 locations: the path-suffixed one the MCP specification has
-    /// clients try first, and the bare well-known path for clients that do not.
-    /// </remarks>
-    private static bool IsMetadataRequest(HttpRequest request, Uri resource) =>
-        (HttpMethods.IsGet(request.Method) || HttpMethods.IsHead(request.Method)) &&
-        (request.Path == OAuthAccessGuard.MetadataPath ||
-         request.Path == OAuthAccessGuard.MetadataPath + resource.AbsolutePath.TrimEnd('/'));
 }

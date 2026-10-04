@@ -51,6 +51,14 @@ public sealed record TokenCheck(TokenStatus Status, CallerIdentity? Caller = nul
 /// nobody can rotate.</item>
 /// <item>A token without the principal claim: a call nobody can be held to
 /// account for would also escape every per-principal budget.</item>
+/// <item>A token carrying <c>nonce</c>: that marks an OpenID Connect ID token,
+/// which proves a login to a client and is handled far more loosely than an
+/// access token (kept in browsers, logged). Where the client and the API share
+/// one app registration, its issuer and audience match this proxy's, so
+/// without this check a leaked ID token would open every tool.</item>
+/// <item>With <c>require_at_jwt</c>, a token whose <c>typ</c> is not
+/// <c>at+jwt</c> (RFC 9068). Opt-in, because Entra ID, Okta and Auth0 do not
+/// send it by default and would otherwise have every token refused.</item>
 /// </list>
 /// </remarks>
 public sealed class AccessTokenValidator
@@ -64,6 +72,9 @@ public sealed class AccessTokenValidator
 
     /// <summary>The longest principal accepted, in characters.</summary>
     public const int MaxPrincipalLength = 256;
+
+    /// <summary>The <c>typ</c> values accepted under <c>require_at_jwt</c> (RFC 9068 section 2.1).</summary>
+    public static readonly IReadOnlyList<string> AccessTokenTypes = ["at+jwt", "application/at+jwt"];
 
     /// <summary>The signature algorithms accepted: asymmetric only.</summary>
     public static readonly IReadOnlySet<string> Algorithms = new HashSet<string>(StringComparer.Ordinal)
@@ -138,6 +149,9 @@ public sealed class AccessTokenValidator
             ValidAlgorithms = Algorithms,
             RequireSignedTokens = true,
             TryAllIssuerSigningKeys = true,
+            // Null means "any type", which is the library's default and the
+            // only setting most issuers' tokens pass.
+            ValidTypes = _settings.RequireAtJwt is true ? AccessTokenTypes : null,
             // Checked below against the injected clock, with the configured skew.
             ValidateLifetime = false,
             RequireExpirationTime = false,
@@ -151,6 +165,11 @@ public sealed class AccessTokenValidator
         if (Lifetime(parsed) is { } lifetimeProblem)
         {
             return TokenCheck.Invalid(lifetimeProblem);
+        }
+
+        if (parsed.TryGetClaim(JwtRegisteredClaimNames.Nonce, out _))
+        {
+            return TokenCheck.Invalid("an ID token, not an access token");
         }
 
         var identity = result.ClaimsIdentity;
@@ -219,6 +238,7 @@ public sealed class AccessTokenValidator
         SecurityTokenInvalidAudienceException => "token not meant for this proxy",
         SecurityTokenInvalidIssuerException => "token from another issuer",
         SecurityTokenSignatureKeyNotFoundException or SecurityTokenInvalidSignatureException => "invalid signature",
+        SecurityTokenInvalidTypeException => "not an access token (typ)",
         _ => "invalid token",
     };
 }

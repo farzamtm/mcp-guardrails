@@ -23,16 +23,51 @@ public enum HttpAccessVerdict
 
     /// <summary>503: the authorization server's keys are too old to trust, so nothing can be checked.</summary>
     Unavailable,
+
+    /// <summary>200: answer with <see cref="HttpAccessResult.Document"/>, the Protected Resource Metadata.</summary>
+    Metadata,
+}
+
+/// <summary>The parts of an HTTP request an access decision reads.</summary>
+/// <param name="Method">The HTTP method.</param>
+/// <param name="Path">The request path.</param>
+/// <param name="Scheme">The request's scheme, as it reached this process.</param>
+/// <param name="Host">The <c>Host</c> header, if any.</param>
+/// <param name="Endpoint">The path the MCP endpoint is mapped to.</param>
+/// <param name="Authorization">The <c>Authorization</c> header, if any.</param>
+/// <param name="Origin">The <c>Origin</c> header, if any.</param>
+public sealed record HttpAccessRequest(
+    string Method,
+    string Path,
+    string Scheme,
+    string? Host,
+    string Endpoint,
+    string? Authorization,
+    string? Origin);
+
+/// <summary>Decides whether an HTTP request may reach the MCP endpoint.</summary>
+/// <remarks>
+/// One contract for the static bearer token and for OAuth, so the listener
+/// holds no decision of its own - the challenge to send, the metadata path -
+/// and a third way of authenticating is a third implementation rather than a
+/// branch in untested host code.
+/// </remarks>
+public interface IHttpAccessGuard
+{
+    /// <summary>Judges one request.</summary>
+    ValueTask<HttpAccessResult> CheckAsync(HttpAccessRequest request, CancellationToken cancellationToken = default);
 }
 
 /// <summary>A verdict, with who the caller is and what to tell a refused one.</summary>
 /// <param name="Verdict">What to do with the request.</param>
 /// <param name="Caller">The validated caller, when the request carried an access token.</param>
 /// <param name="Challenge">The <c>WWW-Authenticate</c> value for a 401 or 403, if any.</param>
+/// <param name="Document">The JSON body to answer with, for <see cref="HttpAccessVerdict.Metadata"/>.</param>
 public sealed record HttpAccessResult(
     HttpAccessVerdict Verdict,
     CallerIdentity? Caller = null,
-    string? Challenge = null);
+    string? Challenge = null,
+    string? Document = null);
 
 /// <summary>
 /// Decides, from two headers, whether an HTTP request may reach the MCP endpoint.
@@ -55,7 +90,7 @@ public sealed record HttpAccessResult(
 /// through response timing.</item>
 /// </list>
 /// </remarks>
-public sealed class HttpAccessGuard
+public sealed class HttpAccessGuard : IHttpAccessGuard
 {
     private readonly byte[]? _tokenDigest;
 
@@ -63,6 +98,22 @@ public sealed class HttpAccessGuard
     public HttpAccessGuard(string? bearerToken)
     {
         _tokenDigest = bearerToken is null ? null : Digest(bearerToken);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// A refused token is challenged with a bare <c>Bearer</c>: there is no
+    /// metadata to point at, because the token is a shared secret the operator
+    /// hands out, not something a client can go and get.
+    /// </remarks>
+    public ValueTask<HttpAccessResult> CheckAsync(HttpAccessRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var verdict = Check(request.Authorization, request.Origin);
+
+        return ValueTask.FromResult(
+            new HttpAccessResult(verdict, Challenge: verdict is HttpAccessVerdict.Unauthorized ? "Bearer" : null));
     }
 
     /// <summary>Judges one request.</summary>

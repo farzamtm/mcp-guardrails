@@ -1,3 +1,4 @@
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Policy;
 
 namespace McpGuardrails.Core.Tests.Policy;
@@ -16,7 +17,9 @@ public sealed class IdentityMatchTests
     private static PolicyEvaluator Evaluator(string rules) => new(PolicyLoader.Parse(_access + rules));
 
     private static Verdict Decide(PolicyEvaluator evaluator, string? principal, params string[] groups) =>
-        evaluator.Evaluate(new ToolCallFacts("fs__write_file", Principal: principal, Groups: groups)).Verdict;
+        evaluator.Evaluate(new ToolCallFacts(
+            "fs__write_file",
+            Caller: principal is null ? null : new CallerIdentity(principal, groups))).Verdict;
 
     [Fact]
     public void APrincipalGlob_MatchesTheCaller()
@@ -32,6 +35,26 @@ public sealed class IdentityMatchTests
 
         Assert.Equal(Verdict.Allow, Decide(evaluator, "alice@example.com"));
         Assert.Equal(Verdict.Deny, Decide(evaluator, "alice@example.org"));
+    }
+
+    [Fact]
+    public void APrincipalGlob_IgnoresCase_SoADenyRuleCannotBeSteppedAround()
+    {
+        // Identity providers emit email-style principals in whatever case the
+        // account was created with; a deny keyed on the lower-case domain must
+        // still catch the same domain spelt differently.
+        var evaluator = Evaluator("""
+            rules:
+              - name: contractors-read-only
+                match: { principal: "*@contractor.example" }
+                decision: deny
+              - name: rest
+                decision: allow
+            """);
+
+        Assert.Equal(Verdict.Deny, Decide(evaluator, "bob@Contractor.Example"));
+        Assert.Equal(Verdict.Deny, Decide(evaluator, "BOB@CONTRACTOR.EXAMPLE"));
+        Assert.Equal(Verdict.Allow, Decide(evaluator, "bob@contractor.example.org"));
     }
 
     [Fact]
@@ -81,7 +104,7 @@ public sealed class IdentityMatchTests
                 decision: allow
             """);
 
-        var trail = evaluator.Evaluate(new ToolCallFacts("fs__x", Principal: "bob"), explain: true).Trail!;
+        var trail = evaluator.Evaluate(new ToolCallFacts("fs__x", Caller: new CallerIdentity("bob", [])), explain: true).Trail!;
 
         Assert.Contains(trail, line => line.Contains("alice-only", StringComparison.Ordinal) && line.Contains("principal", StringComparison.Ordinal));
         Assert.Contains(trail, line => line.Contains("ops-only", StringComparison.Ordinal) && line.Contains("groups", StringComparison.Ordinal));

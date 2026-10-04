@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using McpGuardrails.Core.Policy;
 
 namespace McpGuardrails.Core.Budget;
@@ -31,8 +32,9 @@ public sealed class BudgetGate
     private readonly IBudgetStore _store;
     private readonly string _scope;
 
-    // Set only when both scopes are configured. See ApplyBoth for why the session
-    // has to be the concrete in-memory store rather than any IBudgetStore.
+    // Set only when a session and a daily cap are configured together. See
+    // ApplyBoth for why the session has to be the concrete in-memory store
+    // rather than any IBudgetStore.
     private readonly InMemoryBudgetStore? _session;
     private readonly IBudgetStore? _daily;
 
@@ -40,13 +42,13 @@ public sealed class BudgetGate
     // call and otherwise follow the session's rules, including with a daily cap.
     private readonly PrincipalBudgetStore? _principals;
 
-    // A plain object rather than System.Threading.Lock because ApplyBoth needs
-    // Monitor.Wait/PulseAll, which Lock does not offer. Guards _pending only;
-    // it is never held across a call into the daily store.
-    private readonly object _pair = new();
-
-    // Session charges whose daily charge has not settled yet. See ApplyBoth.
-    private int _pending;
+    // One pairing per in-memory store charged before the daily store: the
+    // session's single store, or each principal's own. Per store rather than one
+    // for the gate, because a caller at its own cap can only be freed by a refund
+    // to that same store - waiting on other callers' charges would hold a
+    // request thread for traffic that can never give it budget back. Weak keys,
+    // so a pairing lives exactly as long as its store.
+    private readonly ConditionalWeakTable<InMemoryBudgetStore, Pairing> _pairings = new();
 
     /// <param name="store">Where the running totals live.</param>
     /// <param name="scope">
@@ -245,18 +247,21 @@ public sealed class BudgetGate
     /// process behind it, including calls the session cap would refuse at once.
     ///
     /// That leaves one window to close. Between a call's session charge and its
-    /// refund, a concurrent call could see the session full and be refused for
-    /// budget that was never really spent. So a session refusal while other
-    /// charges are still pending is not final: the caller waits for them to
-    /// settle and tries again, and is refused only once nothing is in flight.
-    /// Only a call already at the session cap ever waits, so the common path
-    /// stays lock-free across I/O. Neither cap can be overshot either way: each
-    /// store's own check-and-charge is atomic, and a refund only returns a charge
-    /// this call made.
+    /// refund, a concurrent call on the same store could see it full and be
+    /// refused for budget that was never really spent. So a refusal while other
+    /// charges against that store are still pending is not final: the caller
+    /// waits for them to settle and tries again, and is refused only once
+    /// nothing is in flight. Only a call already at its cap ever waits, and only
+    /// on charges against its own store - for per-principal budgets, the other
+    /// callers' traffic never delays a refusal. Neither cap can be overshot
+    /// either way: each store's own check-and-charge is atomic, and a refund
+    /// only returns a charge this call made.
     /// </remarks>
     private Decision ApplyBoth(Decision decision, InMemoryBudgetStore session, string sessionScope, IBudgetStore daily)
     {
-        lock (_pair)
+        var pairing = _pairings.GetValue(session, static _ => new Pairing());
+
+        lock (pairing)
         {
             while (true)
             {
@@ -264,32 +269,32 @@ public sealed class BudgetGate
 
                 if (sessionCharge.Allowed)
                 {
-                    _pending++;
+                    pairing.Pending++;
                     break;
                 }
 
-                if (_pending == 0)
+                if (pairing.Pending == 0)
                 {
                     return Refuse(sessionCharge, decision, sessionScope);
                 }
 
-                Monitor.Wait(_pair);
+                Monitor.Wait(pairing);
             }
         }
 
         var failure = TryCharge(daily, decision.Cost, out var dailyCharge);
 
-        lock (_pair)
+        lock (pairing)
         {
-            // Refunded inside the same lock that decrements _pending, so a waiter
+            // Refunded inside the same lock that decrements Pending, so a waiter
             // that wakes up sees the refund and the settled count together.
             if (failure is not null || !dailyCharge.Allowed)
             {
                 session.Refund(decision.Cost);
             }
 
-            _pending--;
-            Monitor.PulseAll(_pair);
+            pairing.Pending--;
+            Monitor.PulseAll(pairing);
         }
 
         if (failure is not null)
@@ -411,4 +416,16 @@ public sealed class BudgetGate
     /// with the operator's locale makes the audit log harder to grep for no gain.
     /// </remarks>
     private static string Number(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>The lock and in-flight count for one in-memory store. See ApplyBoth.</summary>
+    /// <remarks>
+    /// A plain class used as its own monitor rather than System.Threading.Lock,
+    /// because ApplyBoth needs Monitor.Wait/PulseAll, which Lock does not offer.
+    /// Never held across a call into the daily store.
+    /// </remarks>
+    private sealed class Pairing
+    {
+        /// <summary>Charges against the store whose daily charge has not settled yet.</summary>
+        public int Pending;
+    }
 }

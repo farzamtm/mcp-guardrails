@@ -35,7 +35,7 @@ public static class PolicyFacts
         Tool? tool,
         string? server = null,
         CallerIdentity? caller = null) =>
-        new(toolName, request?.Arguments?.AsReadOnly(), Annotations(tool), server, caller?.Principal, caller?.Groups);
+        new(toolName, request?.Arguments?.AsReadOnly(), Annotations(tool), server, caller);
 
     /// <summary>Copies a tool's hints into the policy engine's own shape.</summary>
     /// <remarks>
