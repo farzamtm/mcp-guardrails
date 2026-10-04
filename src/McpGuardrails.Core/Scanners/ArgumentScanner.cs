@@ -8,6 +8,10 @@ namespace McpGuardrails.Core.Scanners;
 /// <param name="Argument">
 /// Where it was found, e.g. <c>url</c> or <c>options.paths[2]</c>; empty for
 /// <see cref="ArgumentDetector.TooLarge"/>, which is about the call as a whole.
+/// A property whose name is not a plain identifier is named by its position
+/// instead (<c>argument #2</c>, <c>options.property #3</c>): the name is the
+/// model's text, and this string is shown to approvers and written to the
+/// audit log in the proxy's own voice.
 /// </param>
 public sealed record ArgumentHit(string Detector, string Argument);
 
@@ -91,9 +95,10 @@ public static class ArgumentScanner
 
         var walk = new Walk(detectors, IsShellTool(toolName));
 
+        var position = 0;
         foreach (var (name, value) in arguments)
         {
-            if (!walk.Property(name, value, depth: 1, Context.None))
+            if (!walk.Property(name, ++position, value, depth: 1, Context.None))
             {
                 break;
             }
@@ -107,12 +112,53 @@ public static class ArgumentScanner
     /// </summary>
     /// <remarks>
     /// Names, because MCP has no annotation that says "this runs a shell". Every
-    /// string argument of such a tool is treated as a command.
+    /// string argument of such a tool is treated as a command. Matched by whole
+    /// words - <c>exec</c>, <c>shell</c>, or <c>run</c>/<c>execute</c> followed
+    /// by <c>command</c>/<c>cmd</c> - so <c>execute_sql</c>, whose <c>;</c> and
+    /// <c>&lt;</c> are SQL, is not one.
     /// </remarks>
-    internal static bool IsShellTool(string toolName) =>
-        toolName.Contains("exec", StringComparison.OrdinalIgnoreCase) ||
-        toolName.Contains("shell", StringComparison.OrdinalIgnoreCase) ||
-        toolName.Contains("run_command", StringComparison.OrdinalIgnoreCase);
+    internal static bool IsShellTool(string toolName)
+    {
+        var previous = "";
+        foreach (var word in Words(toolName))
+        {
+            if (word is "exec" or "shell" ||
+                (previous is "run" or "execute" && word is "command" or "cmd"))
+            {
+                return true;
+            }
+
+            previous = word;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A name split into lower-case words on punctuation and camel case, so
+    /// <c>shell_command</c>, <c>commandLine</c> and <c>sourcePaths</c> read as words.
+    /// </summary>
+    private static IEnumerable<string> Words(string name)
+    {
+        var start = 0;
+
+        for (var i = 1; i <= name.Length; i++)
+        {
+            if (i < name.Length && char.IsLetterOrDigit(name[i]) &&
+                !(char.IsUpper(name[i]) && char.IsLower(name[i - 1])))
+            {
+                continue;
+            }
+
+            var word = name[start..i].Trim('_', '-', '.', ' ').ToLowerInvariant();
+            if (word.Length > 0)
+            {
+                yield return word;
+            }
+
+            start = i;
+        }
+    }
 
     /// <summary>
     /// True when a string argument holds shell metacharacters.
@@ -164,24 +210,15 @@ public static class ArgumentScanner
 
     /// <summary>What a property's name says about its value.</summary>
     /// <remarks>
-    /// Split into words on punctuation and camel case, so <c>shell_command</c>,
-    /// <c>commandLine</c> and <c>sourcePaths</c> are recognised as well as the
+    /// Read by <see cref="Words"/>, so compounds are recognised as well as the
     /// bare words. A trailing <c>s</c> is ignored, for lists.
     /// </remarks>
     private static Context Classify(string name)
     {
         var context = Context.None;
-        var start = 0;
 
-        for (var i = 1; i <= name.Length; i++)
+        foreach (var word in Words(name))
         {
-            if (i < name.Length && char.IsLetterOrDigit(name[i]) &&
-                !(char.IsUpper(name[i]) && char.IsLower(name[i - 1])))
-            {
-                continue;
-            }
-
-            var word = name[start..i].Trim('_', '-', '.', ' ').ToLowerInvariant();
             var singular = word.EndsWith('s') ? word[..^1] : word;
 
             if (_commandWords.Contains(word) || _commandWords.Contains(singular))
@@ -193,25 +230,60 @@ public static class ArgumentScanner
             {
                 context |= Context.Path;
             }
-
-            start = i;
         }
 
         return context;
     }
 
+    /// <summary>
+    /// True for a property name safe to repeat in the proxy's own words: an
+    /// ASCII identifier of at most 64 characters.
+    /// </summary>
+    /// <remarks>
+    /// Anything else - a newline, a quote, a bidi override, a sentence - is the
+    /// model writing text that would appear inside an approval question or a
+    /// refusal as if the proxy had said it.
+    /// </remarks>
+    internal static bool IsPlainName(string name)
+    {
+        if (name.Length is 0 or > 64 || !(char.IsAsciiLetter(name[0]) || name[0] == '_'))
+        {
+            return false;
+        }
+
+        foreach (var c in name)
+        {
+            if (!(char.IsAsciiLetterOrDigit(c) || c is '_' or '-'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>One step of the path to a value: a property or an array index.</summary>
+    /// <param name="Name">The property's name, or null for an array element.</param>
+    /// <param name="Index">The element's index, or the property's 1-based position among its siblings.</param>
+    private readonly record struct Step(string? Name, int Index);
+
     /// <summary>The state of one scan.</summary>
     private sealed class Walk(ArgumentDetectors detectors, bool shellTool)
     {
         private readonly Dictionary<string, string> _hits = new(StringComparer.Ordinal);
-        private readonly List<string> _path = [];
+
+        // Steps, not text: the path is only spelled out for a hit, and a
+        // million-element array should not cost a million strings to walk.
+        private readonly List<Step> _path = [];
         private long _characters;
         private int _values;
 
         /// <summary>Scans one named value. Returns false once a cap is hit and scanning must stop.</summary>
-        public bool Property(string name, JsonElement value, int depth, Context inherited)
+        /// <param name="name">The property's name.</param>
+        /// <param name="position">Its 1-based position among its siblings.</param>
+        public bool Property(string name, int position, JsonElement value, int depth, Context inherited)
         {
-            if (!Charge(name.Length))
+            if (!ChargeCharacters(name.Length))
             {
                 return false;
             }
@@ -220,7 +292,7 @@ public static class ArgumentScanner
             // command keeps being a command: {"command": {"argv": [...]}}.
             var context = Classify(name) | (inherited & Context.Command);
 
-            _path.Add(_path.Count == 0 ? name : "." + name);
+            _path.Add(new Step(name, position));
             var more = Value(value, depth, context);
             _path.RemoveAt(_path.Count - 1);
 
@@ -229,7 +301,8 @@ public static class ArgumentScanner
 
         private bool Value(JsonElement value, int depth, Context context)
         {
-            if (depth > MaxDepth || !Charge(0))
+            // Each JSON value counts once against the cap, whatever its kind.
+            if (depth > MaxDepth || ++_values > MaxValues)
             {
                 return Stop();
             }
@@ -237,9 +310,10 @@ public static class ArgumentScanner
             switch (value.ValueKind)
             {
                 case JsonValueKind.Object:
+                    var position = 0;
                     foreach (var property in value.EnumerateObject())
                     {
-                        if (!Property(property.Name, property.Value, depth + 1, context))
+                        if (!Property(property.Name, ++position, property.Value, depth + 1, context))
                         {
                             return false;
                         }
@@ -251,7 +325,7 @@ public static class ArgumentScanner
                     var index = 0;
                     foreach (var item in value.EnumerateArray())
                     {
-                        _path.Add($"[{index++}]");
+                        _path.Add(new Step(null, index++));
                         var more = Value(item, depth + 1, context);
                         _path.RemoveAt(_path.Count - 1);
 
@@ -265,7 +339,7 @@ public static class ArgumentScanner
 
                 case JsonValueKind.String:
                     var text = value.GetString()!;
-                    if (!Charge(text.Length))
+                    if (!ChargeCharacters(text.Length))
                     {
                         return false;
                     }
@@ -281,13 +355,15 @@ public static class ArgumentScanner
 
         private void Inspect(string text, Context context)
         {
+            var command = shellTool || context.HasFlag(Context.Command);
+
             if (detectors.HasFlag(ArgumentDetectors.Ssrf) && SsrfDetector.IsMatch(text))
             {
                 Hit(ArgumentDetector.Ssrf);
             }
 
             if (detectors.HasFlag(ArgumentDetectors.SensitivePath) &&
-                PathDetectors.IsSensitivePath(text, context.HasFlag(Context.Path)))
+                PathDetectors.IsSensitivePath(text, context.HasFlag(Context.Path), command))
             {
                 Hit(ArgumentDetector.SensitivePath);
             }
@@ -297,21 +373,18 @@ public static class ArgumentScanner
                 Hit(ArgumentDetector.PathTraversal);
             }
 
-            if (detectors.HasFlag(ArgumentDetectors.ShellMetachar) &&
-                (shellTool || context.HasFlag(Context.Command)) &&
-                HasShellMetacharacters(text))
+            if (detectors.HasFlag(ArgumentDetectors.ShellMetachar) && command && HasShellMetacharacters(text))
             {
                 Hit(ArgumentDetector.ShellMetachar);
             }
         }
 
-        /// <summary>Counts characters and values against the caps.</summary>
-        private bool Charge(int characters)
+        /// <summary>Counts characters of keys and strings against the cap.</summary>
+        private bool ChargeCharacters(int characters)
         {
             _characters += characters;
-            _values++;
 
-            return (_characters <= MaxCharacters && _values <= MaxValues) || Stop();
+            return _characters <= MaxCharacters || Stop();
         }
 
         private bool Stop()
@@ -331,9 +404,27 @@ public static class ArgumentScanner
             }
 
             var path = new StringBuilder();
-            foreach (var segment in _path)
+            foreach (var step in _path)
             {
-                path.Append(segment);
+                if (step.Name is null)
+                {
+                    path.Append('[').Append(step.Index).Append(']');
+                    continue;
+                }
+
+                if (path.Length > 0)
+                {
+                    path.Append('.');
+                }
+
+                if (IsPlainName(step.Name))
+                {
+                    path.Append(step.Name);
+                }
+                else
+                {
+                    path.Append(path.Length == 0 ? "argument #" : "property #").Append(step.Index);
+                }
             }
 
             var text = path.ToString();

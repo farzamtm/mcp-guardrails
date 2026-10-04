@@ -63,10 +63,16 @@ public sealed class ArgumentGate
     private readonly ArgumentScannerSettings _settings;
 
     /// <param name="settings">Which detectors run on which tools, and what a hit does.</param>
+    /// <exception cref="PolicyException">
+    /// The settings name an unknown detector or action - possible when they were
+    /// built in code rather than loaded, which validates them too. Refused here
+    /// rather than read as "no detector", which would be a silent fail-open.
+    /// </exception>
     public ArgumentGate(ArgumentScannerSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
 
+        settings.Validate();
         _settings = settings;
     }
 
@@ -103,7 +109,14 @@ public sealed class ArgumentGate
         }
 
         var rule = RulePrefix + findings.Hits[0].Detector;
-        var what = string.Join("; ", findings.Hits.Select(hit => ArgumentDetector.Describe(hit.Detector)));
+
+        // Every message below is built from these two pieces, so the model, the
+        // approver and --explain read the same words. Both are the proxy's own:
+        // fixed descriptions, detector names and argument paths made only of
+        // plain names (see ArgumentHit), never the model's text.
+        var found = $"{string.Join("; ", findings.Hits.Select(hit => ArgumentDetector.Describe(hit.Detector)))} " +
+                    $"({findings.Summary})";
+        string Trail(string verdict) => $"scanner 'arguments': {findings.Summary} -> {verdict}";
 
         return action switch
         {
@@ -111,17 +124,20 @@ public sealed class ArgumentGate
                 decision.RefusedBy(
                     DecisionSource.Scanner,
                     rule,
-                    $"the arguments contain {what} ({findings.Summary}), and this policy refuses such calls " +
-                    "for this tool. Do not retry with the value encoded, split or reworded; if the task " +
-                    "needs it, tell the user what you were trying to do and let them decide.",
-                    $"scanner 'arguments': {findings.Summary} -> deny"),
+                    $"the arguments contain {found}, and this policy refuses such calls for this tool. " +
+                    "Do not retry with the value encoded, split or reworded; if the task needs it, tell " +
+                    "the user what you were trying to do and let them decide.",
+                    Trail("deny")),
                 findings,
                 ArgumentEffect.Blocked),
 
-            ArgumentAction.Approve => new ArgumentOutcome(Escalate(decision, rule, what, findings), findings, ArgumentEffect.Approval),
+            ArgumentAction.Approve => new ArgumentOutcome(
+                Escalate(decision, rule, found, Trail("require_approval")),
+                findings,
+                ArgumentEffect.Approval),
 
             _ => new ArgumentOutcome(
-                decision with { Trail = Extend(decision.Trail, $"scanner 'arguments': {findings.Summary} -> audit") },
+                decision with { Trail = Extend(decision.Trail, Trail("audit")) },
                 findings,
                 ArgumentEffect.Audited),
         };
@@ -134,18 +150,17 @@ public sealed class ArgumentGate
     /// gate's rule name with the default approval settings: asked in-band, and
     /// refused if nobody answers.
     /// </remarks>
-    private static Decision Escalate(Decision decision, string rule, string what, ArgumentFindings findings)
+    private static Decision Escalate(Decision decision, string rule, string found, string trailEntry)
     {
-        var note = $"Guardrails flagged its arguments: they contain {what} ({findings.Summary}). " +
-                   "Check the arguments before approving.";
-        var trail = Extend(decision.Trail, $"scanner 'arguments': {findings.Summary} -> require_approval");
+        var note = $"Guardrails flagged its arguments: they contain {found}. Check the arguments before approving.";
+        var trail = Extend(decision.Trail, trailEntry);
 
         return decision.Verdict is Verdict.RequireApproval
             ? decision with { ApprovalNote = note, Trail = trail }
             : decision with
             {
                 Verdict = Verdict.RequireApproval,
-                Reason = $"the arguments contain {what} ({findings.Summary}), so a human has to approve the call.",
+                Reason = $"the arguments contain {found}, so a human has to approve the call.",
                 RuleName = rule,
                 Source = DecisionSource.Scanner,
                 ApprovalNote = note,
