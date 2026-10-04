@@ -19,7 +19,7 @@ marked **(unverified)**.
 | SDK | [`ModelContextProtocol` 2.2.0](../src/McpGuardrails.Core/McpGuardrails.Core.csproj) |
 | Protocol revisions | 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28 — the full set the SDK supports, on both sides |
 | Transport to the client | stdio, or stateless Streamable HTTP with `--transport http` (no `Mcp-Session-Id`, no GET/SSE stream, so no server-to-client requests) |
-| Transport to upstream servers | stdio only (spawned child processes) |
+| Transport to upstream servers | stdio (spawned child processes), Streamable HTTP (`type: http`) or HTTP+SSE (`type: sse`) from the [servers file](servers.md); never auto-detected |
 | Features proxied | Tools: `tools/list`, `tools/call` |
 | Not proxied | Resources, prompts, completions, logging, subscriptions, `listChanged` notifications, progress |
 | Approval mechanism | Elicitation (`elicitation/create`), form mode, held open until answered — stdio only; or a signed webhook on either transport |

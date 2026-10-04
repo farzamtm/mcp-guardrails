@@ -312,6 +312,27 @@ public static class SecretScanner
     }
 
     /// <summary>
+    /// Which detectors fire on one string value, judged by its content and by the
+    /// key it is stored under.
+    /// </summary>
+    /// <param name="value">The value to scan.</param>
+    /// <param name="propertyName">Its key, so an <c>apiKey</c> counts whatever its shape.</param>
+    /// <param name="includePii">Also detect email addresses and card numbers.</param>
+    /// <remarks>
+    /// The same rules as <see cref="RedactForDisplay"/>, for callers that need a
+    /// yes or no rather than a redacted copy: <c>import</c> uses it to decide
+    /// which values in a client config to lift out into variable references.
+    /// </remarks>
+    public static SecretReport Scan(string value, string? propertyName, bool includePii)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+
+        var report = SecretReport.Clean;
+        RedactString(value, propertyName, includePii, ref report);
+        return report;
+    }
+
+    /// <summary>
     /// What a human may be shown of one argument value: its secrets replaced,
     /// as text.
     /// </summary>

@@ -1,4 +1,5 @@
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Serialization;
 using YamlDotNet.RepresentationModel;
 
 namespace McpGuardrails.Core.Tests.Policy;
@@ -32,7 +33,7 @@ public sealed class PolicyLoaderDefensiveTests : IDisposable
         // null here would otherwise become a NullReferenceException.
         var scalar = new YamlScalarNode(value: null);
 
-        Assert.Null(PolicyLoader.ToJsonValue(scalar));
+        Assert.Null(YamlJson.ToJsonValue(scalar));
     }
 
     /// <summary>

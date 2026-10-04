@@ -255,6 +255,32 @@ scanners:
 
 CLASSIFIER_KEY = "smoke-test-key-not-a-real-one"
 
+# The servers-file phase. Two copies of the filesystem server, each sandboxed to
+# its own directory, a dependency-free fixture server whose env_names tool shows
+# which environment variables it was given, and a remote upstream - the proxy's
+# own HTTP mode, fronting a second fixture - reached over Streamable HTTP.
+SERVERS_DIR = f"{SANDBOX}/servers-phase"
+SERVERS_A = f"{SERVERS_DIR}/a"
+SERVERS_B = f"{SERVERS_DIR}/b"
+SERVERS_FILE = f"{SERVERS_DIR}/servers.yaml"
+SERVERS_UPSTREAM_FILE = f"{SERVERS_DIR}/upstream.yaml"
+SERVERS_POLICY = f"{SERVERS_DIR}/policy.yaml"
+SERVERS_AUDIT = f"{SANDBOX}/audit-servers.jsonl"
+SERVERS_UPSTREAM_AUDIT = f"{SANDBOX}/audit-servers-upstream.jsonl"
+SERVERS_PROBE = f"{SERVERS_A}/probe.txt"
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture_server.py")
+# Must match DefaultUpstreams.FilesystemServerVersion, so npx reuses its cache.
+FS_PACKAGE = "@modelcontextprotocol/server-filesystem@2026.8.31"
+# Set in the proxy's environment, and must never reach an isolated child.
+PROXY_SECRET_ENV = "GUARDRAILS_SMOKE_PROXY_SECRET"
+UPSTREAM_TOKEN = "smoke-upstream-token-0123456789"
+
+# A Claude Desktop config for the wrap phase. The token is assembled at runtime
+# for the same reason as AWS_KEY above; it was never valid.
+WRAP_TOKEN = "ghp" + "_" + "smoketest" + "0" * 27
+WRAP_CONFIG = f"{SERVERS_DIR}/claude_desktop_config.json"
+WRAP_SERVERS = f"{SERVERS_DIR}/wrapped-servers.yaml"
+
 
 class FakeAnthropic:
     """A stand-in for POST /v1/messages that answers with a fixed verdict.
@@ -484,9 +510,16 @@ def read_audit_text(path: str, what: str) -> tuple[str, list[dict]] | None:
 
 
 def read_audit(path: str, what: str) -> list[dict] | None:
-    """read_audit_text for the callers that only need the parsed records."""
+    """The per-call records, for the checks that count them.
+
+    Leaves out the upstream_connected lines every serving session starts with:
+    they are about the servers, not the calls, and the servers phase reads them
+    through read_audit_text instead.
+    """
     audit = read_audit_text(path, what)
-    return None if audit is None else audit[1]
+    if audit is None:
+        return None
+    return [line for line in audit[1] if line.get("event") != "upstream_connected"]
 
 
 CHECKS: list[Check] = [
@@ -1032,6 +1065,12 @@ HTTP_CHECKS: list[Check] = [
 
 
 def main() -> int:
+    # Empty means "no servers file": every phase but the servers phase runs the
+    # built-in filesystem server, even on a machine whose own
+    # ~/.mcp-guardrails/servers.yaml would otherwise be picked up. The servers
+    # phase names its file explicitly.
+    os.environ["GUARDRAILS_SERVERS"] = ""
+
     try:
         os.makedirs(SANDBOX, exist_ok=True)
     except OSError as exc:
@@ -1289,6 +1328,13 @@ def main() -> int:
         exists = os.path.exists(path)
         print(f"{'FAIL' if exists else 'PASS'}  {label}")
         failures += 1 if exists else 0
+
+    # Phase 11: servers from a servers file - several stdio servers, an isolated
+    # environment, a remote upstream - and the commands that manage the file.
+    print("\n--- servers file ---")
+    servers_failures, servers_stderr = run_servers_phase()
+    failures += servers_failures
+    http_stderr += servers_stderr
 
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
@@ -1642,12 +1688,21 @@ def run_http_session(
 
 
 def wait_for_lines(path: str, count: int, *, timeout: float) -> None:
-    """Return once path holds at least count lines, or when timeout runs out."""
+    """Return once path holds at least count call records, or at the timeout.
+
+    Startup's upstream_connected lines are not counted, or the wait would end
+    one call early and race the flush of the last one.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             with open(path, encoding="utf-8") as handle:
-                if sum(1 for line in handle if line.strip()) >= count:
+                records = (
+                    line
+                    for line in handle
+                    if line.strip() and '"upstream_connected"' not in line
+                )
+                if sum(1 for _ in records) >= count:
                     return
         except FileNotFoundError:
             pass
@@ -2255,6 +2310,353 @@ def check_audit_log() -> int:
         check.expect(
             unknown.get("server") is None, "unresolved call has no downstream server"
         )
+
+    return check.failures
+
+
+def servers_yaml(upstream_url: str) -> str:
+    """The servers file for the phase, as a user would write it."""
+    return f"""
+version: 1
+defaults:
+  shutdown_timeout: 5s
+servers:
+  fs-a:
+    command: npx
+    args: ["-y", "{FS_PACKAGE}", '{SERVERS_A}']
+    env_isolation: false
+  fs-b:
+    command: npx
+    args: ["-y", "{FS_PACKAGE}", "${{GUARDRAILS_SMOKE_SANDBOX_B:-{SERVERS_B}}}"]
+    env_isolation: false
+  fixture:
+    command: '{sys.executable}'
+    args: ['{FIXTURE}']
+    env_isolation: true
+    env:
+      FIXTURE_OWN: "set-by-the-servers-file"
+  remote:
+    type: http
+    url: {upstream_url}
+    headers:
+      Authorization: "Bearer ${{SMOKE_UPSTREAM_TOKEN}}"
+  retired:
+    command: definitely-not-installed
+    disabled: true
+"""
+
+
+# A rule scoped by server: echo is refused from the local fixture and allowed
+# from the remote one, although the downstream tool is the same.
+SERVERS_POLICY_TEXT = """
+rules:
+  - name: no-local-echo
+    match:
+      server: fixture
+      tool: "*__echo"
+    decision: deny
+    message: Echo is only allowed from the remote server.
+"""
+
+
+def tool_names(result: dict) -> set[str]:
+    return {t["name"] for t in result.get("tools", [])}
+
+
+def env_names(result: dict) -> set[str]:
+    """The variable names fixture__env_names reported, one per line."""
+    text = "".join(c.get("text", "") for c in result.get("content", []))
+    return set(text.split("\n"))
+
+
+def start_http_upstream(env: dict[str, str]) -> tuple[subprocess.Popen, str | None]:
+    """Start the proxy in HTTP mode as somebody else's upstream; return its URL."""
+    proc = subprocess.Popen(
+        [BIN, "--transport", "http", "--port", "0"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={**os.environ, **env},
+    )
+    stderr = proc.stderr
+    if stderr is None:
+        raise RuntimeError("failed to open the upstream's stderr")
+
+    found = threading.Event()
+    endpoint: list[str] = []
+
+    def drain() -> None:
+        pattern = re.compile(r"at (http://\S+/mcp)")
+        for line in stderr:
+            match = pattern.search(line)
+            if match and not endpoint:
+                endpoint.append(match.group(1))
+                found.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+    return proc, endpoint[0] if found.wait(timeout=60) else None
+
+
+def run_servers_phase() -> tuple[int, list[str]]:
+    """Every downstream server comes from a servers file."""
+    for directory in (SERVERS_A, SERVERS_B):
+        os.makedirs(directory, exist_ok=True)
+    for stale in (SERVERS_AUDIT, SERVERS_UPSTREAM_AUDIT, SERVERS_PROBE, WRAP_SERVERS):
+        if os.path.exists(stale):
+            os.remove(stale)
+
+    with open(SERVERS_UPSTREAM_FILE, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"version: 1\nservers:\n  fixture:\n    command: '{sys.executable}'\n"
+            f"    args: ['{FIXTURE}']\n    env_isolation: true\n"
+        )
+    with open(SERVERS_POLICY, "w", encoding="utf-8") as handle:
+        handle.write(SERVERS_POLICY_TEXT)
+
+    upstream, url = start_http_upstream(
+        {
+            "GUARDRAILS_SERVERS": SERVERS_UPSTREAM_FILE,
+            "GUARDRAILS_POLICY": f"{SANDBOX}/no-such-policy.yaml",
+            "GUARDRAILS_AUDIT": SERVERS_UPSTREAM_AUDIT,
+            "GUARDRAILS_HTTP_TOKEN": UPSTREAM_TOKEN,
+        }
+    )
+    try:
+        if url is None:
+            print("FAIL  servers: the HTTP upstream never reported a listening address")
+            return 1, []
+
+        with open(SERVERS_FILE, "w", encoding="utf-8") as handle:
+            handle.write(servers_yaml(url))
+
+        checks: list[Check] = [
+            (
+                request(1, "tools/list"),
+                "servers: every configured server's tools are advertised, namespaced",
+                lambda r: (
+                    {
+                        "fs-a__write_file",
+                        "fs-b__read_text_file",
+                        "fixture__env_names",
+                        "remote__fixture__echo",
+                    }
+                    <= tool_names(r)
+                ),
+            ),
+            (
+                request(2, "tools/list"),
+                "servers: a disabled server is not connected",
+                lambda r: not any(n.startswith("retired__") for n in tool_names(r)),
+            ),
+            (
+                call(
+                    3, "fs-a__write_file", {"path": SERVERS_PROBE, "content": CONTENT}
+                ),
+                "servers: fs-a writes inside its own sandbox",
+                lambda r: not r.get("isError"),
+            ),
+            (
+                call(4, "fs-b__read_text_file", {"path": SERVERS_PROBE}),
+                "servers: fs-b cannot read fs-a's sandbox",
+                lambda r: bool(r.get("isError")),
+            ),
+            (
+                call(5, "fixture__env_names", {}),
+                "servers: an isolated child never sees the proxy's secrets",
+                lambda r: (
+                    PROXY_SECRET_ENV not in env_names(r)
+                    and "SMOKE_UPSTREAM_TOKEN" not in env_names(r)
+                ),
+            ),
+            (
+                call(6, "fixture__env_names", {}),
+                "servers: ...but gets PATH and its own env",
+                lambda r: {"PATH", "FIXTURE_OWN"} <= env_names(r),
+            ),
+            (
+                call(7, "remote__fixture__echo", {"message": "over http"}),
+                "servers: a remote upstream answers through Streamable HTTP",
+                lambda r: "echo: over http" in result_text(r),
+            ),
+            (
+                call(8, "fixture__echo", {"message": "local"}),
+                "servers: a 'server:' rule refuses the same tool from one server",
+                lambda r: denied_with(r, "only allowed from the remote server"),
+            ),
+        ]
+
+        failures, stderr_lines = run_session(
+            checks,
+            {
+                "GUARDRAILS_SERVERS": SERVERS_FILE,
+                "GUARDRAILS_POLICY": SERVERS_POLICY,
+                "GUARDRAILS_AUDIT": SERVERS_AUDIT,
+                "SMOKE_UPSTREAM_TOKEN": UPSTREAM_TOKEN,
+                PROXY_SECRET_ENV: "the-proxy-keeps-this",
+            },
+        )
+    finally:
+        upstream.terminate()
+        try:
+            upstream.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            upstream.kill()
+
+    check = Checker(failures)
+    audit = read_audit_text(SERVERS_AUDIT, "servers audit log")
+    if audit is None:
+        return check.failures + 1, stderr_lines
+
+    raw, lines = audit
+    connected = {
+        line["server"]: line for line in lines if line["event"] == "upstream_connected"
+    }
+    check.expect(
+        set(connected) == {"fs-a", "fs-b", "fixture", "remote"},
+        "servers: one upstream_connected line per connected server",
+    )
+    check.expect(
+        connected.get("remote", {}).get("transport") == "http"
+        and connected.get("fixture", {}).get("tool_count") == 2,
+        "servers: the audit records transport and tool count",
+    )
+    check.expect(
+        "${GUARDRAILS_SMOKE_SANDBOX_B:-"
+        in connected.get("fs-b", {}).get("identity", ""),
+        "servers: the audit records the unexpanded template",
+    )
+    check.expect(
+        UPSTREAM_TOKEN not in raw, "servers: no header value reaches the audit log"
+    )
+
+    check.failures += check_servers_commands()
+    return check.failures, stderr_lines
+
+
+def run_cli(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [BIN, *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, **env},
+        check=False,
+    )
+
+
+def check_servers_commands() -> int:
+    """validate, a refused start, and wrap/unwrap on a fixture client config."""
+    check = Checker()
+    no_policy = {"GUARDRAILS_POLICY": f"{SANDBOX}/no-such-policy.yaml"}
+
+    valid = run_cli(
+        ["validate", "--servers", SERVERS_FILE],
+        {**no_policy, "SMOKE_UPSTREAM_TOKEN": UPSTREAM_TOKEN},
+    )
+    check.expect(
+        valid.returncode == 0 and "valid" in valid.stdout,
+        f"validate: a good servers file exits 0 (got {valid.returncode})",
+    )
+
+    unset = f"{SERVERS_DIR}/unset.yaml"
+    with open(unset, "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  a:\n    command: npx\n"
+            '    args: ["${GUARDRAILS_SMOKE_DEFINITELY_UNSET}"]\n'
+            "  b: { command: definitely-not-installed }\n"
+        )
+
+    invalid = run_cli(["validate", "--servers", unset], no_policy)
+    check.expect(
+        invalid.returncode == 1
+        and "GUARDRAILS_SMOKE_DEFINITELY_UNSET" in invalid.stdout
+        and "definitely-not-installed" in invalid.stdout,
+        f"validate: every error is reported, exit 1 (got {invalid.returncode})",
+    )
+
+    refused = run_cli(["list-upstream", "--servers", unset], no_policy)
+    check.expect(
+        refused.returncode == 1
+        and "GUARDRAILS_SMOKE_DEFINITELY_UNSET" in refused.stderr,
+        "servers: an unset variable stops the proxy and names the variable",
+    )
+
+    missing = run_cli(
+        ["list-upstream", "--servers", f"{SERVERS_DIR}/nope.yaml"], no_policy
+    )
+    check.expect(
+        missing.returncode == 1 and "does not exist" in missing.stderr,
+        "servers: a named servers file that is missing is an error, not a fallback",
+    )
+
+    config = json.dumps(
+        {
+            "mcpServers": {
+                "fixture": {
+                    "command": sys.executable,
+                    "args": [FIXTURE],
+                    "env": {"GITHUB_TOKEN": WRAP_TOKEN},
+                }
+            },
+            "globalShortcut": "",
+        },
+        indent=2,
+    )
+    with open(WRAP_CONFIG, "w", encoding="utf-8", newline="") as handle:
+        handle.write(config)
+
+    wrap_args = [
+        "--client",
+        "claude-desktop",
+        "--path",
+        WRAP_CONFIG,
+        "-o",
+        WRAP_SERVERS,
+    ]
+    dry = run_cli(["wrap", *wrap_args, "--dry-run"], no_policy)
+    with open(WRAP_CONFIG, encoding="utf-8", newline="") as handle:
+        untouched = handle.read() == config
+    check.expect(
+        dry.returncode == 0
+        and '"guardrails"' in dry.stdout
+        and untouched
+        and not os.path.exists(WRAP_SERVERS),
+        f"wrap --dry-run: shows the change and writes nothing (exit {dry.returncode})",
+    )
+    check.expect(
+        WRAP_TOKEN not in dry.stdout + dry.stderr,
+        "wrap --dry-run: never prints the secret it lifts",
+    )
+
+    wrapped = run_cli(["wrap", *wrap_args], no_policy)
+    servers_text = ""
+    if os.path.exists(WRAP_SERVERS):
+        with open(WRAP_SERVERS, encoding="utf-8") as handle:
+            servers_text = handle.read()
+    check.expect(
+        wrapped.returncode == 0
+        and "${FIXTURE_GITHUB_TOKEN}" in servers_text
+        and WRAP_TOKEN not in servers_text,
+        "wrap: the servers file references the secret, never holds it "
+        f"(exit {wrapped.returncode})",
+    )
+
+    unwrapped = run_cli(
+        ["unwrap", "--client", "claude-desktop", "--path", WRAP_CONFIG], {}
+    )
+    with open(WRAP_CONFIG, encoding="utf-8", newline="") as handle:
+        restored = handle.read() == config
+    check.expect(
+        unwrapped.returncode == 0 and restored,
+        "unwrap: the original config is back byte for byte "
+        f"(exit {unwrapped.returncode})",
+    )
+
+    if check.failures:
+        for result in (valid, invalid, refused, dry, wrapped, unwrapped):
+            print(result.stdout[-600:], result.stderr[-600:], file=sys.stderr)
 
     return check.failures
 

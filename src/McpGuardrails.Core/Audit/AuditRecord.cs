@@ -29,8 +29,12 @@ public sealed record AuditRecord
     public required string Event { get; init; }
 
     /// <summary>Client-visible tool name, e.g. "fs__write_file".</summary>
+    /// <remarks>
+    /// Present on every per-tool event. Absent on <c>upstream_connected</c>,
+    /// which is about a server rather than one of its tools.
+    /// </remarks>
     [JsonPropertyName("tool")]
-    public required string Tool { get; init; }
+    public string? Tool { get; init; }
 
     /// <summary>Downstream server that served the call, when it resolved.</summary>
     [JsonPropertyName("server")]
@@ -149,6 +153,26 @@ public sealed record AuditRecord
     /// <summary>What the proxy did about them: redacted or blocked.</summary>
     [JsonPropertyName("result_secrets_action")]
     public string? ResultSecretsAction { get; init; }
+
+    /// <summary>How the proxy reaches the server: stdio, http or sse. <c>upstream_connected</c> only.</summary>
+    [JsonPropertyName("transport")]
+    public string? Transport { get; init; }
+
+    /// <summary>How many tools the server advertised. <c>upstream_connected</c> only.</summary>
+    [JsonPropertyName("tool_count")]
+    public int? ToolCount { get; init; }
+
+    /// <summary>
+    /// What was connected to, as written in the servers file: the command line
+    /// or the URL, with <c>${VAR}</c> references unexpanded. <c>upstream_connected</c> only.
+    /// </summary>
+    /// <remarks>
+    /// The template rather than the expanded value, so a token passed as
+    /// <c>${GITHUB_TOKEN}</c> is recorded as that reference and never as itself;
+    /// anything secret-shaped written into the file literally is masked too.
+    /// </remarks>
+    [JsonPropertyName("identity")]
+    public string? Identity { get; init; }
 
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }

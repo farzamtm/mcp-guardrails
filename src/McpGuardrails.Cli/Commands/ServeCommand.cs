@@ -4,6 +4,7 @@ using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Hosting;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Upstream;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
@@ -141,6 +142,13 @@ internal sealed class ServeCommand : ICliCommand
         }
 
         using var dailyStoreLifetime = dailyStore;
+
+        // One audit line per connected server, recording what it was launched
+        // from, so the log says which program answered each later call.
+        foreach (var connection in startup.Upstream.Connections)
+        {
+            await startup.Audit.WriteAsync(UpstreamAudit.Connected(connection, DateTimeOffset.UtcNow), CancellationToken.None);
+        }
 
         // One audit line per flagged tool.
         foreach (var finding in toolMetadata.Findings)

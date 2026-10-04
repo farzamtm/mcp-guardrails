@@ -2,10 +2,29 @@ using System.Text.RegularExpressions;
 
 namespace McpGuardrails.Core.Upstream;
 
+/// <summary>How the proxy reaches a downstream server.</summary>
+public enum UpstreamTransport
+{
+    /// <summary>Spawn a child process and speak JSON-RPC over its stdin/stdout.</summary>
+    Stdio,
+
+    /// <summary>Streamable HTTP, the current MCP remote transport.</summary>
+    Http,
+
+    /// <summary>The older HTTP+SSE transport, for servers that have not moved on.</summary>
+    Sse,
+}
+
 /// <summary>
 /// Describes one downstream MCP server the proxy should front.
 /// </summary>
 /// <remarks>
+/// Transport-neutral: a stdio server has a <see cref="Command"/>, a remote one a
+/// <see cref="Url"/>, and <see cref="Validate"/> refuses a config that mixes them.
+/// Every value here is already expanded - <c>${VAR}</c> references were resolved
+/// by <see cref="ServersLoader"/> - except <see cref="DisplayTemplate"/>, which
+/// keeps the file's text so it can be shown without revealing what it expanded to.
+///
 /// C# notes:
 ///
 /// - `record` generates a constructor, value equality, a readable ToString() and
@@ -26,8 +45,11 @@ public sealed partial record UpstreamServerConfig
     /// </summary>
     public required string Name { get; init; }
 
-    /// <summary>Executable to spawn, e.g. "npx".</summary>
-    public required string Command { get; init; }
+    /// <summary>How to reach the server. Stdio unless the servers file says otherwise.</summary>
+    public UpstreamTransport Transport { get; init; } = UpstreamTransport.Stdio;
+
+    /// <summary>Executable to spawn, e.g. "npx". Stdio only.</summary>
+    public string? Command { get; init; }
 
     /// <summary>
     /// Arguments passed to <see cref="Command"/>.
@@ -38,8 +60,56 @@ public sealed partial record UpstreamServerConfig
     /// </remarks>
     public IReadOnlyList<string> Arguments { get; init; } = [];
 
-    /// <summary>Extra environment variables for the child process.</summary>
+    /// <summary>
+    /// Environment variables for the child process: added to the proxy's own
+    /// when <see cref="InheritEnvironment"/> is true, and the child's entire
+    /// environment when it is false.
+    /// </summary>
     public IReadOnlyDictionary<string, string?>? EnvironmentVariables { get; init; }
+
+    /// <summary>
+    /// Whether the child starts with a copy of the proxy's environment.
+    /// </summary>
+    /// <remarks>
+    /// True by default, which is how every stdio server has been launched so far.
+    /// The servers file sets it to false under <c>env_isolation: true</c>, so a
+    /// downstream server never sees the proxy's API keys or another server's
+    /// token unless the file passes them on.
+    /// </remarks>
+    public bool InheritEnvironment { get; init; } = true;
+
+    /// <summary>Working directory for the child process. Stdio only.</summary>
+    public string? WorkingDirectory { get; init; }
+
+    /// <summary>How long a child gets to exit on shutdown before it is killed. Stdio only.</summary>
+    public TimeSpan? ShutdownTimeout { get; init; }
+
+    /// <summary>The server's endpoint. Http and Sse only.</summary>
+    public Uri? Url { get; init; }
+
+    /// <summary>Static headers sent with every request. Http and Sse only.</summary>
+    public IReadOnlyDictionary<string, string>? Headers { get; init; }
+
+    /// <summary>
+    /// Whether the proxy may start without this server when it cannot be reached.
+    /// </summary>
+    /// <remarks>
+    /// False by default: a server the operator configured and the proxy silently
+    /// dropped is a tool set nobody reviewed. Opting in means its tools are
+    /// absent for the session and calls to them fail as unknown tools.
+    /// </remarks>
+    public bool Optional { get; init; }
+
+    /// <summary>
+    /// How the server was written in the servers file, before expansion: the
+    /// command line, or the URL.
+    /// </summary>
+    /// <remarks>
+    /// What <c>list-upstream</c>, <c>validate</c> and the audit log show. A
+    /// <c>${GITHUB_TOKEN}</c> reference is safe to print; its value is not.
+    /// Null for servers defined in code.
+    /// </remarks>
+    public string? DisplayTemplate { get; init; }
 
     /// <summary>
     /// Server names must be letters, digits and hyphens only.
@@ -54,6 +124,9 @@ public sealed partial record UpstreamServerConfig
     [GeneratedRegex("^[a-zA-Z0-9-]+$")]
     private static partial Regex NamePattern { get; }
 
+    /// <summary>True when <paramref name="name"/> is a legal server name.</summary>
+    public static bool IsValidName(string name) => NamePattern.IsMatch(name);
+
     /// <summary>
     /// Throws if this config is malformed. Call once at startup: a bad config
     /// should kill the process immediately, not produce a confusing failure later.
@@ -64,14 +137,44 @@ public sealed partial record UpstreamServerConfig
         // [CallerArgumentExpression] attribute inside it captures the caller's
         // expression text, so the message names the offending property for free.
         ArgumentException.ThrowIfNullOrWhiteSpace(Name);
-        ArgumentException.ThrowIfNullOrWhiteSpace(Command);
 
-        if (!NamePattern.IsMatch(Name))
+        if (!IsValidName(Name))
         {
             throw new ArgumentException(
                 $"Upstream server name '{Name}' is invalid. " +
                 "Use letters, digits and hyphens only (no underscores).",
                 nameof(Name));
+        }
+
+        if (Transport is UpstreamTransport.Stdio)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(Command);
+
+            if (Url is not null)
+            {
+                throw new ArgumentException(
+                    $"Upstream server '{Name}' is stdio but has a URL.", nameof(Url));
+            }
+
+            return;
+        }
+
+        if (!Enum.IsDefined(Transport))
+        {
+            throw new ArgumentException(
+                $"Upstream server '{Name}' has an unknown transport.", nameof(Transport));
+        }
+
+        if (Url is null)
+        {
+            throw new ArgumentException(
+                $"Upstream server '{Name}' is a remote server but has no URL.", nameof(Url));
+        }
+
+        if (Command is not null)
+        {
+            throw new ArgumentException(
+                $"Upstream server '{Name}' is a remote server but has a command.", nameof(Command));
         }
     }
 }

@@ -1,6 +1,7 @@
 {
   "//": "Copy into ~/Library/Application Support/Claude/claude_desktop_config.json (macOS).",
   "//command": "Use an ABSOLUTE path - Claude Desktop does not run in your shell and has no PATH or cwd you can rely on.",
+  "//servers": "Without GUARDRAILS_SERVERS (or ~/.mcp-guardrails/servers.yaml) the proxy fronts its built-in filesystem server. 'mcp-guardrails wrap --client claude-desktop' writes all of this for you.",
   "mcpServers": {
     "guardrails": {
       "command": "/absolute/path/to/mcp-guardrails/src/McpGuardrails.Cli/bin/Debug/net10.0/McpGuardrails.Cli",

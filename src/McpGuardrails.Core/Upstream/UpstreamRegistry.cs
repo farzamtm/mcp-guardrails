@@ -9,10 +9,10 @@ namespace McpGuardrails.Core.Upstream;
 /// Creates the transport used to reach one downstream server.
 /// </summary>
 /// <remarks>
-/// A seam for testing. Production always spawns a child process over stdio, but
-/// a test can substitute an in-memory stream pair and talk to a real MCP server
-/// running in the same process - no npx, no network, no spawned binaries, and
-/// tests that still exercise the genuine protocol rather than a mock.
+/// A seam for testing. Production spawns a child process or opens an HTTP
+/// connection, but a test can substitute an in-memory stream pair and talk to a
+/// real MCP server running in the same process - no npx, no network, no spawned
+/// binaries, and tests that still exercise the genuine protocol rather than a mock.
 /// </remarks>
 public delegate IClientTransport UpstreamTransportFactory(
     UpstreamServerConfig config,
@@ -24,7 +24,34 @@ public delegate IClientTransport UpstreamTransportFactory(
 public sealed record UpstreamConnection(
     string Name,
     McpClient Client,
-    IReadOnlyList<McpClientTool> Tools);
+    IReadOnlyList<McpClientTool> Tools)
+{
+    /// <summary>The configuration it was connected from.</summary>
+    /// <remarks>
+    /// Optional so the record keeps its three-argument shape for tests that build
+    /// one by hand; the registry always sets it.
+    /// </remarks>
+    public UpstreamServerConfig? Config { get; init; }
+}
+
+/// <summary>An <c>optional</c> server the proxy started without.</summary>
+/// <param name="Name">The server's name.</param>
+/// <param name="Reason">Why it could not be reached, for the operator's log.</param>
+public sealed record UnavailableUpstream(string Name, string Reason);
+
+/// <summary>
+/// A downstream server could not be reached at startup.
+/// </summary>
+/// <remarks>
+/// Names the server, because "connection refused" alone does not say which of
+/// eight configured servers refused it.
+/// </remarks>
+public sealed class UpstreamConnectionException(string server, Exception innerException)
+    : Exception($"Could not connect to upstream server '{server}': {innerException.Message}", innerException)
+{
+    /// <summary>The server that failed.</summary>
+    public string Server { get; } = server;
+}
 
 /// <summary>
 /// Owns the connections to every downstream server and answers "which server
@@ -32,6 +59,8 @@ public sealed record UpstreamConnection(
 /// </summary>
 /// <remarks>
 /// This is the proxy's client half. The server half lives in the CLI's ServeCommand.
+/// What to connect to comes from <see cref="ServersLoader"/>, or from
+/// <see cref="DefaultUpstreams"/> when there is no servers file.
 ///
 /// C# notes:
 ///
@@ -55,8 +84,11 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     // annotations, which only the downstream server knows.
     private readonly Dictionary<string, (UpstreamConnection Connection, McpClientTool Tool)> _byQualifiedName;
 
-    private UpstreamRegistry(IReadOnlyList<UpstreamConnection> connections)
+    private UpstreamRegistry(
+        IReadOnlyList<UpstreamConnection> connections,
+        IReadOnlyList<UnavailableUpstream> unavailable)
     {
+        Unavailable = unavailable;
         _byServerName = connections.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
         _byQualifiedName = new Dictionary<string, (UpstreamConnection, McpClientTool)>(StringComparer.Ordinal);
@@ -73,6 +105,9 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     /// <summary>All downstream connections, in configuration order.</summary>
     public IReadOnlyCollection<UpstreamConnection> Connections => _byServerName.Values;
 
+    /// <summary>Optional servers that could not be reached, in configuration order.</summary>
+    public IReadOnlyList<UnavailableUpstream> Unavailable { get; }
+
     /// <summary>
     /// Spawns and connects to every configured server, then caches its tool list.
     /// </summary>
@@ -81,7 +116,12 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     /// and waits for it to boot; doing that sequentially would make startup the
     /// sum of every server's boot time instead of the slowest one. Task.WhenAll
     /// is the idiomatic way to await a set of concurrent operations.
+    ///
+    /// If a required server fails, the ones that did connect are shut down before
+    /// the error propagates: a proxy that refuses to start must not leave child
+    /// processes behind.
     /// </remarks>
+    /// <exception cref="UpstreamConnectionException">A required server could not be reached.</exception>
     public static async Task<UpstreamRegistry> ConnectAsync(
         IReadOnlyList<UpstreamServerConfig> configs,
         ILoggerFactory loggerFactory,
@@ -91,7 +131,7 @@ public sealed class UpstreamRegistry : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(configs);
         ArgumentNullException.ThrowIfNull(loggerFactory);
 
-        transportFactory ??= CreateStdioTransport;
+        transportFactory ??= CreateTransport;
 
         foreach (var config in configs)
         {
@@ -109,31 +149,125 @@ public sealed class UpstreamRegistry : IAsyncDisposable
                 nameof(configs));
         }
 
-        var connections = await Task.WhenAll(
-            configs.Select(c => ConnectOneAsync(c, loggerFactory, transportFactory, cancellationToken)));
+        var attempts = await Task.WhenAll(
+            configs.Select(c => TryConnectOneAsync(c, loggerFactory, transportFactory, cancellationToken)));
 
-        return new UpstreamRegistry(connections);
+        var connections = new List<UpstreamConnection>();
+        var unavailable = new List<UnavailableUpstream>();
+        UpstreamConnectionException? failure = null;
+
+        foreach (var (config, connection, error) in attempts)
+        {
+            if (connection is not null)
+            {
+                connections.Add(connection);
+            }
+            else if (config.Optional)
+            {
+                unavailable.Add(new UnavailableUpstream(config.Name, error!.Message));
+            }
+            else
+            {
+                failure ??= new UpstreamConnectionException(config.Name, error!);
+            }
+        }
+
+        var registry = new UpstreamRegistry(connections, unavailable);
+
+        if (failure is not null)
+        {
+            await registry.DisposeAsync();
+            throw failure;
+        }
+
+        return registry;
     }
 
-    /// <summary>Production transport: spawn the server as a child process.</summary>
-    /// <remarks>
-    /// internal rather than private so tests can verify the config-to-transport
-    /// mapping without spawning a process. Silently dropping EnvironmentVariables
-    /// here would break real deployments in a way no other test would catch.
-    /// </remarks>
-    internal static IClientTransport CreateStdioTransport(
+    /// <summary>
+    /// Production transport: a child process for stdio, an HTTP connection for
+    /// the remote transports.
+    /// </summary>
+    internal static IClientTransport CreateTransport(
         UpstreamServerConfig config,
         ILoggerFactory loggerFactory) =>
-        new StdioClientTransport(
-            new StdioClientTransportOptions
-            {
-                Name = config.Name,
-                Command = config.Command,
-                Arguments = [.. config.Arguments],
-                EnvironmentVariables = config.EnvironmentVariables?.ToDictionary(
-                    kv => kv.Key, kv => kv.Value, StringComparer.Ordinal),
-            },
-            loggerFactory);
+        config.Transport is UpstreamTransport.Stdio
+            ? new StdioClientTransport(StdioOptions(config), loggerFactory)
+            : new HttpClientTransport(HttpOptions(config), RemoteHttp, loggerFactory, ownsHttpClient: false);
+
+    /// <summary>
+    /// One HTTP client for every remote server, for the life of the process, as
+    /// HttpClient is designed to be used.
+    /// </summary>
+    /// <remarks>
+    /// Redirects are off, as for the webhook client: a 3xx would carry the
+    /// configured Authorization header to a host the operator never named.
+    /// </remarks>
+    private static HttpClient RemoteHttp { get; } =
+        new(new SocketsHttpHandler { AllowAutoRedirect = false });
+
+    /// <summary>How a stdio config becomes the SDK's launch options.</summary>
+    /// <remarks>
+    /// internal rather than private so tests can verify the mapping without
+    /// spawning a process. Silently dropping EnvironmentVariables or the
+    /// inheritance switch here would break real deployments - or leak the
+    /// proxy's secrets into a child - in a way no other test would catch.
+    /// </remarks>
+    internal static StdioClientTransportOptions StdioOptions(UpstreamServerConfig config)
+    {
+        var options = new StdioClientTransportOptions
+        {
+            Name = config.Name,
+            Command = config.Command!,
+            Arguments = [.. config.Arguments],
+            EnvironmentVariables = config.EnvironmentVariables?.ToDictionary(
+                kv => kv.Key, kv => kv.Value, StringComparer.Ordinal),
+            InheritEnvironmentVariables = config.InheritEnvironment,
+            WorkingDirectory = config.WorkingDirectory,
+        };
+
+        if (config.ShutdownTimeout is { } timeout)
+        {
+            options.ShutdownTimeout = timeout;
+        }
+
+        return options;
+    }
+
+    /// <summary>How a remote config becomes the SDK's HTTP options.</summary>
+    /// <remarks>
+    /// The transport mode is always explicit. The SDK's AutoDetect tries
+    /// Streamable HTTP and silently falls back to SSE, which is a downgrade
+    /// nobody chose; a server that only speaks SSE has to say <c>type: sse</c>.
+    /// </remarks>
+    internal static HttpClientTransportOptions HttpOptions(UpstreamServerConfig config) => new()
+    {
+        Name = config.Name,
+        Endpoint = config.Url!,
+        TransportMode = config.Transport is UpstreamTransport.Sse
+            ? HttpTransportMode.Sse
+            : HttpTransportMode.StreamableHttp,
+        AdditionalHeaders = config.Headers?.ToDictionary(
+            kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
+    };
+
+    private static async Task<(UpstreamServerConfig Config, UpstreamConnection? Connection, Exception? Error)>
+        TryConnectOneAsync(
+            UpstreamServerConfig config,
+            ILoggerFactory loggerFactory,
+            UpstreamTransportFactory transportFactory,
+            CancellationToken cancellationToken)
+    {
+        try
+        {
+            return (config, await ConnectOneAsync(config, loggerFactory, transportFactory, cancellationToken), null);
+        }
+        catch (Exception ex)
+        {
+            // Caught for every server, not only optional ones, so the caller can
+            // close what did connect before reporting the failure.
+            return (config, null, ex);
+        }
+    }
 
     private static async Task<UpstreamConnection> ConnectOneAsync(
         UpstreamServerConfig config,
@@ -149,9 +283,19 @@ public sealed class UpstreamRegistry : IAsyncDisposable
             loggerFactory: loggerFactory,
             cancellationToken: cancellationToken);
 
-        var tools = await client.ListToolsAsync(cancellationToken: cancellationToken);
+        try
+        {
+            var tools = await client.ListToolsAsync(cancellationToken: cancellationToken);
 
-        return new UpstreamConnection(config.Name, client, [.. tools]);
+            return new UpstreamConnection(config.Name, client, [.. tools]) { Config = config };
+        }
+        catch
+        {
+            // Connected but could not list: the client owns a live process or
+            // session, and nothing else holds a reference to close it.
+            await client.DisposeAsync();
+            throw;
+        }
     }
 
     /// <summary>

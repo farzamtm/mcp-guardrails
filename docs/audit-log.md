@@ -13,6 +13,26 @@ Default location `~/.mcp-guardrails/audit.jsonl`, overridable with `GUARDRAILS_A
  "duration_ms":5.87,"is_error":false}
 ```
 
+Each downstream server is recorded once at startup, when serving begins, with
+what it was launched from. `identity` is the command line or URL as written in
+the [servers file](servers.md), with `${VAR}` references unexpanded and
+anything secret-shaped masked; `tool` is absent because the line is about a
+server:
+
+```json
+{"ts":"2026-10-04T10:00:00.120000+00:00","event":"upstream_connected","server":"github",
+ "transport":"stdio","tool_count":26,
+ "identity":"docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server",
+ "duration_ms":0,"is_error":false}
+```
+
+`transport` is `stdio`, `http` or `sse`.
+
+```bash
+# Which servers did each session talk to?
+jq -r 'select(.event == "upstream_connected") | [.ts, .server, .transport, .identity] | @tsv' ~/.mcp-guardrails/audit.jsonl
+```
+
 A call whose result matched a scanner carries two more fields. Their absence on a
 forwarded call means the result was clean; their absence on a refused call means
 nothing came back to scan. A third, `scanner_structured_content_withheld`, is

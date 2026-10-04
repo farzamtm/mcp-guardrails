@@ -47,9 +47,11 @@ This is the long version.
 | **Proxy ↔ downstream server** | `tools/list` once at startup, `tools/call` per call, results back | Semi-trusted. The proxy spawns the server, so it starts it, but does not sandbox it; it gates what is *asked* of the server and labels what comes back. |
 | **Tool results** | Text, structured content, embedded resources | **Untrusted.** Anything a server returns may have been written by a third party — a README, a database row, a fetched page. This is the primary attack the project targets. |
 | **Tool metadata** | Names, descriptions, input schemas, annotations from `tools/list` | **Untrusted.** Scanned once at startup with the result heuristics; a flagged tool is advertised with a warning in its description or, under `block`, withheld and refused. Annotations are still taken at face value. See [tool metadata](#tool-metadata-is-scanned-not-verified). |
+| **Proxy ↔ remote server** | The same, over Streamable HTTP or SSE, with the static headers from the servers file | Semi-trusted, like a stdio server, and reached over the network: https is required except to loopback, redirects are not followed (a 3xx would carry the `Authorization` header elsewhere), and the transport is never auto-detected, so nothing silently downgrades to SSE. |
+| **Servers file** | Read once at startup from `--servers`, `GUARDRAILS_SERVERS` or `~/.mcp-guardrails/servers.yaml` ([servers.md](servers.md)) | Trusted, and **it is code execution**: whoever can write it chooses what the proxy launches and where it sends headers. Unknown keys are errors, unset variables stop the start, and on Unix the proxy warns when the file is group- or world-writable. |
 | **Policy file** | Read once at startup from `GUARDRAILS_POLICY` or `~/.mcp-guardrails/policy.yaml` | Trusted. Anyone who can write it has already won. |
 | **Audit log** | Appended to `GUARDRAILS_AUDIT` or `~/.mcp-guardrails/audit.jsonl` | Trusted by whoever reads it, protected only by filesystem permissions. |
-| **Environment** | `GUARDRAILS_*` variables; inherited by every spawned server | Trusted. |
+| **Environment** | `GUARDRAILS_*` variables, API keys, other servers' tokens | Trusted. Under `env_isolation: true` a stdio server receives only an allowlist, its `env_passthrough` and its own `env`; otherwise it inherits everything, which this release warns about at startup. See [environment isolation](servers.md#environment-isolation). |
 
 Wiring for all of this is in
 [`src/McpGuardrails.Cli/Commands/ServeCommand.cs`](../src/McpGuardrails.Cli/Commands/ServeCommand.cs). The
@@ -100,8 +102,10 @@ send it somewhere, call a destructive tool, hide what it did from the user.
 
 ### A2. Compromised or malicious downstream server
 
-**Who:** the author of an MCP server, or whoever compromised its package. Note
-the default upstream is fetched with `npx -y @modelcontextprotocol/server-filesystem@<version>`,
+**Who:** the author of an MCP server, or whoever compromised its package. With
+a servers file this is every server listed in it; `validate` and `import` warn
+about `npx`/`uvx` launches without a pinned version. Note the default upstream
+(used when there is no servers file) is fetched with `npx -y @modelcontextprotocol/server-filesystem@<version>`,
 pinned to one exact release
 ([`DefaultUpstreams.FilesystemServerVersion`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)),
 so a newly published version is not picked up silently on the next start. The
@@ -141,7 +145,16 @@ hash checking what npm serves for it.
   it, as a scanner decision before approval, so a stale client list or a guessed
   name does not reach it. Each flagged tool is logged once at startup, to stderr
   and as a `tool_metadata` audit line.
-- **The audit log** records every call it received and how long it took.
+- **Environment isolation**
+  ([`EnvironmentIsolation`](../src/McpGuardrails.Core/Upstream/EnvironmentIsolation.cs)).
+  With `env_isolation: true` a stdio server starts with only the variables
+  programs need to run, plus what the servers file passes to it by name, so it
+  never sees the classifier's API key, the HTTP bearer token or another server's
+  token. Opt-in for this release, with a startup warning listing the variable
+  names a server would lose; it becomes the default later.
+- **The audit log** records every call it received and how long it took, and an
+  `upstream_connected` line per server at startup naming what was launched (the
+  unexpanded template), so a later edit to the servers file shows up.
 
 **What it can still do:** see [what a downstream server can still do](#what-a-downstream-server-can-still-do).
 
@@ -362,10 +375,12 @@ The proxy gates calls *to* a server; it does nothing about the server itself.
 
 - **Anything its process can do.** It runs as the user, with the user's files
   and network. It does not need a tool call to read `~/.ssh` and post it.
-- **Read the proxy's environment.** Spawned servers inherit the proxy's full
-  environment — `DefaultUpstreams` sets no `EnvironmentVariables`, and the SDK's
-  stdio transport inherits by default. Any secret in the client's `env` block
-  for the proxy is visible to every server.
+- **Read the proxy's environment, unless isolated.** A stdio server inherits
+  the proxy's full environment unless the servers file sets
+  `env_isolation: true`, and the built-in filesystem server always does. Then
+  any secret in the client's `env` block for the proxy is visible to it. With
+  isolation, a server sees only the allowlist, what `env_passthrough` names and
+  its own `env`.
 - **Lie in annotations** — declare a delete tool read-only and slip past
   annotation rules. Name the tools you care about explicitly.
 - **Poison tool descriptions in ways the heuristics miss** — see above.
@@ -375,7 +390,8 @@ The proxy gates calls *to* a server; it does nothing about the server itself.
 - **Take a long time.** The proxy applies no per-call timeout of its own; a call
   ends when the server answers or the client cancels.
 - **Stop the proxy starting.** Upstreams connect at startup and a failure
-  there is fatal for the whole proxy.
+  there is fatal for the whole proxy, unless that server is marked
+  `optional: true` in the servers file.
 - **Change its tools after startup.** The tool list is read once at connect
   time; later changes are not picked up, and the policy matches the startup
   annotations.
@@ -461,7 +477,8 @@ loader **rejects** it rather than accepting a setting that does nothing.
 | --- | --- |
 | Slack approval (`approval.mode: slack`) | Not a recognised mode, so rejected at load; `in_band` elicitation or a signed webhook |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
-| Configurable upstream servers | One hard-coded filesystem server ([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)) |
-| Policy reload without restart | Read once at startup |
+| Environment isolation by default | Opt-in with `env_isolation: true`; a startup warning names what each server would lose |
+| OAuth to remote upstream servers | Static headers only |
+| Policy or servers reload without restart | Both read once at startup |
 
 When one of these lands, this page should change in the same pull request.

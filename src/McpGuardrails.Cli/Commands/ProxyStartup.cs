@@ -105,10 +105,10 @@ internal sealed class ProxyStartup : IAsyncDisposable
         // not be able to quietly override it.
         var classifierFlag = args.Contains("--injection-classifier", StringComparer.Ordinal);
 
-        // Where the sandboxed filesystem server is allowed to operate.
-        var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
-                      ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
-        Directory.CreateDirectory(sandbox);
+        // Where calls go: the servers file, or the built-in filesystem server
+        // when there is none. Loaded and validated in full before anything is
+        // spawned, so every mistake in the file is reported at once.
+        var servers = LoadServers(args);
 
         // Where the audit log lands.
         var auditPath = CliPaths.ConfigPath("GUARDRAILS_AUDIT", "audit.jsonl");
@@ -117,6 +117,15 @@ internal sealed class ProxyStartup : IAsyncDisposable
         // whichever of the two wrote it.
         var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
             logging => CliLogging.ToStandardError(logging, listing));
+
+        // Warnings are logged in list-upstream mode too: it is the command an
+        // operator runs to check a new servers file, and where the environment
+        // isolation notice should first be seen.
+        var serversLog = loggerFactory.CreateLogger("McpGuardrails.Servers");
+        foreach (var warning in servers.Warnings)
+        {
+            serversLog.LogWarning("{Warning}", warning);
+        }
 
         // Everything created from here on is owned by the startup once it is
         // returned; until then, a failure has to release it here.
@@ -127,9 +136,25 @@ internal sealed class ProxyStartup : IAsyncDisposable
         {
             // Connect to every downstream server and cache the tools they
             // advertise. Disposing the registry shuts every spawned child down.
-            upstream = await UpstreamRegistry.ConnectAsync(
-                DefaultUpstreams.Create(sandbox),
-                loggerFactory);
+            try
+            {
+                upstream = await UpstreamRegistry.ConnectAsync(servers.Servers, loggerFactory);
+            }
+            catch (UpstreamConnectionException ex)
+            {
+                // Fatal unless the server is marked optional: a proxy serving a
+                // subset of the tools the operator configured is a tool set
+                // nobody reviewed.
+                throw new CommandFailedException(1, $"{ex.Message} Mark it 'optional: true' to start without it.");
+            }
+
+            foreach (var missing in upstream.Unavailable)
+            {
+                serversLog.LogWarning(
+                    "Optional upstream server '{Server}' is unavailable and its tools are absent this session: {Reason}",
+                    missing.Name,
+                    missing.Reason);
+            }
 
             // Created after the registry so it is disposed BEFORE it: the sink
             // drains its queue while the tool calls that feed it are finished.
@@ -194,6 +219,36 @@ internal sealed class ProxyStartup : IAsyncDisposable
             loggerFactory.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// The servers to connect: from the servers file when there is one, else the
+    /// built-in filesystem server.
+    /// </summary>
+    private static ServersLoadResult LoadServers(string[] args)
+    {
+        var path = CliServers.Path(args);
+
+        if (path is null)
+        {
+            // Where the sandboxed filesystem server is allowed to operate.
+            var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
+                          ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
+            Directory.CreateDirectory(sandbox);
+
+            return new ServersLoadResult(DefaultUpstreams.Create(sandbox), [], [], []);
+        }
+
+        var result = ServersLoader.LoadFile(path, CliHost.Environment);
+        if (!result.IsValid)
+        {
+            throw new CommandFailedException(
+                1,
+                $"Invalid servers file '{path}':{Environment.NewLine}" +
+                string.Join(Environment.NewLine, result.Errors.Select(e => $"  - {e}")));
+        }
+
+        return result;
     }
 
     /// <summary>

@@ -230,5 +230,18 @@ public sealed class PolicyEvaluatorTests
     {
         Assert.True(new PolicyMatch().IsCatchAll);
         Assert.False(new PolicyMatch { Tool = "fs__read_file" }.IsCatchAll);
+        Assert.False(new PolicyMatch { Server = "fs" }.IsCatchAll);
+    }
+
+    [Fact]
+    public void Constructor_RejectsAnEmptyServerPattern()
+    {
+        var policy = new PolicyDocument
+        {
+            Rules = [new PolicyRule { Name = "r", Match = new PolicyMatch { Server = " " } }],
+        };
+
+        var exception = Assert.Throws<PolicyException>(() => new PolicyEvaluator(policy));
+        Assert.Contains("empty 'server'", exception.Message, StringComparison.Ordinal);
     }
 }
