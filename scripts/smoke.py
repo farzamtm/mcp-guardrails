@@ -1408,6 +1408,10 @@ def main() -> int:
     failures += arguments_failures
     http_stderr += arguments_stderr
 
+    # Phase 15: the offline scan command, over a clean and a hostile fixture.
+    print("\n--- scan command ---")
+    failures += run_scan_command_phase()
+
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
     print(f"{'FAIL' if escaped else 'PASS'}  denied write never touched the disk")
@@ -3139,6 +3143,177 @@ def run_arguments_phase() -> tuple[int, list[str]]:
         "arguments: hits are detector names, never argument values",
     )
     return check.failures, stderr
+
+
+SCAN_DIR = f"{SANDBOX}/scan"
+
+
+def run_scan_command_phase() -> int:
+    """scan finds each kind of problem, quotes none of it and writes no state."""
+    os.makedirs(SCAN_DIR, exist_ok=True)
+    audit = f"{SCAN_DIR}/audit.jsonl"
+    pins = f"{SCAN_DIR}/pins.json"
+    for path in (audit, pins):
+        if os.path.exists(path):
+            os.remove(path)
+    # Pointed at files that must still not exist afterwards: scan is a look at
+    # a server, and looking must not leave state behind.
+    env = {"GUARDRAILS_AUDIT": audit, "GUARDRAILS_PINS": pins}
+    check = Checker()
+
+    clean = run_cli(["scan", "--command", sys.executable, FIXTURE], env)
+    check.expect(
+        clean.returncode == 0 and "Clean: 2 tools scanned" in clean.stdout,
+        f"scan: a clean server exits 0 (got {clean.returncode})",
+    )
+
+    hostile = run_cli(
+        ["scan", "--json", "--command", sys.executable, FIXTURE, "--hostile"], env
+    )
+    try:
+        report = json.loads(hostile.stdout)
+    except json.JSONDecodeError:
+        report = {}
+    found = {
+        (tool["name"], finding["check"])
+        for server in report.get("servers", [])
+        for tool in server["tools"]
+        for finding in tool["findings"]
+    }
+    check.expect(
+        hostile.returncode == 1 and report.get("clean") is False,
+        f"scan: findings exit 1 (got {hostile.returncode})",
+    )
+    check.expect(
+        ("lookup", "injection") in found,
+        "scan: an injection in a description is found",
+    )
+    check.expect(
+        ("fetch_page", "schema-suggestion") in found,
+        "scan: a metadata URL suggested by a schema default is found",
+    )
+    check.expect(
+        ("delete_record", "read-only-mismatch") in found,
+        "scan: a 'read-only' tool named like a delete is found",
+    )
+    check.expect(
+        ("fetch_other", "schema-suggestion") in found,
+        "scan: a suggestion under a key carrying escape codes is still found",
+    )
+    advisory = [
+        finding["where"]
+        for server in report.get("servers", [])
+        for tool in server["tools"]
+        for finding in tool["findings"]
+        if finding.get("advisory")
+    ]
+    check.expect(
+        advisory == [["description"]] and report.get("advisory_count") == 1,
+        "scan: a verb in a description is advisory, not a failure",
+    )
+    check.expect(
+        all(
+            tool["hash"].startswith("sha256:")
+            for server in report.get("servers", [])
+            for tool in server["tools"]
+        ),
+        "scan: every tool carries its pinning hash",
+    )
+    check.expect(
+        "id_rsa" not in hostile.stdout and "169.254" not in hostile.stdout,
+        "scan: the report never quotes the definitions it flags",
+    )
+    check.expect(
+        "\\u001b" not in hostile.stdout.lower() and "\x1b" not in hostile.stdout,
+        "scan: an escape code in a schema key never reaches the JSON report",
+    )
+
+    servers_file = f"{SCAN_DIR}/servers.yaml"
+    with open(servers_file, "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  fixture:\n"
+            f"    command: {json.dumps(sys.executable)}\n"
+            f"    args: [{json.dumps(FIXTURE)}, '--hostile']\n"
+            "    env_isolation: true\n"
+        )
+    from_file = run_cli(["scan", "--servers", servers_file], env)
+    check.expect(
+        from_file.returncode == 1
+        and "  ! delete_record: declares readOnlyHint: true" in from_file.stdout
+        and from_file.stdout.rstrip().endswith(
+            "4 findings in 4 tools; 1 advisory note."
+        ),
+        f"scan: a servers file is scanned as text (got {from_file.returncode})",
+    )
+    check.expect(
+        "\x1b" not in from_file.stdout + from_file.stderr,
+        "scan: an escape code in a schema key never reaches the terminal",
+    )
+
+    # A server that refuses to list its tools, with escape codes in its error.
+    refused = run_cli(["scan", "--command", sys.executable, FIXTURE, "--refuse"], env)
+    check.expect(
+        refused.returncode == 1 and "Nothing was scanned" in refused.stderr,
+        f"scan: a server that refuses to list is a failure (got {refused.returncode})",
+    )
+    check.expect(
+        "\x1b" not in refused.stderr and "\x07" not in refused.stderr,
+        "scan: a server's error message cannot drive the terminal, in the "
+        "failure or in the log",
+    )
+
+    stalled = run_cli(
+        ["scan", "--timeout", "2", "--command", sys.executable, FIXTURE, "--stall"],
+        env,
+    )
+    check.expect(
+        stalled.returncode == 1 and "did not answer within 2 s" in stalled.stderr,
+        f"scan: a server that never answers times out, exit 1 "
+        f"(got {stalled.returncode})",
+    )
+
+    disabled_file = f"{SCAN_DIR}/disabled.yaml"
+    with open(disabled_file, "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  legacy:\n    disabled: true\n"
+            f"    command: {json.dumps(sys.executable)}\n"
+        )
+    nothing = run_cli(["scan", "--servers", disabled_file], env)
+    check.expect(
+        nothing.returncode == 1
+        and "Nothing was scanned: no server is enabled." in nothing.stdout
+        and "legacy  disabled, not scanned" in nothing.stdout,
+        f"scan: a file with no enabled server is not a clean scan "
+        f"(got {nothing.returncode})",
+    )
+
+    stray = run_cli(["scan", servers_file], env)
+    check.expect(
+        stray.returncode == 2,
+        f"scan: a file name without --servers is a usage error, not a scan of "
+        f"something else (got {stray.returncode})",
+    )
+
+    unreachable = run_cli(["scan", "--url", "http://127.0.0.1:1/mcp"], env)
+    check.expect(
+        unreachable.returncode == 1 and "Nothing was scanned" in unreachable.stderr,
+        f"scan: an unreachable server is a failure, not a clean report "
+        f"(got {unreachable.returncode})",
+    )
+
+    usage = run_cli(
+        ["scan", "--url", "https://example.com/mcp", "--command", "npx"], env
+    )
+    check.expect(
+        usage.returncode == 2,
+        f"scan: a contradictory command line exits 2 (got {usage.returncode})",
+    )
+
+    check.expect(
+        not os.path.exists(audit) and not os.path.exists(pins),
+        "scan: no audit log and no pins file were written",
+    )
+    return check.failures
 
 
 if __name__ == "__main__":
