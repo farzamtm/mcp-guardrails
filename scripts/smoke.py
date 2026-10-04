@@ -3380,10 +3380,21 @@ def run_oauth_phase() -> tuple[int, list[str]]:
     check = Checker()
     proc, url, stderr = start_oauth_proxy(env)
 
-    def token(subject: str, **kwargs: object) -> str:
-        kwargs.setdefault("audience", OAUTH_AUDIENCE)
-        kwargs.setdefault("scope", "mcp.tools")
-        return issuer.token(subject, **kwargs)  # type: ignore[arg-type]
+    def token(
+        subject: str,
+        *,
+        audience: str = OAUTH_AUDIENCE,
+        scope: str | None = "mcp.tools",
+        groups: list[str] | None = None,
+        expires_in: int = 300,
+    ) -> str:
+        return issuer.token(
+            subject,
+            audience=audience,
+            scope=scope,
+            groups=groups,
+            expires_in=expires_in,
+        )
 
     try:
         if url is None:

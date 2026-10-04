@@ -41,3 +41,17 @@ Bad combinations are startup errors (exit code 2), not guesses: `--port` without
 `--transport http`, a repeated flag, a host name instead of an IP, a token that is
 set but too short, a policy with `budgets.session` under `--transport http`, a
 policy with `access.oauth` over stdio or together with `GUARDRAILS_HTTP_TOKEN`.
+
+When several things are wrong, they are reported in startup order, and the first
+one ends the start:
+
+1. The policy file: unreadable or invalid, exit code 1. It is read first
+   because `access.oauth` in it decides what the command line may ask for.
+2. The command line and transport options, checked against that policy: exit
+   code 2.
+3. The servers file: every problem in it at once, exit code 1.
+4. Connecting the downstream servers (a required one that fails: exit code 1),
+   then a budget the transport cannot enforce, such as `budgets.session` over
+   HTTP (exit code 2), then fetching the OAuth signing keys (exit code 1).
+
+Nothing is spawned before steps 1-3 pass.
