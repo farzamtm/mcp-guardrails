@@ -18,13 +18,22 @@ namespace McpGuardrails.Core.Policy;
 /// - <b>No allocation.</b> Matching runs on every rule of every tool call. This
 ///   walks two spans and allocates nothing.
 ///
-/// Matching is ordinal and case-sensitive, like the rest of tool-name handling:
-/// MCP tool names are identifiers, not prose, and <c>FS__Write_File</c> is simply
-/// a different tool from <c>fs__write_file</c>.
+/// Matching is ordinal and case-sensitive by default, like the rest of
+/// tool-name handling: MCP tool names are identifiers, not prose, and
+/// <c>FS__Write_File</c> is simply a different tool from <c>fs__write_file</c>.
+/// Callers matching names that are not identifiers - principals, which are
+/// often email addresses an identity provider spells in whatever case the
+/// account was created with - ask for case-insensitive matching instead.
 /// </remarks>
 public static class GlobMatcher
 {
     /// <summary>True when <paramref name="value"/> matches <paramref name="pattern"/>.</summary>
+    /// <param name="pattern">The glob.</param>
+    /// <param name="value">The name to test.</param>
+    /// <param name="ignoreCase">
+    /// Compare characters the way <see cref="StringComparison.OrdinalIgnoreCase"/>
+    /// does, rather than exactly.
+    /// </param>
     /// <remarks>
     /// The algorithm is the classic two-pointer glob match. When a <c>*</c> is
     /// met, remember where it was and assume it consumes nothing; on a later
@@ -32,7 +41,7 @@ public static class GlobMatcher
     /// what looks like exponential search into a linear scan, because only the
     /// most recent <c>*</c> ever needs to grow.
     /// </remarks>
-    public static bool IsMatch(ReadOnlySpan<char> pattern, ReadOnlySpan<char> value)
+    public static bool IsMatch(ReadOnlySpan<char> pattern, ReadOnlySpan<char> value, bool ignoreCase = false)
     {
         int patternIndex = 0;
         int valueIndex = 0;
@@ -45,7 +54,7 @@ public static class GlobMatcher
         while (valueIndex < value.Length)
         {
             if (patternIndex < pattern.Length &&
-                (pattern[patternIndex] == '?' || pattern[patternIndex] == value[valueIndex]))
+                (pattern[patternIndex] == '?' || Same(pattern[patternIndex], value[valueIndex], ignoreCase)))
             {
                 patternIndex++;
                 valueIndex++;
@@ -80,4 +89,12 @@ public static class GlobMatcher
 
         return patternIndex == pattern.Length;
     }
+
+    /// <remarks>
+    /// Per-character invariant upper-casing is what
+    /// <see cref="StringComparison.OrdinalIgnoreCase"/> does, without allocating
+    /// or depending on the culture.
+    /// </remarks>
+    private static bool Same(char pattern, char value, bool ignoreCase) =>
+        pattern == value || (ignoreCase && char.ToUpperInvariant(pattern) == char.ToUpperInvariant(value));
 }

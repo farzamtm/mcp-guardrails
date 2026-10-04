@@ -1,6 +1,7 @@
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Text;
 using McpGuardrails.Core.Upstream;
 
 namespace McpGuardrails.Cli.Commands;
@@ -60,26 +61,28 @@ internal sealed class PinsCommand : ICliCommand
         var result = PinCheck.Run(document, startup.Upstream.Connections.Select(PinSubject.From), DateTimeOffset.UtcNow);
         foreach (var report in result.Reports)
         {
-            Console.WriteLine(Summary(report));
+            // Tool names and reasons are the server's text, printed to a
+            // terminal: nothing in them may move the cursor or forge a line.
+            Console.WriteLine(TerminalText.Printable(Summary(report)));
             foreach (var tool in report.Changed)
             {
-                Console.WriteLine($"  changed  {tool}");
+                Console.WriteLine($"  changed  {TerminalText.Printable(tool)}");
             }
 
             foreach (var tool in report.Added)
             {
-                Console.WriteLine($"  added    {tool}");
+                Console.WriteLine($"  added    {TerminalText.Printable(tool)}");
             }
 
             foreach (var tool in report.Removed)
             {
-                Console.WriteLine($"  removed  {tool}");
+                Console.WriteLine($"  removed  {TerminalText.Printable(tool)}");
             }
         }
 
         foreach (var missing in startup.Upstream.Unavailable)
         {
-            Console.WriteLine($"{missing.Name}: unavailable, not compared ({missing.Reason})");
+            Console.WriteLine($"{missing.Name}: unavailable, not compared ({TerminalText.Printable(missing.Reason)})");
         }
 
         var differing = result.Reports.Count(r => r.HasDifferences);
@@ -98,7 +101,9 @@ internal sealed class PinsCommand : ICliCommand
 
         try
         {
-            Console.Write(PinReview.Diff(pinned, subject, tool));
+            // Lines kept: the diff is the proxy's own layout around JSON the
+            // writer already escaped, and a tool name in its headers.
+            Console.Write(TerminalText.PrintableLines(PinReview.Diff(pinned, subject, tool)));
         }
         catch (PinsException ex)
         {
@@ -142,7 +147,7 @@ internal sealed class PinsCommand : ICliCommand
 
         foreach (var (name, pin) in accepted)
         {
-            Console.WriteLine($"{name}: {(pin.Removed ? "dropped the pin of" : "accepted")} {pin.Tool}");
+            Console.WriteLine($"{name}: {(pin.Removed ? "dropped the pin of" : "accepted")} {TerminalText.Printable(pin.Tool)}");
             await startup.Audit.WriteAsync(PinAudit.Accepted(name, pin, now), CancellationToken.None);
         }
 

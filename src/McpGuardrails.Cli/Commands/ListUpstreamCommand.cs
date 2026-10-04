@@ -1,3 +1,4 @@
+using McpGuardrails.Core.Text;
 using McpGuardrails.Core.Upstream;
 
 namespace McpGuardrails.Cli.Commands;
@@ -23,7 +24,11 @@ internal sealed class ListUpstreamCommand : ICliCommand
             Console.WriteLine($"{connection.Name}  ({connection.Tools.Count} tools)");
             foreach (var tool in connection.Tools)
             {
-                Console.WriteLine($"  {ToolNamespacer.Qualify(connection.Name, tool.Name),-40} {tool.Description?.ReplaceLineEndings(" ")}");
+                // Both are the server's text: one line each, and nothing in them
+                // may drive the terminal.
+                var name = TerminalText.Printable(ToolNamespacer.Qualify(connection.Name, tool.Name));
+                var description = TerminalText.Printable(tool.Description?.ReplaceLineEndings(" ") ?? string.Empty);
+                Console.WriteLine($"  {name,-40} {description}");
             }
         }
 

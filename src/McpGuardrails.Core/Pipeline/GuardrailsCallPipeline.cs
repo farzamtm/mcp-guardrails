@@ -165,10 +165,10 @@ public sealed class GuardrailsCallPipeline
                     parameters,
                     scanning => ScanAsync(parameters, forward, scanning),
                     redacting),
-                gated,
-                caller),
-            cancellationToken,
-            caller);
+                caller,
+                gated),
+            caller,
+            cancellationToken);
     }
 
     /// <summary>
@@ -223,8 +223,8 @@ public sealed class GuardrailsCallPipeline
     internal async ValueTask<CallToolResult> AuditAsync(
         CallToolRequestParams? parameters,
         Func<CancellationToken, ValueTask<CallToolResult>> next,
-        CancellationToken cancellationToken,
-        CallerIdentity? caller = null)
+        CallerIdentity? caller,
+        CancellationToken cancellationToken)
     {
         // Opens the per-call scope that lets the inner layers report their
         // decisions back up to this one. See GuardrailsCallScope for why a
@@ -367,8 +367,8 @@ public sealed class GuardrailsCallPipeline
         CallToolRequestParams? parameters,
         IApprovalChannel inBand,
         Func<CancellationToken, ValueTask<CallToolResult>> next,
-        CancellationToken cancellationToken,
-        CallerIdentity? caller = null)
+        CallerIdentity? caller,
+        CancellationToken cancellationToken)
     {
         var toolName = ToolName(parameters);
 

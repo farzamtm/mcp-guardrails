@@ -11,17 +11,28 @@ public sealed class ScanOptionsException(string message) : Exception(message);
 /// <remarks>
 /// <c>--command</c> takes the rest of the line, so a server's own flags
 /// (<c>npx -y pkg --json</c>) are never read as the proxy's. Only what comes
-/// before it is parsed, and an unknown flag there is an error rather than
-/// ignored: a misspelt <c>--sever</c> silently scanning something else would
-/// produce a clean report about the wrong thing.
+/// before it is parsed, and anything unexpected there is an error rather than
+/// ignored: a misspelt <c>--sever</c>, a file name given without
+/// <c>--servers</c>, or a flag given twice would otherwise silently scan
+/// something else and produce a clean report about the wrong thing.
 /// </remarks>
 public sealed record ScanOptions
 {
     /// <summary>The server name a <c>--command</c> or <c>--url</c> target is scanned under.</summary>
     public const string TargetName = "target";
 
+    /// <summary>How long connecting to every server and listing its tools may take, by default.</summary>
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(60);
+
     /// <summary>Print the report as JSON instead of text.</summary>
     public bool Json { get; init; }
+
+    /// <summary>
+    /// How long connecting and listing may take before a server counts as not
+    /// answering: an optional one is reported unavailable, a required one fails
+    /// the scan. A server that stalls must not hang a CI job.
+    /// </summary>
+    public TimeSpan Timeout { get; init; } = DefaultTimeout;
 
     /// <summary>The <c>--servers</c> file, when given.</summary>
     public string? ServersPath { get; init; }
@@ -38,7 +49,7 @@ public sealed record ScanOptions
     /// </remarks>
     public string? TargetDocument { get; init; }
 
-    private static readonly string[] _known = ["--json", "--servers", "--url", "--sse", "--header", "--command"];
+    private static readonly string[] _known = ["--json", "--servers", "--url", "--sse", "--header", "--timeout", "--command"];
 
     /// <summary>Parses the command line.</summary>
     /// <param name="args">The full command line, including the word <c>scan</c>.</param>
@@ -52,8 +63,10 @@ public sealed record ScanOptions
 
         string? servers = null;
         string? url = null;
+        string? timeout = null;
         var sse = false;
         var json = false;
+        var sawScan = false;
         var headers = new List<string>();
 
         for (var i = 0; i < own.Count; i++)
@@ -67,10 +80,13 @@ public sealed record ScanOptions
                     sse = true;
                     break;
                 case "--servers":
-                    servers = ValueAfter(own, ref i);
+                    servers = Once(servers, own, ref i);
                     break;
                 case "--url":
-                    url = ValueAfter(own, ref i);
+                    url = Once(url, own, ref i);
+                    break;
+                case "--timeout":
+                    timeout = Once(timeout, own, ref i);
                     break;
                 case "--header":
                     headers.Add(ValueAfter(own, ref i));
@@ -78,6 +94,16 @@ public sealed record ScanOptions
                 case var flag when flag.StartsWith("--", StringComparison.Ordinal):
                     throw new ScanOptionsException(
                         $"scan does not know the flag '{flag}'. Known: {string.Join(", ", _known)}.");
+                case "scan" when !sawScan:
+                    // The subcommand itself, wherever it was written.
+                    sawScan = true;
+                    break;
+                default:
+                    // Not echoed: a stray word is as likely to be a token pasted
+                    // in the wrong place as a file name.
+                    throw new ScanOptionsException(
+                        "scan takes no words of its own outside its flags: a servers file is --servers <path>, " +
+                        "a server's command line goes after --command.");
             }
         }
 
@@ -107,6 +133,7 @@ public sealed record ScanOptions
         return new ScanOptions
         {
             Json = json,
+            Timeout = timeout is null ? DefaultTimeout : ParseTimeout(timeout),
             ServersPath = servers,
             TargetDocument = command is not null ? StdioDocument(command)
                 : url is not null ? RemoteDocument(url, sse, headers)
@@ -188,6 +215,18 @@ public sealed record ScanOptions
 
         return -1;
     }
+
+    private static TimeSpan ParseTimeout(string value) =>
+        int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
+        && seconds is > 0 and <= 3600
+            ? TimeSpan.FromSeconds(seconds)
+            : throw new ScanOptionsException("--timeout takes a whole number of seconds from 1 to 3600.");
+
+    /// <summary>A single-value flag's value, refusing the flag a second time.</summary>
+    private static string Once(string? previous, IReadOnlyList<string> args, ref int i) =>
+        previous is null
+            ? ValueAfter(args, ref i)
+            : throw new ScanOptionsException($"{args[i]} was given more than once.");
 
     private static string ValueAfter(IReadOnlyList<string> args, ref int i)
     {

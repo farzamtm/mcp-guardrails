@@ -78,6 +78,29 @@ public sealed class PrincipalBudgetTests
     }
 
     [Fact]
+    public async Task WithADailyCap_ACallerAtItsCap_IsRefusedWithoutWaitingForOtherCallers()
+    {
+        // Alice is at her cap while Bob's daily charge is stuck in the store. Only
+        // a refund to Alice's own counter could change her answer, so her refusal
+        // must not wait for Bob's charge to settle.
+        using var daily = new HoldingStore();
+        var gate = new BudgetGate(new PrincipalBudgetStore(new BudgetLimits { MaxCalls = 1 }), daily);
+        Assert.False(gate.Apply(Allowed(), principal: "alice").IsBlocked);
+
+        daily.Hold.Reset();
+        var bob = Task.Run(() => gate.Apply(Allowed(), principal: "bob"));
+        Assert.True(daily.Entered.Wait(TimeSpan.FromSeconds(10)));
+
+        var alice = Task.Run(() => gate.Apply(Allowed(), principal: "alice"));
+        var finished = await Task.WhenAny(alice, Task.Delay(TimeSpan.FromSeconds(10)));
+
+        daily.Hold.Set();
+        Assert.Same(alice, finished);
+        Assert.Equal("principal.max_calls", (await alice).RuleName);
+        Assert.False((await bob).IsBlocked);
+    }
+
+    [Fact]
     public void BlockedAndUnresolvedCalls_AreFree()
     {
         var principals = new PrincipalBudgetStore(_two);
@@ -149,5 +172,34 @@ public sealed class PrincipalBudgetTests
     {
         Assert.Throws<ArgumentNullException>(() => new PrincipalBudgetStore(null!));
         Assert.Throws<ArgumentNullException>(() => new PrincipalBudgetStore(_two).For(null!));
+    }
+
+    /// <summary>A daily store that accepts every charge, blocking while <see cref="Hold"/> is reset.</summary>
+    private sealed class HoldingStore : IBudgetStore, IDisposable
+    {
+        public ManualResetEventSlim Hold { get; } = new(initialState: true);
+
+        public ManualResetEventSlim Entered { get; } = new();
+
+        public long Calls => 0;
+
+        public long Cost => 0;
+
+        public BudgetCharge TryCharge(long cost)
+        {
+            if (!Hold.IsSet)
+            {
+                Entered.Set();
+                Hold.Wait(TimeSpan.FromSeconds(30));
+            }
+
+            return BudgetCharge.Accepted;
+        }
+
+        public void Dispose()
+        {
+            Hold.Dispose();
+            Entered.Dispose();
+        }
     }
 }

@@ -1,8 +1,8 @@
 using System.Text.Json;
-using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Hosting;
+using McpGuardrails.Core.Tests.Access;
 
-namespace McpGuardrails.Core.Tests.Access;
+namespace McpGuardrails.Core.Tests.Hosting;
 
 /// <summary>
 /// The protected-resource side of the MCP authorization flow: verdicts,
@@ -146,6 +146,14 @@ public sealed class OAuthAccessGuardTests
     }
 
     [Fact]
+    public async Task NoHost_FallsBackToLoopback()
+    {
+        var (_, guard) = await Guard();
+
+        Assert.Equal(new Uri("http://localhost/mcp"), guard.Resource("http", null, "/mcp"));
+    }
+
+    [Fact]
     public async Task AConfiguredResource_WinsOverTheRequest()
     {
         var (_, guard) = await Guard("    resource: https://mcp.example.com/mcp");
@@ -190,6 +198,55 @@ public sealed class OAuthAccessGuardTests
         Assert.False(json.RootElement.TryGetProperty("scopes_supported", out _));
     }
 
+    // ------------------------------------------------------------- requests
+
+    private static HttpAccessRequest Request(
+        string path,
+        string method = "POST",
+        string? authorization = null,
+        string? host = "127.0.0.1:7300") =>
+        new(method, path, "http", host, "/mcp", authorization, Origin: null);
+
+    [Theory]
+    [InlineData("GET", "/.well-known/oauth-protected-resource/mcp")]
+    [InlineData("head", "/.well-known/oauth-protected-resource/mcp")]
+    [InlineData("GET", "/.well-known/oauth-protected-resource")]
+    public async Task TheMetadataPaths_AnswerWithTheDocument_WithoutAToken(string method, string path)
+    {
+        var (_, guard) = await Guard();
+
+        var result = await guard.CheckAsync(Request(path, method));
+
+        Assert.Equal(HttpAccessVerdict.Metadata, result.Verdict);
+        using var json = JsonDocument.Parse(result.Document!);
+        Assert.Equal("http://127.0.0.1:7300/mcp", json.RootElement.GetProperty("resource").GetString());
+    }
+
+    [Theory]
+    [InlineData("POST", "/.well-known/oauth-protected-resource/mcp")]
+    [InlineData("GET", "/.well-known/oauth-protected-resource/other")]
+    [InlineData("GET", "/mcp")]
+    public async Task AnythingElse_NeedsAToken(string method, string path)
+    {
+        var (_, guard) = await Guard();
+
+        var result = await guard.CheckAsync(Request(path, method));
+
+        Assert.Equal(HttpAccessVerdict.Unauthorized, result.Verdict);
+        Assert.Equal($"Bearer resource_metadata=\"{_metadata}\"", result.Challenge);
+    }
+
+    [Fact]
+    public async Task ARequestWithAValidToken_ReachesTheEndpoint_WithItsCaller()
+    {
+        var (issuer, guard) = await Guard();
+
+        var result = await guard.CheckAsync(Request("/mcp", authorization: $"Bearer {issuer.Token()}"));
+
+        Assert.Equal(HttpAccessVerdict.Allowed, result.Verdict);
+        Assert.Equal("alice", result.Caller!.Principal);
+    }
+
     [Fact]
     public async Task TheGuard_RejectsNullArguments()
     {
@@ -201,5 +258,7 @@ public sealed class OAuthAccessGuardTests
         await Assert.ThrowsAsync<ArgumentNullException>(() => guard.CheckAsync(null, null, null!).AsTask());
         Assert.Throws<ArgumentNullException>(() => OAuthAccessGuard.MetadataUrl(null!));
         Assert.Throws<ArgumentNullException>(() => guard.MetadataDocument(null!));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => guard.CheckAsync(null!).AsTask());
+        Assert.Throws<ArgumentNullException>(() => OAuthAccessGuard.IsMetadataRequest("GET", "/", null!));
     }
 }

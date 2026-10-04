@@ -1,8 +1,8 @@
 using System.Text.Json;
-using McpGuardrails.Core.Hosting;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Serialization;
 
-namespace McpGuardrails.Core.Access;
+namespace McpGuardrails.Core.Hosting;
 
 /// <summary>
 /// Decides whether an HTTP request may reach the MCP endpoint when
@@ -18,9 +18,11 @@ namespace McpGuardrails.Core.Access;
 /// foreign web page's request safe to serve.
 ///
 /// Headers and URLs in, verdict out, like <see cref="HttpAccessGuard"/>, so the
-/// decision is unit-tested without a web server.
+/// decision is unit-tested without a web server. That includes which paths are
+/// the metadata document: the 401 points clients at a URL, and the rule that
+/// answers that URL lives beside the rule that builds it.
 /// </remarks>
-public sealed class OAuthAccessGuard
+public sealed class OAuthAccessGuard : IHttpAccessGuard
 {
     /// <summary>Where the Protected Resource Metadata is served (RFC 9728 section 3).</summary>
     public const string MetadataPath = "/.well-known/oauth-protected-resource";
@@ -39,7 +41,25 @@ public sealed class OAuthAccessGuard
         _validator = validator;
     }
 
-    /// <summary>Judges one request.</summary>
+    /// <inheritdoc />
+    public ValueTask<HttpAccessResult> CheckAsync(HttpAccessRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var resource = Resource(request.Scheme, request.Host, request.Endpoint);
+
+        // Public by definition: it is how a client without a token finds out
+        // where to get one.
+        if (IsMetadataRequest(request.Method, request.Path, resource))
+        {
+            return ValueTask.FromResult(
+                new HttpAccessResult(HttpAccessVerdict.Metadata, Document: MetadataDocument(resource)));
+        }
+
+        return CheckAsync(request.Authorization, request.Origin, resource, cancellationToken);
+    }
+
+    /// <summary>Judges one request to the MCP endpoint.</summary>
     /// <param name="authorization">The <c>Authorization</c> header, if any.</param>
     /// <param name="origin">The <c>Origin</c> header, if any.</param>
     /// <param name="resource">This proxy's resource URL, from <see cref="Resource"/>.</param>
@@ -89,16 +109,35 @@ public sealed class OAuthAccessGuard
     /// </summary>
     /// <remarks>
     /// Built from the request when not configured, so a proxy on a loopback port
-    /// works with no extra setting. Behind a TLS-terminating reverse proxy the
-    /// request's own scheme is the wrong one, which is what <c>resource</c> is for.
-    /// A host that does not make a URL falls back to loopback rather than
-    /// failing the request.
+    /// works with no extra setting. That URL reflects the request's
+    /// <c>Host</c> header back into the challenge and the metadata document. It
+    /// goes only to the client that sent it, and the audience check uses the
+    /// configured <c>audience</c>, so it decides nothing - but behind a
+    /// TLS-terminating reverse proxy the request's own scheme and host are the
+    /// wrong ones, which is what <c>resource</c> is for. No host, or one that
+    /// does not make a URL, falls back to loopback rather than failing the
+    /// request.
     /// </remarks>
-    public Uri Resource(string scheme, string host, string endpointPath) =>
+    public Uri Resource(string scheme, string? host, string endpointPath) =>
         _settings.ResourceUri
-        ?? (Uri.TryCreate($"{scheme}://{host}{endpointPath}", UriKind.Absolute, out var uri)
+        ?? (host is not null && Uri.TryCreate($"{scheme}://{host}{endpointPath}", UriKind.Absolute, out var uri)
             ? uri
             : new Uri($"http://localhost{endpointPath}"));
+
+    /// <summary>Whether a request asks for the metadata of <paramref name="resource"/>.</summary>
+    /// <remarks>
+    /// Both RFC 9728 locations: the path-suffixed one <see cref="MetadataUrl"/>
+    /// builds, which the MCP specification has clients try first, and the bare
+    /// well-known path for clients that do not. GET or HEAD only.
+    /// </remarks>
+    public static bool IsMetadataRequest(string method, string path, Uri resource)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+
+        return (string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(method, "HEAD", StringComparison.OrdinalIgnoreCase)) &&
+               (path == MetadataPath || path == MetadataPath + resource.AbsolutePath.TrimEnd('/'));
+    }
 
     /// <summary>Where the metadata for <paramref name="resource"/> is served.</summary>
     /// <remarks>
@@ -134,8 +173,10 @@ public sealed class OAuthAccessGuard
     /// <remarks>
     /// The scope parameter tells a client what to ask for on its next attempt
     /// (the MCP specification's scope selection). Every value in the header is a
-    /// configured scope, an absolute URL or a fixed phrase, so nothing a client
-    /// sent is ever reflected into it.
+    /// configured scope, a fixed phrase or the metadata URL. That URL carries
+    /// the request's own <c>Host</c> when <c>resource</c> is not configured (see
+    /// <see cref="Resource"/>), normalized by <see cref="Uri"/>; nothing else a
+    /// client sent is reflected into the header.
     /// </remarks>
     private string Challenge(Uri metadata, string? error = null, string? description = null)
     {

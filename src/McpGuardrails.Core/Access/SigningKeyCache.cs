@@ -39,6 +39,11 @@ public readonly record struct KeyLookup(IReadOnlyList<SecurityKey>? Keys)
 /// picked up between scheduled refreshes - at most once per
 /// <see cref="RetryCooldown"/>, so a stream of tokens with made-up key ids
 /// cannot turn the proxy into a request amplifier against the issuer.</item>
+/// <item>A refetch is shared work, so it runs under the cache's own lifetime,
+/// never under the request that happened to trigger it. A client that
+/// disconnects mid-fetch stops waiting; the fetch carries on for everyone
+/// else, instead of being abandoned and then held off by the cooldown while
+/// tokens signed with a rotated key are refused.</item>
 /// </list>
 /// Only RSA and EC signature keys are kept. A symmetric (<c>oct</c>) key in a
 /// published key set would let anyone who read it mint tokens, and refusing it
@@ -59,11 +64,16 @@ public sealed class SigningKeyCache : IDisposable
     private readonly HttpClient _http;
     private readonly TimeProvider _time;
     private readonly ILogger _logger;
-    private readonly SemaphoreSlim _refreshing = new(1, 1);
+    private readonly CancellationTokenSource _lifetime = new();
+
+    // Guards _refresh and _lastAttemptTicks together, so deciding to start a
+    // refresh and recording the attempt is one step. Never held across I/O.
+    private readonly Lock _gate = new();
 
     private Uri? _jwksUri;
     private volatile KeySnapshot? _snapshot;
     private long _lastAttemptTicks;
+    private Task? _refresh;
 
     /// <param name="settings">The validated <c>access.oauth</c> block.</param>
     /// <param name="handler">
@@ -83,17 +93,20 @@ public sealed class SigningKeyCache : IDisposable
         ArgumentNullException.ThrowIfNull(handler);
 
         _settings = settings;
-        _http = new HttpClient(handler) { Timeout = FetchTimeout };
+        _http = new HttpClient(handler)
+        {
+            Timeout = FetchTimeout,
+            // The size of what a remote server sends is its decision, and the
+            // memory is ours: HttpClient enforces this while buffering, without
+            // trusting Content-Length.
+            MaxResponseContentBufferSize = MaxDocumentBytes,
+        };
         _time = time ?? TimeProvider.System;
         _logger = logger ?? NullLogger.Instance;
     }
 
-    /// <summary>A handler fit for fetching keys: no redirects, connections recycled.</summary>
-    public static SocketsHttpHandler CreateHandler() => new()
-    {
-        AllowAutoRedirect = false,
-        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-    };
+    /// <summary>A handler fit for fetching keys: see <see cref="OutboundHttp.CreateHandler"/>.</summary>
+    public static SocketsHttpHandler CreateHandler() => OutboundHttp.CreateHandler();
 
     /// <summary>When the keys in use were fetched, or null before <see cref="InitializeAsync"/>.</summary>
     public DateTimeOffset? FetchedAt => _snapshot?.FetchedAt;
@@ -106,7 +119,11 @@ public sealed class SigningKeyCache : IDisposable
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
         var now = _time.GetUtcNow();
-        Interlocked.Exchange(ref _lastAttemptTicks, now.UtcTicks);
+
+        lock (_gate)
+        {
+            _lastAttemptTicks = now.UtcTicks;
+        }
 
         try
         {
@@ -132,11 +149,12 @@ public sealed class SigningKeyCache : IDisposable
         var now = _time.GetUtcNow();
         var due = now - snapshot.FetchedAt >= _settings.JwksRefresh;
         var unknown = keyId is not null && !snapshot.Has(keyId);
-        var cooled = now.UtcTicks - Interlocked.Read(ref _lastAttemptTicks) >= RetryCooldown.Ticks;
 
-        if ((due || unknown) && cooled)
+        if ((due || unknown) && Refresh(now, joinRunning: unknown) is { } refresh)
         {
-            await TryRefreshAsync(now, cancellationToken);
+            // WaitAsync, so a request that gives up stops waiting without
+            // cancelling a fetch other requests depend on.
+            await refresh.WaitAsync(cancellationToken);
             snapshot = _snapshot!;
         }
 
@@ -145,24 +163,59 @@ public sealed class SigningKeyCache : IDisposable
             : new KeyLookup(snapshot.Keys);
     }
 
+    /// <summary>The refresh to wait for, or null to go on with the keys there are.</summary>
+    /// <param name="now">When the caller looked.</param>
+    /// <param name="joinRunning">
+    /// Whether to wait for a refresh already under way. True for an unknown key
+    /// id: the refresh in flight is exactly what may make that token valid, so
+    /// answering from the old keys would refuse it for nothing. False for a
+    /// scheduled refresh: the keys there are stay valid until the maximum age,
+    /// so the request need not wait.
+    /// </param>
     /// <remarks>
-    /// One refresh at a time. A request that arrives while another is refreshing
-    /// does not wait for it: it uses the keys there are, which are still valid
-    /// unless the maximum age says otherwise.
+    /// One refresh at a time, and at most one start per
+    /// <see cref="RetryCooldown"/>, both decided under one lock so two requests
+    /// that look at the same moment cannot fetch back to back.
     /// </remarks>
-    private async Task TryRefreshAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    private Task? Refresh(DateTimeOffset now, bool joinRunning)
     {
-        if (!await _refreshing.WaitAsync(0, cancellationToken))
+        lock (_gate)
         {
-            return;
+            if (_refresh is { IsCompleted: false } running)
+            {
+                return joinRunning ? running : null;
+            }
+
+            if (now.UtcTicks - _lastAttemptTicks < RetryCooldown.Ticks)
+            {
+                return null;
+            }
+
+            _lastAttemptTicks = now.UtcTicks;
+            return _refresh = RefreshAsync(now);
         }
+    }
+
+    /// <remarks>
+    /// A fetch failure is logged and the old keys stay in use, so every request
+    /// awaiting this sees it complete; only a bug surfaces, as it would anywhere
+    /// else. The cache's token is taken before the first await, while the cache
+    /// is certainly alive, so a dispose that races the start reads as the
+    /// cancellation it is.
+    /// </remarks>
+    private async Task RefreshAsync(DateTimeOffset now)
+    {
+        var lifetime = _lifetime.Token;
+
+        // Off the caller's stack and out of the lock that started it, so the
+        // fetch never runs synchronously inside Refresh.
+        await Task.Yield();
 
         try
         {
-            Interlocked.Exchange(ref _lastAttemptTicks, now.UtcTicks);
-            _snapshot = new KeySnapshot(await FetchKeysAsync(_jwksUri!, cancellationToken), now);
+            _snapshot = new KeySnapshot(await FetchKeysAsync(_jwksUri!, lifetime), now);
         }
-        catch (Exception ex) when (IsFetchFailure(ex, cancellationToken))
+        catch (Exception ex) when (IsFetchFailure(ex, lifetime))
         {
             _logger.LogWarning(
                 "Cannot refresh the signing keys from {JwksUri}: {Reason}. The keys fetched at {FetchedAt:u} stay in use until they are {MaxAge} old.",
@@ -171,9 +224,10 @@ public sealed class SigningKeyCache : IDisposable
                 _snapshot!.FetchedAt,
                 _settings.JwksMaxAge);
         }
-        finally
+        catch (Exception) when (lifetime.IsCancellationRequested)
         {
-            _refreshing.Release();
+            // Disposed mid-fetch, whether the fetch saw the cancellation or the
+            // disposed client first: nobody is left to use the keys.
         }
     }
 
@@ -219,13 +273,7 @@ public sealed class SigningKeyCache : IDisposable
 
             try
             {
-                return OutboundUrl.Validate(
-                    document.JwksUri,
-                    "jwks_uri",
-                    reason: "Signing keys fetched in the clear can be replaced by anyone on the path",
-                    credentialHint: "the keys are public and need no credential",
-                    allowLoopbackHttp: _settings.AllowInsecureLocalhost is true,
-                    optInSetting: "access.oauth.allow_insecure_localhost");
+                return _settings.KeySetUrl(document.JwksUri, "jwks_uri");
             }
             catch (PolicyException ex)
             {
@@ -261,37 +309,33 @@ public sealed class SigningKeyCache : IDisposable
     /// <returns>The body, or null on a 404.</returns>
     private async Task<string?> GetAsync(Uri uri, CancellationToken cancellationToken)
     {
-        using var response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
 
-        if (response.StatusCode is HttpStatusCode.NotFound)
+        HttpResponseMessage response;
+        try
         {
-            return null;
+            // Buffered by GetAsync, within MaxResponseContentBufferSize.
+            response = await _http.GetAsync(uri, cancellationToken);
         }
-
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new OAuthException($"'{uri}' answered {(int)response.StatusCode}");
-        }
-
-        // Read with a cap rather than trusting Content-Length: the size of what
-        // a remote server sends is its decision, and the memory is ours.
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var buffer = new byte[MaxDocumentBytes + 1];
-        var length = 0;
-        int read;
-
-        while (length < buffer.Length &&
-               (read = await stream.ReadAsync(buffer.AsMemory(length), cancellationToken)) > 0)
-        {
-            length += read;
-        }
-
-        if (length > MaxDocumentBytes)
+        catch (HttpRequestException ex) when (ex.HttpRequestError is HttpRequestError.ConfigurationLimitExceeded)
         {
             throw new OAuthException($"'{uri}' sent more than {MaxDocumentBytes} bytes");
         }
 
-        return System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+        using (response)
+        {
+            if (response.StatusCode is HttpStatusCode.NotFound)
+            {
+                return null;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new OAuthException($"'{uri}' answered {(int)response.StatusCode}");
+            }
+
+            return await response.Content.ReadAsStringAsync(cancellationToken);
+        }
     }
 
     /// <remarks>
@@ -312,8 +356,9 @@ public sealed class SigningKeyCache : IDisposable
 
     public void Dispose()
     {
+        _lifetime.Cancel();
         _http.Dispose();
-        _refreshing.Dispose();
+        _lifetime.Dispose();
     }
 
     private sealed record KeySnapshot(IReadOnlyList<SecurityKey> Keys, DateTimeOffset FetchedAt)

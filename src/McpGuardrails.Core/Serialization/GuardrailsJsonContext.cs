@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
@@ -80,6 +81,8 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(PinSettings))]
 [JsonSerializable(typeof(PinMode))]
 [JsonSerializable(typeof(NewToolAction))]
+[JsonSerializable(typeof(AccessPolicy))]
+[JsonSerializable(typeof(OAuthSettings))]
 // The servers file, bound the same way as the policy. Unknown keys are refused
 // per type with [JsonUnmappedMemberHandling] on the records themselves, because
 // a misspelt option in the file that decides what the proxy launches must not be

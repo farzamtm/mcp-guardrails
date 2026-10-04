@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
+using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Serialization;
 
@@ -87,20 +88,12 @@ public sealed class WebhookApprovalChannel : IApprovalChannel, IDisposable
         };
     }
 
-    /// <summary>The production transport.</summary>
+    /// <summary>The production transport: see <see cref="OutboundHttp.CreateHandler"/>.</summary>
     /// <remarks>
-    /// Redirects off. A 3xx is a request to send the signed body somewhere the
-    /// policy did not name - possibly over plain http - and following it would
-    /// bypass every check the loader made on the URL. Not following it makes it
-    /// a non-2xx answer, which is a denial.
+    /// A 3xx is not followed, so it arrives as a non-2xx answer, which is a
+    /// denial: the signed body never goes somewhere the policy did not name.
     /// </remarks>
-    public static SocketsHttpHandler CreateHandler() => new()
-    {
-        AllowAutoRedirect = false,
-        // Re-resolve DNS now and then: the process can live as long as the
-        // client session, and a receiver behind a load balancer moves.
-        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-    };
+    public static SocketsHttpHandler CreateHandler() => OutboundHttp.CreateHandler();
 
     /// <inheritdoc />
     public async ValueTask<ApprovalOutcome> RequestAsync(

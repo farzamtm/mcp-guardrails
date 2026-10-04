@@ -37,14 +37,15 @@ access:
 | --- | --- | --- |
 | `issuer` | required | The authorization server's issuer identifier, exactly as it appears in a token's `iss`. Must be https. |
 | `audience` | required | The value a token's `aud` must contain. Without it, a token the same issuer minted for any other application would be accepted here. |
-| `resource` | the request's URL | This proxy's public MCP endpoint, as advertised in the metadata. Set it when the proxy is behind a reverse proxy or TLS terminator, because clients check that it matches the URL they connected to. |
-| `required_scopes` | none | Scopes every token must grant. A token missing one gets a 403 that names the scopes to ask for. |
+| `resource` | the request's URL | This proxy's public MCP endpoint, as advertised in the metadata. Unset, it is built from the request's scheme and `Host` header, so the client's own `Host` is echoed back in the challenge and the metadata (to that client only; it never affects which tokens are accepted). Set it when the proxy is behind a reverse proxy or TLS terminator, because clients check that it matches the URL they connected to. |
+| `required_scopes` | none | Scopes every token must grant. A token missing one gets a 403 that names the scopes to ask for. Leaving it empty logs a startup warning: a scope the issuer grants only in access tokens is what shuts out ID tokens and tokens issued for other purposes. |
 | `principal_claim` | `sub` | The claim whose value becomes the principal. A token without it is refused. |
 | `groups_claim` | `groups` | The claim whose values a rule's `groups:` matches. |
 | `jwks_uri` | discovered | Where the signing keys are, if the issuer does not publish discovery metadata. |
 | `clock_skew_s` | `60` | Tolerance applied to `exp` and `nbf`, at most 300. |
 | `jwks_refresh_s` | `3600` | How often the signing keys are refetched; at least 60. |
 | `jwks_max_age_s` | `86400` | How long the last keys fetched stay in use while the issuer is unreachable; at most a week. |
+| `require_at_jwt` | `false` | Refuse a token whose `typ` header is not `at+jwt` (RFC 9068). Leave it off for Entra ID, Okta and Auth0, which send `typ: JWT` by default; turn it on for an issuer that sends `at+jwt`, so nothing else it signs can pass for an access token. |
 | `allow_insecure_localhost` | `false` | Allow plain `http://` for `issuer` and `jwks_uri`, and only on loopback. For a test authorization server on the same machine. |
 
 Unknown keys are errors, like everywhere else in a security setting.
@@ -74,7 +75,7 @@ specification](https://modelcontextprotocol.io/specification/draft/basic/authori
 | Request | Answer |
 | --- | --- |
 | No token, or a scheme other than Bearer | `401`, challenge with `resource_metadata` |
-| Malformed, forged, expired, wrong issuer or audience, no principal claim | `401`, `error="invalid_token"` and a short fixed `error_description` |
+| Malformed, forged, expired, wrong issuer or audience, no principal claim, an ID token | `401`, `error="invalid_token"` and a short fixed `error_description` |
 | Valid, but missing a required scope | `403`, `error="insufficient_scope"`, the scopes to ask for |
 | Valid | Passed on to the MCP endpoint, with the principal attached |
 | Signing keys past `jwks_max_age_s` | `503`, no challenge: the client did nothing wrong |
@@ -95,6 +96,11 @@ specification](https://modelcontextprotocol.io/specification/draft/basic/authori
   ID), as a string or an array.
 - **The principal** is a non-empty string of at most 256 characters with no
   control characters, so it can go into the audit log safely.
+- **Not an ID token:** a token carrying `nonce` is refused. When the client and
+  the API share one app registration, an OpenID Connect ID token has the same
+  issuer, audience and keys as an access token, and ID tokens are handled far
+  more loosely (kept in browsers, logged). With `require_at_jwt`, `typ` must
+  also be `at+jwt`.
 
 Signature verification is done by `Microsoft.IdentityModel.JsonWebTokens`, the
 library under every ASP.NET Core JWT bearer handler. A trimmed Native AOT publish
@@ -140,8 +146,16 @@ budgets:
   daily: { max_calls: 5000 }      # everyone together, per UTC day
 ```
 
-`principal:` is a glob, like `tool:`. `groups:` matches when the caller is in
-any of the listed groups, by exact, case-sensitive name.
+`principal:` is a glob, like `tool:`, but matched **case-insensitively**.
+Principals are often email addresses or UPNs, and identity providers emit them
+in whatever case the account was created with, so a deny rule for
+`*@contractor.example` has to catch `bob@Contractor.Example` too. For rules that
+must not depend on a mutable, human-chosen name at all, use an immutable claim
+such as `sub` or Entra's `oid` as `principal_claim`.
+
+`groups:` matches when the caller is in any of the listed groups, by exact,
+case-sensitive name: group claims are identifiers (Entra sends object IDs), and
+copying the value from a token into the policy is the reliable way to write one.
 
 A call without a principal matches no identity condition, the same way a call to
 an unknown tool matches no `server:`. Because no call has a principal without

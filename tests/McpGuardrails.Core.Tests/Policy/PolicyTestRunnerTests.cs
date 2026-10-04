@@ -327,4 +327,24 @@ public sealed class PolicyTestRunnerTests
 
         Assert.Empty(report.Failures);
     }
+
+    [Theory]
+    [InlineData("fs__write", "")]
+    [InlineData("fs__nope", "unknown: true")]
+    public void GroupsWithoutAPrincipal_AreRefused(string call, string unknown)
+    {
+        // No validated token has groups but no principal, so such a case would
+        // test a caller the proxy can never see.
+        var ex = Assert.Throws<PolicyException>(() => Run($$"""
+            policy: p.yaml
+            tools: { fs__write: {} }
+            cases:
+              - call: {{call}}
+                {{unknown}}
+                groups: [ops]
+                expect: deny
+            """));
+
+        Assert.Contains("'groups:' without 'principal:'", ex.Message, StringComparison.Ordinal);
+    }
 }

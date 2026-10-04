@@ -77,8 +77,9 @@ rules:
 ```
 
 **Who is calling**, under [OAuth](oauth.md): `principal:` is a glob over the
-access token's principal claim, and `groups:` matches when the caller is in any
-of the listed groups. A call with no principal — over stdio, or over HTTP
+access token's principal claim, matched **case-insensitively** (unlike `tool:`),
+and `groups:` matches when the caller is in any of the listed groups, by exact,
+case-sensitive name. A call with no principal — over stdio, or over HTTP
 without `access.oauth` — matches neither, so a policy using them without an
 `access.oauth` section is refused at load rather than carrying rules that can
 never fire.
@@ -200,7 +201,8 @@ A few rules keep a test from silently testing nothing:
   and the MCP defaults apply: not read-only, destructive.
 - A case with no `principal:` has no caller, as over stdio. For a policy that
   uses [OAuth](oauth.md) identities, give the case `principal: alice` and, if
-  rules match on them, `groups: [ops]`.
+  rules match on them, `groups: [ops]`. `groups:` without `principal:` is
+  refused: no validated caller looks like that.
 
 `policy:` may also name a pack file, with `server:` giving the name to fill in.
 That is how the shipped packs are tested.

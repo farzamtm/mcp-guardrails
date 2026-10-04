@@ -388,6 +388,10 @@ public sealed class SigningKeyCacheTests
         var refreshing = cache.GetKeysAsync("rsa-1").AsTask();
         var startedAt = issuer.Clock.Now;
 
+        // The refresh runs off the caller's stack, so wait for it to reach the
+        // authorization server before looking.
+        await issuer.Handler.WaitForAsync(TestIssuer.JwksPath, count: 2);
+
         // Past the cooldown, so this request would refresh too if it could.
         issuer.Clock.Advance(SigningKeyCache.RetryCooldown);
         var meanwhile = await cache.GetKeysAsync("rsa-1");
@@ -399,6 +403,80 @@ public sealed class SigningKeyCacheTests
         issuer.Handler.Gate.SetResult();
         await refreshing;
         Assert.Equal(startedAt, cache.FetchedAt);
+    }
+
+    [Fact]
+    public async Task AnUnknownKeyId_DuringARefresh_WaitsForIt()
+    {
+        // The refresh in flight is what makes a token signed with a rotated key
+        // valid, so answering from the old keys would refuse it for nothing.
+        var issuer = new TestIssuer();
+        using var cache = await issuer.KeysAsync();
+        var rotated = new RsaSecurityKey(System.Security.Cryptography.RSA.Create(2048)) { KeyId = "rsa-2" };
+        issuer.Handler.Serve(TestIssuer.JwksPath, TestIssuer.Jwks(issuer.Rsa, rotated));
+        issuer.Clock.Advance(TimeSpan.FromHours(1));
+        issuer.Handler.Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var scheduled = cache.GetKeysAsync("rsa-1").AsTask();
+        var rotatedLookup = cache.GetKeysAsync("rsa-2").AsTask();
+        Assert.False(rotatedLookup.IsCompleted);
+
+        issuer.Handler.Gate.SetResult();
+        await scheduled;
+
+        Assert.Contains("rsa-2", (await rotatedLookup).Keys!.Select(k => k.KeyId));
+        Assert.Equal(2, issuer.Handler.Count(TestIssuer.JwksPath));
+    }
+
+    [Fact]
+    public async Task ARequestThatGivesUp_DoesNotCancelTheSharedRefresh()
+    {
+        // The refresh belongs to the cache, not to the request that started it:
+        // a client disconnecting mid-fetch must not throw it away and leave the
+        // cooldown holding off the retry.
+        var issuer = new TestIssuer();
+        using var cache = await issuer.KeysAsync();
+        var rotated = new RsaSecurityKey(System.Security.Cryptography.RSA.Create(2048)) { KeyId = "rsa-2" };
+        issuer.Handler.Serve(TestIssuer.JwksPath, TestIssuer.Jwks(issuer.Rsa, rotated));
+        issuer.Clock.Advance(SigningKeyCache.RetryCooldown);
+        issuer.Handler.Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var disconnecting = new CancellationTokenSource();
+
+        var abandoned = cache.GetKeysAsync("rsa-2", disconnecting.Token).AsTask();
+        await disconnecting.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned);
+
+        issuer.Handler.Gate.SetResult();
+        var keys = await cache.GetKeysAsync("rsa-2");
+
+        Assert.Contains("rsa-2", keys.Keys!.Select(k => k.KeyId));
+        Assert.Equal(2, issuer.Handler.Count(TestIssuer.JwksPath));
+    }
+
+    [Fact]
+    public async Task DisposingMidRefresh_EndsTheRefreshQuietly()
+    {
+        var issuer = new TestIssuer();
+        var cache = await issuer.KeysAsync();
+        issuer.Clock.Advance(SigningKeyCache.RetryCooldown);
+        issuer.Handler.Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var waiting = cache.GetKeysAsync("rsa-2").AsTask();
+        cache.Dispose();
+
+        var keys = await waiting;
+        Assert.DoesNotContain("rsa-2", keys.Keys!.Select(k => k.KeyId));
+    }
+
+    [Fact]
+    public async Task AnExceptionThatIsNoFetchFailure_DuringARefresh_Surfaces()
+    {
+        var issuer = new TestIssuer();
+        using var cache = await issuer.KeysAsync();
+        issuer.Clock.Advance(SigningKeyCache.RetryCooldown);
+        issuer.Handler.Failure = new InvalidOperationException("bug");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cache.GetKeysAsync("rsa-2").AsTask());
     }
 
     [Fact]
