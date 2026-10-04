@@ -13,8 +13,8 @@ namespace McpGuardrails.Cli;
 /// </summary>
 /// <remarks>
 /// Only the listener lives here. The MCP server itself - handlers and every
-/// guardrail filter - is registered once in Program.cs and is identical for both
-/// transports; this class decides where it listens and who may reach it.
+/// guardrail filter - is registered once in ServeCommand and is identical for
+/// both transports; this class decides where it listens and who may reach it.
 /// </remarks>
 internal static class HttpHost
 {

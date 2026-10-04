@@ -31,7 +31,7 @@ public sealed record UpstreamConnection(
 /// handles this tool?".
 /// </summary>
 /// <remarks>
-/// This is the proxy's client half. The server half lives in the CLI's Program.cs.
+/// This is the proxy's client half. The server half lives in the CLI's ServeCommand.
 ///
 /// C# notes:
 ///

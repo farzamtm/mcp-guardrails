@@ -14,7 +14,7 @@ namespace McpGuardrails.Core.Pipeline;
 /// downstream server: audit, the gates, redaction, result scanning, the forward.
 /// </summary>
 /// <remarks>
-/// Lives in Core rather than in the CLI's Program.cs because this is where the
+/// Lives in Core rather than in the CLI's ServeCommand because this is where the
 /// decisions are, and the CLI is excluded from coverage. The order of the layers
 /// is the security design - a policy denial must never reach an approver, a
 /// credential must be refused before a human is asked, budget must only be spent
