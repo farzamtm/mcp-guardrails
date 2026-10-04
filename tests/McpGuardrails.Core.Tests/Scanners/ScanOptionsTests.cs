@@ -36,7 +36,44 @@ public sealed class ScanOptionsTests
         var options = ScanOptions.Parse(["scan"]);
 
         Assert.Equal((false, null, null), (options.Json, options.ServersPath, options.TargetDocument));
+        Assert.Equal(ScanOptions.DefaultTimeout, options.Timeout);
     }
+
+    [Fact]
+    public void TheSubcommand_MayStandAnywhereBeforeCommand() =>
+        Assert.True(ScanOptions.Parse(["--json", "scan"]).Json);
+
+    [Theory]
+    [InlineData("scan", "servers.yaml", "--json")] // --servers forgotten
+    [InlineData("scan", "--json", "-json")] // a single-dash flag
+    [InlineData("scan", "scan")]
+    public void AStrayWord_IsAnError_SoTheWrongThingIsNeverScanned(params string[] args)
+    {
+        var message = Error(args);
+
+        Assert.Contains("--servers <path>", message, StringComparison.Ordinal);
+        Assert.DoesNotContain("servers.yaml", message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--servers", "a.yaml", "--servers", "b.yaml")]
+    [InlineData("--url", "https://a.example/mcp", "--url", "https://b.example/mcp")]
+    [InlineData("--timeout", "5", "--timeout", "9")]
+    public void ASingleValueFlagGivenTwice_IsAnError(params string[] flags) =>
+        Assert.Equal($"{flags[0]} was given more than once.", Error(["scan", .. flags]));
+
+    [Fact]
+    public void ATimeout_IsReadInSeconds() =>
+        Assert.Equal(TimeSpan.FromSeconds(5), ScanOptions.Parse(["scan", "--timeout", "5"]).Timeout);
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("-1")]
+    [InlineData("3601")]
+    [InlineData("1.5")]
+    [InlineData("soon")]
+    public void ATimeoutThatIsNotASensibleWholeNumber_IsAnError(string value) =>
+        Assert.Contains("whole number of seconds", Error("scan", "--timeout", value), StringComparison.Ordinal);
 
     [Fact]
     public void JsonAndServers_AreRead()

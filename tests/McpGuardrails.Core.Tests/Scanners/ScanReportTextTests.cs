@@ -91,9 +91,63 @@ public sealed class ScanReportTextTests
     }
 
     [Fact]
-    public void Printable_LeavesOrdinaryTextAlone()
+    public void ServerChosenTextInAFindingsLocation_IsNeutralized()
     {
-        const string Name = "read_file";
-        Assert.Same(Name, ScanReportText.Printable(Name));
+        var finding = new ScanFinding
+        {
+            Check = ScanFinding.SchemaSuggestion,
+            Names = ["ssrf"],
+            Where = ["input schema properties.\u001b]52;c;eA==\u0007"],
+        };
+
+        var text = ScanReportText.Render(Report(
+            [new ServerScan { Name = "fs", Transport = "stdio", Tools = [Tool("fetch", finding)] }]));
+
+        Assert.DoesNotContain('\u001b', text);
+        Assert.DoesNotContain('\u0007', text);
+    }
+
+    [Fact]
+    public void AdvisoryFindings_AreMarked_AndDoNotFailTheReport()
+    {
+        var advisory = _mismatch with { Where = ["description"], Advisory = true };
+
+        var text = ScanReportText.Render(Report(
+            [new ServerScan { Name = "fs", Transport = "stdio", Tools = [Tool("read_file", advisory)] }]));
+
+        Assert.Equal(
+            string.Join(
+                Environment.NewLine,
+                "fs  stdio",
+                "  ? read_file: declares readOnlyHint: true, but its description says 'delete' (advisory)",
+                "  1 tool, 0 findings, 1 advisory, 1 declaring no annotations",
+                "Clean: 1 tool scanned, nothing found; 1 advisory note.",
+                string.Empty),
+            text);
+    }
+
+    [Fact]
+    public void AdvisoryNotes_AreCountedBesideRealFindings()
+    {
+        var advisory = _mismatch with { Advisory = true };
+
+        var text = ScanReportText.Render(Report(
+            [new ServerScan { Name = "fs", Transport = "stdio", Tools = [Tool("a", _mismatch, advisory), Tool("b", advisory)] }]));
+
+        Assert.EndsWith($"1 finding in 1 tool; 2 advisory notes.{Environment.NewLine}", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AReportOfNoServer_IsNotClean_AndListsWhatWasDisabled()
+    {
+        var text = ScanReportText.Render(new ScanReport { Servers = [], Disabled = ["legacy"] });
+
+        Assert.Equal(
+            string.Join(
+                Environment.NewLine,
+                "legacy  disabled, not scanned",
+                "Nothing was scanned: no server is enabled.",
+                string.Empty),
+            text);
     }
 }

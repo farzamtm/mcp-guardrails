@@ -43,9 +43,47 @@ public sealed class AnnotationCheckTests
         var mismatches = AnnotationCheck.Check(Tool("delete_file", "Removes the file at the given path."));
 
         Assert.Equal(
-            [new AnnotationMismatch("name", "delete"), new AnnotationMismatch("description", "remove")],
+            [new AnnotationMismatch("name", "delete"), new AnnotationMismatch("description", "remove", Advisory: true)],
             mismatches);
     }
+
+    [Fact]
+    public void ADescriptionMatch_IsAdvisory_SoDenialsDoNotFailAScan()
+    {
+        // "never deletes anything" is honest, and matches as readily as a lie.
+        var mismatch = Assert.Single(AnnotationCheck.Check(Tool("read_file", "Reads a file; never deletes anything.")));
+
+        Assert.Equal(new AnnotationMismatch("description", "delete", Advisory: true), mismatch);
+    }
+
+    [Theory]
+    [InlineData("get_updates")] // Telegram's read-only getUpdates
+    [InlineData("getUpdates")]
+    [InlineData("list_sent_messages")]
+    [InlineData("search_deleted_items")]
+    [InlineData("get_settings")]
+    [InlineData("reset_view")]
+    [InlineData("run_query")]
+    [InlineData("get_post")]
+    [InlineData("list_edits")]
+    public void ReadToolNames_ThatOnlyContainANounOrParticiple_AreNotReported(string name) =>
+        Assert.Empty(AnnotationCheck.Check(Tool(name)));
+
+    [Theory]
+    [InlineData("create_directory", "create")]
+    [InlineData("move_file", "move")]
+    [InlineData("edit_file", "edit")]
+    [InlineData("rename_file", "rename")]
+    [InlineData("kill_process", "kill")]
+    [InlineData("exec", "execute")]
+    [InlineData("insert_row", "insert")]
+    [InlineData("set_config", "set")]
+    [InlineData("truncate_table", "truncate")]
+    [InlineData("purge_cache", "purge")]
+    [InlineData("overwrite_file", "overwrite")]
+    [InlineData("modifyRecord", "modify")]
+    public void ReadOnlyToolsNamedLikeAWrite_AreReported(string name, string verb) =>
+        Assert.Equal([new AnnotationMismatch("name", verb)], AnnotationCheck.Check(Tool(name)));
 
     [Fact]
     public void AnHonestReadOnlyTool_IsClean() =>
@@ -66,16 +104,18 @@ public sealed class AnnotationCheckTests
     [InlineData("update2", "update")]
     [InlineData("writeFile", "write")]
     public void Names_AreSplitOnSeparatorsDigitsAndCamelCase(string name, string verb) =>
-        Assert.Equal(verb, AnnotationCheck.FirstVerb(name, splitCamelCase: true));
+        Assert.Equal(verb, AnnotationCheck.FirstVerb(name, inName: true));
 
     [Theory]
     [InlineData("select_dropdown")]
     [InlineData("sender_name")]
     [InlineData("updater")]
     [InlineData("overwriting")]
+    [InlineData("deleted")]
     [InlineData("list")]
+    [InlineData("averyveryverylongwordindeed")]
     public void OnlyWholeWordsFromTheVocabularyMatch(string name) =>
-        Assert.Null(AnnotationCheck.FirstVerb(name, splitCamelCase: true));
+        Assert.Null(AnnotationCheck.FirstVerb(name, inName: true));
 
     [Theory]
     [InlineData("It wrote the report.", "write")]
@@ -84,14 +124,14 @@ public sealed class AnnotationCheckTests
     [InlineData("Dropped rows are gone", "drop")]
     [InlineData("Lists rows; nothing is UPDATED.", "update")]
     public void Descriptions_MatchInflectionsInAnyCase(string description, string verb) =>
-        Assert.Equal(verb, AnnotationCheck.FirstVerb(description, splitCamelCase: false));
+        Assert.Equal(verb, AnnotationCheck.FirstVerb(description, inName: false));
 
     [Fact]
     public void Descriptions_AreNotSplitOnCamelCase()
     {
         // In prose a capital inside a word is a brand name, not two words.
-        Assert.Null(AnnotationCheck.FirstVerb("Works with reDeleted items", splitCamelCase: false));
-        Assert.Equal("delete", AnnotationCheck.FirstVerb("reDeleted", splitCamelCase: true));
+        Assert.Null(AnnotationCheck.FirstVerb("Works with reDeleted items", inName: false));
+        Assert.Equal("delete", AnnotationCheck.FirstVerb("reDelete", inName: true));
     }
 
     [Theory]
@@ -99,12 +139,19 @@ public sealed class AnnotationCheckTests
     [InlineData("")]
     [InlineData("--- 123 ---")]
     public void TextWithoutWords_HasNoVerb(string? text) =>
-        Assert.Null(AnnotationCheck.FirstVerb(text, splitCamelCase: true));
+        Assert.Null(AnnotationCheck.FirstVerb(text, inName: true));
 
     [Fact]
     public void TheVocabulary_MapsEveryFormToItsVerb()
     {
         Assert.Equal("write", AnnotationCheck.Verbs["written"]);
-        Assert.Equal(7, AnnotationCheck.Verbs.Values.Distinct().Count());
+        Assert.Equal("execute", AnnotationCheck.NameVerbs["exec"]);
+
+        // Every name verb is also a description verb, except "set": in prose it
+        // is mostly a noun.
+        Assert.Equal(
+            ["set"],
+            AnnotationCheck.NameVerbs.Values.Except(AnnotationCheck.Verbs.Values).ToArray());
+        Assert.False(AnnotationCheck.NameVerbs.ContainsKey("deleted"));
     }
 }
