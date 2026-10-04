@@ -40,7 +40,7 @@ guardrails go.
 | **Audit** | Every call, including refused ones, to a JSONL log. With no policy at all it is a transparent recorder. | [audit log](docs/audit-log.md) |
 | **Policy** | YAML allow / deny / require-approval rules, first match wins, matching on tool globs, MCP annotations and JSONPath predicates over the arguments. Refusals are written as prompts the agent can act on. | [policy](docs/policy.md) |
 | **Policy packs** | Ready-made, commented policies for popular servers - filesystem, GitHub, git, Postgres, fetch, Playwright, Supabase. `init` writes one reviewable policy file from them, and `policy test` checks that a policy decides the way its test cases say. | [packs](docs/packs.md) |
-| **Budgets** | Session and daily caps on calls and on weighted cost; daily caps persist in SQLite and survive restarts. | [budgets](docs/budgets.md) |
+| **Budgets** | Session, daily and per-caller caps on calls and on weighted cost; daily caps persist in SQLite and survive restarts. | [budgets](docs/budgets.md) |
 | **Human approval** | Holds a call until a person answers, at the client (MCP elicitation) or via an HMAC-signed webhook. Silence means no. | [approval](docs/approval.md) |
 | **Injection scanning** | Tool results and tool definitions are checked for prompt injection and fenced as untrusted data, on by default. An optional Claude classifier can act as a second opinion. | [result scanning](docs/result-scanning.md) |
 | **Pinned tool definitions** | Every server's tool definitions are pinned on first use. A tool that changes across an upgrade (a "rug pull") is flagged with a warning or withheld until someone reviews the diff and accepts it. | [pins](docs/pins.md) |
@@ -49,6 +49,7 @@ guardrails go.
 | **Secret redaction** | API keys, tokens, private keys and passwords are replaced with markers in results, in the audit log and optionally in outgoing arguments. | [secret redaction](docs/secret-redaction.md) |
 | **Any servers** | Front any number of stdio and remote (Streamable HTTP, SSE) servers from one servers file, in the format your client already uses. `wrap` puts the proxy in front of a client's whole server list in one command, and `unwrap` restores it byte for byte. Secrets stay out of the file, and child processes can be isolated from the proxy's environment. | [servers](docs/servers.md) |
 | **Transports** | stdio, or stateless Streamable HTTP (loopback by default, bearer token, Origin check). | [Streamable HTTP](docs/streamable-http.md) |
+| **OAuth** | Over HTTP, the proxy is an OAuth protected resource: it validates JWT access tokens from your authorization server (Entra ID, Okta, Auth0, Keycloak), and each caller's identity feeds `principal:` / `groups:` rules, per-caller budgets and the audit log. | [OAuth](docs/oauth.md) |
 | **OpenTelemetry** | Opt-in spans and metrics over OTLP, with no argument values in any attribute. | [OpenTelemetry](docs/opentelemetry.md) |
 
 What it looks like to the agent when a rule fires:
@@ -298,7 +299,6 @@ locally.
 - **Published releases:** signed binaries, nuget.org, a container image
 - **Slack approval**, and the Tasks/MRTR approval path for clients on the
   2026-07-28 protocol revision
-- **Per-client identity over HTTP**, which per-client budgets need
 
 Suggestions and use cases are welcome in
 [issues](https://github.com/farzamtm/mcp-guardrails/issues).
