@@ -99,4 +99,9 @@ for policy in examples/*.yaml; do
   GUARDRAILS_SERVERS="" GUARDRAILS_PINS="$PINS" GUARDRAILS_POLICY="$policy" "$BIN" list-upstream >/dev/null
 done
 
+# The packs ship inside the binary, so each must behave the way its test file
+# says, not just parse.
+step "test policy packs"
+"$BIN" policy test packs/*.test.yaml
+
 bold $'\nPreflight passed in '"$((SECONDS - START))"$'s - CI should agree.'
