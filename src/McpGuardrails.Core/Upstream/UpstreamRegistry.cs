@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol.Authentication;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
@@ -34,9 +35,12 @@ public sealed record UpstreamConnection(
     public UpstreamServerConfig? Config { get; init; }
 }
 
-/// <summary>An <c>optional</c> server the proxy started without.</summary>
+/// <summary>
+/// A server the proxy started without: an <c>optional</c> one it could not
+/// reach, or an OAuth one with no usable login.
+/// </summary>
 /// <param name="Name">The server's name.</param>
-/// <param name="Reason">Why it could not be reached, for the operator's log.</param>
+/// <param name="Reason">Why it could not be reached, for the operator's log and the model.</param>
 public sealed record UnavailableUpstream(string Name, string Reason);
 
 /// <summary>
@@ -162,6 +166,14 @@ public sealed class UpstreamRegistry : IAsyncDisposable
             {
                 connections.Add(connection);
             }
+            else if (UpstreamNeedsOperatorException.Find(error) is { } needed)
+            {
+                // Not fatal even when the server is required: no amount of
+                // waiting fixes a missing login or credential; a person has to act,
+                // and the rest of the configured servers are still worth serving.
+                // Its tools are absent, and calls to them say what to do.
+                unavailable.Add(new UnavailableUpstream(config.Name, needed.Message));
+            }
             else if (config.Optional)
             {
                 unavailable.Add(new UnavailableUpstream(config.Name, error!.Message));
@@ -189,10 +201,16 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     /// </summary>
     internal static IClientTransport CreateTransport(
         UpstreamServerConfig config,
-        ILoggerFactory loggerFactory) =>
+        ILoggerFactory loggerFactory) => CreateTransport(config, loggerFactory, oauth: null);
+
+    /// <summary>The production transport, with OAuth for a remote server that logs in.</summary>
+    public static IClientTransport CreateTransport(
+        UpstreamServerConfig config,
+        ILoggerFactory loggerFactory,
+        ClientOAuthOptions? oauth) =>
         config.Transport is UpstreamTransport.Stdio
             ? new StdioClientTransport(StdioOptions(config), loggerFactory)
-            : new HttpClientTransport(HttpOptions(config), RemoteHttp, loggerFactory, ownsHttpClient: false);
+            : new HttpClientTransport(HttpOptions(config, oauth), RemoteHttp, loggerFactory, ownsHttpClient: false);
 
     /// <summary>
     /// One HTTP client for every remote server, for the life of the process, as
@@ -239,9 +257,10 @@ public sealed class UpstreamRegistry : IAsyncDisposable
     /// Streamable HTTP and silently falls back to SSE, which is a downgrade
     /// nobody chose; a server that only speaks SSE has to say <c>type: sse</c>.
     /// </remarks>
-    internal static HttpClientTransportOptions HttpOptions(UpstreamServerConfig config) => new()
+    internal static HttpClientTransportOptions HttpOptions(UpstreamServerConfig config, ClientOAuthOptions? oauth = null) => new()
     {
         Name = config.Name,
+        OAuth = oauth,
         Endpoint = config.Url!,
         TransportMode = config.Transport is UpstreamTransport.Sse
             ? HttpTransportMode.Sse
@@ -349,6 +368,25 @@ public sealed class UpstreamRegistry : IAsyncDisposable
 
         tool = null;
         return false;
+    }
+
+    /// <summary>
+    /// The unavailable server a client-visible tool name would have belonged to.
+    /// </summary>
+    /// <remarks>
+    /// Its tools were never listed, so the name cannot be resolved; but its
+    /// prefix still says whose it was, and "server 'linear' needs a login" is a
+    /// far better answer than "unknown tool" to a model that saw the tool in a
+    /// previous session.
+    /// </remarks>
+    public bool TryGetUnavailable(string qualifiedToolName, [NotNullWhen(true)] out UnavailableUpstream? server)
+    {
+        var separator = qualifiedToolName.IndexOf(ToolNamespacer.Separator, StringComparison.Ordinal);
+        server = separator > 0
+            ? Unavailable.FirstOrDefault(u => string.Equals(u.Name, qualifiedToolName[..separator], StringComparison.Ordinal))
+            : null;
+
+        return server is not null;
     }
 
     /// <summary>Shuts down every child process.</summary>

@@ -99,6 +99,30 @@ public static class ArgumentDetector
         _ => ArgumentDetectors.None,
     };
 
+    /// <summary>The flags for a list of names: all for no list, null if any name is unknown.</summary>
+    internal static ArgumentDetectors? Resolve(IReadOnlyList<string>? names)
+    {
+        if (names is null)
+        {
+            return ArgumentDetectors.All;
+        }
+
+        var flags = ArgumentDetectors.None;
+
+        foreach (var name in names)
+        {
+            var flag = Parse(name);
+            if (flag is ArgumentDetectors.None)
+            {
+                return null;
+            }
+
+            flags |= flag;
+        }
+
+        return flags;
+    }
+
     /// <summary>What a detector's hit means, phrased to follow "the arguments contain".</summary>
     public static string Describe(string detector) => detector switch
     {
@@ -136,9 +160,19 @@ public sealed record ArgumentScannerSettings
     [JsonIgnore]
     public ArgumentAction EffectiveAction => Action ?? ArgumentAction.Audit;
 
-    /// <summary>Which detectors run. Absent means all of them.</summary>
+    /// <summary>Which detectors run. Absent means all of them; an empty list means none.</summary>
     [JsonPropertyName("detectors")]
-    public IReadOnlyList<string>? Detectors { get; init; }
+    public IReadOnlyList<string>? Detectors
+    {
+        get => _detectors;
+        init => (_detectors, _flags) = (value, ArgumentDetector.Resolve(value));
+    }
+
+    private readonly IReadOnlyList<string>? _detectors;
+
+    // Resolved once, when the list is set, rather than on every call; null when
+    // the list names something that is not a detector.
+    private readonly ArgumentDetectors? _flags = ArgumentDetectors.All;
 
     /// <summary>
     /// Per-tool settings, matched as globs against the client-visible tool name.
@@ -165,36 +199,29 @@ public sealed record ArgumentScannerSettings
         ArgumentNullException.ThrowIfNull(toolName);
 
         var action = EffectiveAction;
-        var detectors = Flags(Detectors);
+        var detectors = Resolved(_flags);
 
         foreach (var entry in Overrides ?? [])
         {
             // Validated non-empty at load.
             if (GlobMatcher.IsMatch(entry.Tool!, toolName))
             {
-                return (entry.Action ?? action, entry.Detectors is null ? detectors : Flags(entry.Detectors));
+                return (entry.Action ?? action, entry.Detectors is null ? detectors : Resolved(entry.Flags));
             }
         }
 
         return (action, detectors);
     }
 
-    private static ArgumentDetectors Flags(IReadOnlyList<string>? names)
-    {
-        if (names is null)
-        {
-            return ArgumentDetectors.All;
-        }
-
-        var flags = ArgumentDetectors.None;
-
-        foreach (var name in names)
-        {
-            flags |= ArgumentDetector.Parse(name);
-        }
-
-        return flags;
-    }
+    /// <remarks>
+    /// An unknown name never quietly means "no detector": settings built in code
+    /// skip the loader's validation, and reading the name as nothing would
+    /// switch the check off without a word.
+    /// </remarks>
+    private static ArgumentDetectors Resolved(ArgumentDetectors? flags) =>
+        flags ?? throw new PolicyException(
+            "'scanners.arguments' names an unknown detector, so it cannot be applied. " +
+            $"Use {string.Join(", ", ArgumentDetector.Configurable)}.");
 
     internal void Validate()
     {
@@ -264,7 +291,16 @@ public sealed record ArgumentOverride
 
     /// <summary>The detectors for this tool. Absent means the section's.</summary>
     [JsonPropertyName("detectors")]
-    public IReadOnlyList<string>? Detectors { get; init; }
+    public IReadOnlyList<string>? Detectors
+    {
+        get => _detectors;
+        init => (_detectors, Flags) = (value, ArgumentDetector.Resolve(value));
+    }
+
+    private readonly IReadOnlyList<string>? _detectors;
+
+    /// <summary><see cref="Detectors"/> resolved when set; null when it names an unknown detector.</summary>
+    internal ArgumentDetectors? Flags { get; private init; } = ArgumentDetectors.All;
 
     /// <summary>The action for this tool. Absent means the section's.</summary>
     [JsonPropertyName("action")]

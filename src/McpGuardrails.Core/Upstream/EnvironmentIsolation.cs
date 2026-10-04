@@ -34,6 +34,18 @@ public static class EnvironmentIsolation
     ];
 
     /// <summary>
+    /// What a container runtime's CLI needs beyond <see cref="Allowlist"/> to
+    /// reach its daemon: which host or context, its config and certificates, and
+    /// (for rootless Podman) the user's runtime directory.
+    /// </summary>
+    /// <remarks>
+    /// These reach the <c>docker</c>/<c>podman</c> process only. The container
+    /// itself gets nothing but the server's declared <c>env</c>, passed by name.
+    /// </remarks>
+    public static IReadOnlyList<string> ContainerRuntimePassthrough { get; } =
+        ["DOCKER_*", "CONTAINER_*", "CONTAINERS_*", "XDG_*"];
+
+    /// <summary>
     /// The passthrough entry that turns isolation off again: every variable is
     /// passed on.
     /// </summary>

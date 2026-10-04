@@ -123,6 +123,37 @@ public sealed class PolicyTestRunnerTests
     }
 
     [Fact]
+    public void SecretBlocking_FromThePolicy_DecidesBeforeTheArgumentDetectors()
+    {
+        // The proxy runs the secret gate first; a call it refuses is not then
+        // refused again by the argument detectors, whose hits are still listed.
+        const string policy = """
+            scanners:
+              secrets: { arguments: block }
+              arguments: { action: block }
+            """;
+
+        var report = Run("""
+            policy: p.yaml
+            tools: { web__fetch: {} }
+            cases:
+              - call: web__fetch
+                args: { url: "http://169.254.169.254/", key: "AKIAIOSFODNN7EXAMPLE" }
+                expect: deny
+                rule: secrets.arguments
+                argument_hits: [ssrf]
+              - call: web__fetch
+                args: { url: "http://169.254.169.254/" }
+                expect: deny
+                rule: arguments.ssrf
+              - call: web__fetch
+                expect: allow
+            """, policy);
+
+        Assert.Empty(report.Failures);
+    }
+
+    [Fact]
     public void WrongArgumentHits_Fail()
     {
         var report = Run("""

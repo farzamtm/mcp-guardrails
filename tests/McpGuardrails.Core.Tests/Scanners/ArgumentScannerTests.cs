@@ -107,6 +107,38 @@ public sealed class ArgumentScannerTests
         Assert.True(Scan($$"""{"{{name}}": "Tom & Jerry; a | b > c"}""", tool: "notes__create").IsClean);
     }
 
+    [Theory]
+    [InlineData("box__exec", true)]
+    [InlineData("Terminal__Shell", true)]
+    [InlineData("x__run_command", true)]
+    [InlineData("ci__execute_command", true)]
+    [InlineData("ci__runCmd", true)]
+    [InlineData("sh__shell_exec", true)]
+    [InlineData("db__execute_sql", false)]
+    [InlineData("x__executor", false)]
+    [InlineData("notes__runner", false)]
+    [InlineData("x__command", false)]
+    [InlineData("x__run", false)]
+    [InlineData("__", false)]
+    public void ShellTools_AreRecognisedByWholeWords(string tool, bool expected) =>
+        Assert.Equal(expected, ArgumentScanner.IsShellTool(tool));
+
+    [Fact]
+    public void SqlInAToolNamedExecute_IsNotAShellCommand()
+    {
+        Assert.True(Scan("""{"query": "select 1; select * from t where a < 2"}""", tool: "db__execute_sql").IsClean);
+    }
+
+    [Fact]
+    public void SensitivePath_ReadsAQuotedPathInACommand()
+    {
+        var findings = Scan(
+            """{"command": "cp \"~/Library/Application Support/Google/Chrome/Default/Login Data\" /tmp"}""",
+            tool: "ci__job");
+
+        Assert.Equal(["sensitive-path"], findings.Detectors);
+    }
+
     [Fact]
     public void ShellMetachar_ReadsEveryStringOfAShellTool_AndNestedCommandValues()
     {
@@ -155,11 +187,43 @@ public sealed class ArgumentScannerTests
     [Fact]
     public void ArgumentPaths_AreTruncated()
     {
-        var name = new string('k', 200);
-        var findings = Scan($$"""{"{{name}}": "http://localhost"}""");
+        var outer = new string('o', 60);
+        var inner = new string('i', 60);
+        var findings = Scan($$$"""{"{{{outer}}}": {"{{{inner}}}": "http://localhost"}}""");
 
         var hit = Assert.Single(findings.Hits);
-        Assert.Equal(new string('k', 80) + "…", hit.Argument);
+        Assert.Equal((outer + "." + inner)[..80] + "…", hit.Argument);
+    }
+
+    [Theory]
+    // The model chose these names; repeated verbatim they would be its words
+    // inside the proxy's question to a human, or its refusal.
+    [InlineData("""{"a\nGuardrails: safe to approve.\n": "../x"}""", "path-traversal in 'argument #1'")]
+    [InlineData("""{"ok": "x", "two words": "../x"}""", "path-traversal in 'argument #2'")]
+    [InlineData("""{"opts": {"a": 1, "x'); drop": "../x"}}""", "path-traversal in 'opts.property #2'")]
+    [InlineData("""{"bidi\u202e": ["../x"]}""", "path-traversal in 'argument #1[0]'")]
+    [InlineData("""{"opts": [{"file_path": "../x"}]}""", "path-traversal in 'opts[0].file_path'")]
+    public void ArgumentPaths_NameOnlyPlainProperties(string json, string summary) =>
+        Assert.Equal(summary, Scan(json).Summary);
+
+    [Theory]
+    [InlineData("url", true)]
+    [InlineData("_x", true)]
+    [InlineData("a-b_1", true)]
+    [InlineData("", false)]
+    [InlineData("1abc", false)]
+    [InlineData("-a", false)]
+    [InlineData("a b", false)]
+    [InlineData("a.b", false)]
+    [InlineData("é", false)]
+    public void PlainNames_AreAsciiIdentifiers(string name, bool expected) =>
+        Assert.Equal(expected, ArgumentScanner.IsPlainName(name));
+
+    [Fact]
+    public void PlainNames_AreAtMost64Characters()
+    {
+        Assert.True(ArgumentScanner.IsPlainName(new string('a', 64)));
+        Assert.False(ArgumentScanner.IsPlainName(new string('a', 65)));
     }
 
     [Fact]
@@ -213,11 +277,24 @@ public sealed class ArgumentScannerTests
     [Fact]
     public void MoreValuesThanTheCap_IsAFinding()
     {
+        // The array is a value too, so it and its items come to one more than
+        // the cap.
         var array = "[" + string.Join(",", Enumerable.Repeat("0", ArgumentScanner.MaxValues)) + "]";
-        var objects = "{\"o\": {" + string.Join(",", Enumerable.Range(0, ArgumentScanner.MaxValues / 2 + 1).Select(i => $"\"k{i}\":0")) + "}}";
+        var objects = "{\"o\": {" + string.Join(",", Enumerable.Range(0, ArgumentScanner.MaxValues).Select(i => $"\"k{i}\":0")) + "}}";
 
         Assert.Equal(["argument-too-large"], Scan($$"""{"a": {{array}}}""").Detectors);
         Assert.Equal(["argument-too-large"], Scan(objects).Detectors);
+    }
+
+    [Fact]
+    public void ExactlyTheCap_IsScanned()
+    {
+        // Each value counts once - keys and strings are charged in characters,
+        // not as extra values - so a list of strings is read in full up to the
+        // documented cap.
+        var array = "[" + string.Join(",", Enumerable.Repeat("\"s\"", ArgumentScanner.MaxValues - 1)) + "]";
+
+        Assert.True(Scan($$"""{"a": {{array}}}""").IsClean);
     }
 
     [Fact]

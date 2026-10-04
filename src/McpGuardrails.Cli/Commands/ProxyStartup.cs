@@ -5,6 +5,7 @@ using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
+using McpGuardrails.Core.UpstreamAuth;
 using Microsoft.Extensions.Logging;
 
 namespace McpGuardrails.Cli.Commands;
@@ -152,9 +153,19 @@ internal sealed class ProxyStartup : IAsyncDisposable
         {
             // Connect to every downstream server and cache the tools they
             // advertise. Disposing the registry shuts every spawned child down.
+            // OAuth servers read their login from the credential store. The store
+            // is only opened when a server needs it: probing for a keyring on a
+            // machine that has no OAuth server would be noise.
+            UpstreamTransportFactory? transports = null;
+            if (servers.Servers.Any(server => server.OAuth is not null))
+            {
+                var store = CliTokenStore.Create(warning => serversLog.LogWarning("{Warning}", warning));
+                transports = UpstreamOAuth.ServingTransports(store);
+            }
+
             try
             {
-                upstream = await UpstreamRegistry.ConnectAsync(servers.Servers, loggerFactory);
+                upstream = await UpstreamRegistry.ConnectAsync(servers.Servers, loggerFactory, transports);
             }
             catch (UpstreamConnectionException ex)
             {
@@ -167,7 +178,7 @@ internal sealed class ProxyStartup : IAsyncDisposable
             foreach (var missing in upstream.Unavailable)
             {
                 serversLog.LogWarning(
-                    "Optional upstream server '{Server}' is unavailable and its tools are absent this session: {Reason}",
+                    "Upstream server '{Server}' is unavailable and its tools are absent this session: {Reason}",
                     missing.Name,
                     missing.Reason);
             }

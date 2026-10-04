@@ -14,6 +14,10 @@ available in three places:
 The proxy validates tokens. It never issues them, never stores them and never
 logs them.
 
+This page is about clients authenticating **to the proxy**. For the proxy
+logging in **to a remote server** that wants OAuth, see
+[Logging in with OAuth](servers.md#logging-in-with-oauth) and `auth login`.
+
 ## Configuration
 
 The settings live in the policy file, because they are access policy and belong

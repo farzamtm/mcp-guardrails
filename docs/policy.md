@@ -179,9 +179,11 @@ the name before `__`) and its hints. No server is spawned, so it runs in CI with
 no network or keys. A failing case prints the full decision trail, the same text
 `--explain` adds to a refusal. The exit code is 1 when anything fails.
 
-The policy's [argument detectors](argument-scanning.md) run after the rules, as
-they do in the proxy, so a `block` or `approve` from `scanners.arguments` shows
-up in `expect:` and `rule:` (`arguments.ssrf`, say). `argument_hits: [ssrf]`
+The policy's secret blocking (`scanners.secrets.arguments: block`) and then its
+[argument detectors](argument-scanning.md) run after the rules, as they do in
+the proxy, so a refusal under `secrets.arguments` and a `block` or `approve`
+from `scanners.arguments` show up in `expect:` and `rule:` (`arguments.ssrf`,
+say). `argument_hits: [ssrf]`
 asserts which detectors fire, in any order, and `argument_hits: []` that none
 do. That is the only way to test them under the default `audit`, which never
 changes the verdict. Budgets, result scanners and approval act on a running

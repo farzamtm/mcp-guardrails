@@ -20,10 +20,13 @@ namespace McpGuardrails.Core.Scanners;
 /// Encoded addresses are decoded the way the C library's <c>inet_aton</c> does -
 /// <c>2130706433</c>, <c>0x7f.1</c> and <c>0177.0.0.1</c> are all 127.0.0.1 to
 /// most HTTP clients - because an attacker writes whichever form the check
-/// forgot.
+/// forgot. For the same reason the clean-up a URL parser does first is done
+/// here too: tabs and newlines are deleted, escapes decoded and full-width or
+/// enclosed characters folded (<see cref="ArgumentText"/>).
 ///
-/// Linear in the input: one forward pass, a bounded look-back of a few letters
-/// at each colon to read the scheme, and each authority read once.
+/// Linear in the input: at most two forward passes (the second only when the
+/// value holds a tab or newline), a bounded look-back of a few letters at each
+/// colon to read the scheme, and each authority read a constant number of times.
 /// </remarks>
 internal static class SsrfDetector
 {
@@ -32,6 +35,21 @@ internal static class SsrfDetector
 
     /// <summary>True when the value contains a URL to an internal address.</summary>
     public static bool IsMatch(string value)
+    {
+        if (Scan(value))
+        {
+            return true;
+        }
+
+        // The URL standard and Python's urlsplit delete every tab, CR and LF
+        // before parsing, so "ht\ttp://169.254.169.254/" is fetched as written
+        // without them. Judged both ways: as written, a newline still ends a
+        // URL in prose.
+        return value.AsSpan().IndexOfAny('\t', '\n', '\r') >= 0 &&
+               Scan(string.Concat(value.Where(c => !ArgumentText.IsStrippedFromUrls(c))));
+    }
+
+    private static bool Scan(string value)
     {
         var index = value.IndexOf(':');
 
@@ -112,19 +130,57 @@ internal static class SsrfDetector
             return true;
         }
 
-        while (end < value.Length && !EndsAuthority(value[end]))
+        // Two readings of where the host is, and either one being internal is
+        // a hit. Read as prose, the authority also ends at a quote, a bracket,
+        // a comma or a space, so "(http://127.0.0.1)" and "http://10.0.0.1, then"
+        // are found. A URL parser ends it only at the path, query or fragment,
+        // and takes everything up to the last '@' before that as userinfo -
+        // whatever it contains - so "http://a,@169.254.169.254/" goes to the
+        // metadata address.
+        var authorityEnd = index;
+        while (authorityEnd < value.Length && !EndsUrlAuthority(value[authorityEnd]))
+        {
+            authorityEnd++;
+        }
+
+        while (end < authorityEnd && !EndsProseAuthority(value[end]))
         {
             end++;
         }
 
-        return IsInternalHost(Host(value.AsSpan(index, end - index)));
+        if (IsInternalHost(Host(value.AsSpan(index, end - index))))
+        {
+            return true;
+        }
+
+        // The prose reading already took a '@' inside its own span into account.
+        var at = value.AsSpan(end, authorityEnd - end).LastIndexOf('@');
+        if (at < 0)
+        {
+            return false;
+        }
+
+        var hostStart = end + at + 1;
+        var hostEnd = hostStart;
+        while (hostEnd < authorityEnd && !EndsProseAuthority(value[hostEnd]))
+        {
+            hostEnd++;
+        }
+
+        // The caller resumes at the end of the prose reading, not past the
+        // '@': a URL between the two would otherwise be skipped. Nothing
+        // between them is read again by another authority, because the next
+        // URL's slashes end this one's span, so the scan stays linear.
+        return IsInternalHost(Host(value.AsSpan(hostStart, hostEnd - hostStart)));
     }
 
     private static bool IsSlash(string value, int index) =>
-        index < value.Length && PathDetectors.IsSeparator(value[index]);
+        index < value.Length && ArgumentText.IsSeparator(value[index]);
 
-    private static bool EndsAuthority(char c) =>
-        PathDetectors.IsSeparator(c) || c is '?' or '#' or '"' or '\'' or '`' or '<' or '>' or ')' or ',' || char.IsWhiteSpace(c);
+    private static bool EndsUrlAuthority(char c) => ArgumentText.IsSeparator(c) || c is '?' or '#';
+
+    private static bool EndsProseAuthority(char c) =>
+        EndsUrlAuthority(c) || c is '"' or '\'' or '`' or '<' or '>' or ')' or ',' || char.IsWhiteSpace(c);
 
     /// <summary>The host part of an authority, decoded and normalised.</summary>
     private static string Host(ReadOnlySpan<char> authority)
@@ -144,44 +200,12 @@ internal static class SsrfDetector
             host = host[..colon];
         }
 
-        var text = PercentDecode(host);
-
-        // Full-width and ideographic dots are folded by IDNA into '.', so a
-        // client resolving "127。0。0。1" connects to loopback.
-        return text
-            .Replace('。', '.')
-            .Replace('．', '.')
-            .Replace('｡', '.')
+        // Escapes are decoded first, then full-width, enclosed and ideographic
+        // forms folded, the order a URL parser applies before IDNA: a client
+        // resolving "%EF%BC%91２７。0。0。1" connects to loopback.
+        return ArgumentText.FoldHost(ArgumentText.Decode(host.ToString()))
             .ToLowerInvariant()
             .TrimEnd('.');
-    }
-
-    /// <summary>Decodes ASCII <c>%XX</c> escapes; anything else is kept as written.</summary>
-    internal static string PercentDecode(ReadOnlySpan<char> value)
-    {
-        if (!value.Contains('%'))
-        {
-            return value.ToString();
-        }
-
-        var builder = new System.Text.StringBuilder(value.Length);
-
-        for (var i = 0; i < value.Length; i++)
-        {
-            if (value[i] == '%' && i + 2 < value.Length &&
-                char.IsAsciiHexDigit(value[i + 1]) && char.IsAsciiHexDigit(value[i + 2]) &&
-                Convert.FromHexString(value.Slice(i + 1, 2))[0] is var decoded and < 0x80)
-            {
-                builder.Append((char)decoded);
-                i += 2;
-            }
-            else
-            {
-                builder.Append(value[i]);
-            }
-        }
-
-        return builder.ToString();
     }
 
     internal static bool IsInternalHost(string host)
@@ -259,14 +283,22 @@ internal static class SsrfDetector
             _ => (part, 10),
         };
 
-        // Longer than any 32-bit value can be written in octal, so no overflow
-        // check is needed below, and a megabyte of digits is refused unread.
-        if (digits.Length is 0 or > 11)
+        if (digits.Length == 0)
         {
             return false;
         }
 
-        foreach (var c in digits)
+        // inet_aton and the URL standard accept any number of leading zeros, so
+        // "0x00000000007f000001" is loopback. Only the significant digits are
+        // limited: past 11 no 32-bit value can be written even in octal, so no
+        // overflow check is needed below.
+        var significant = digits.TrimStart('0');
+        if (significant.Length > 11)
+        {
+            return false;
+        }
+
+        foreach (var c in significant)
         {
             var digit = char.IsAsciiDigit(c) ? c - '0'
                 : char.IsAsciiHexDigit(c) ? char.ToLowerInvariant(c) - 'a' + 10

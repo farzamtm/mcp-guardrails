@@ -52,6 +52,25 @@ public sealed class PathDetectorsTests
     // Inside a command line: a word with a separator is read as a path.
     [InlineData("cat ~/.ssh/id_rsa")]
     [InlineData("tar czf out.tgz \"/etc/shadow\"")]
+    // Paths the file system resolves to a credential file: '.' and '..'
+    // segments, and the Windows trailing dots, spaces and default stream.
+    [InlineData("/etc/./shadow")]
+    [InlineData("/home/u/.aws/./credentials")]
+    [InlineData("~/.kube/./config")]
+    [InlineData("/home/u/.docker/./config.json")]
+    [InlineData("C:\\Users\\u\\AppData\\.\\Roaming\\Microsoft\\Credentials\\x")]
+    [InlineData("/etc/x/../shadow")]
+    [InlineData("/home/u/.aws/a/b/../../credentials")]
+    [InlineData("C:\\Users\\u\\.ssh.\\id_ed25519.")]
+    [InlineData("C:\\p\\id_rsa.")]
+    [InlineData("C:\\p\\.env::$DATA")]
+    [InlineData("C:\\p\\.ENV::$data")]
+    [InlineData("C:\\p\\.npmrc...")]
+    [InlineData("C:\\p\\.env.local.")]
+    // Escapes decoded the way traversal decodes them: double, overlong, IIS.
+    [InlineData("%252essh/id_rsa")]
+    [InlineData("/home/u/%c0%aessh/id_rsa")]
+    [InlineData("/home/u/%u002essh/id_rsa")]
     public void SensitivePath_FiresOnCredentialLocations(string value) =>
         Assert.True(PathDetectors.IsSensitivePath(value, pathNamed: false));
 
@@ -72,6 +91,12 @@ public sealed class PathDetectorsTests
     [InlineData(".aws")]
     [InlineData("")]
     [InlineData("/")]
+    [InlineData("./x/./y")]
+    [InlineData("../shadow")]
+    [InlineData("a/../credentials")]
+    [InlineData("/./")]
+    [InlineData(".../x")]
+    [InlineData("C:\\p\\notes.txt.")]
     // Prose that mentions credential files without a path-like word.
     [InlineData("remember to add .env to .gitignore")]
     [InlineData("the id_rsa key should never be committed")]
@@ -92,6 +117,31 @@ public sealed class PathDetectorsTests
             "~/Library/Application Support/Google/Chrome/Default/Login Data", pathNamed: true));
         Assert.True(PathDetectors.IsSensitivePath("~/.config/chromium/Default/Web Data", pathNamed: true));
         Assert.False(PathDetectors.IsSensitivePath("add .env to .gitignore", pathNamed: false));
+    }
+
+    [Fact]
+    public void SensitivePath_ReadsAQuotedWordOfACommand_AsOnePath()
+    {
+        // A shell keeps a quoted path together, spaces and all; prose is still
+        // read word by word, where no single word holds the file name.
+        const string copy = "cp \"~/Library/Application Support/Google/Chrome/Default/Login Data\" /tmp/x";
+
+        Assert.True(PathDetectors.IsSensitivePath(copy, pathNamed: false, command: true));
+        Assert.False(PathDetectors.IsSensitivePath(copy, pathNamed: false));
+        Assert.True(PathDetectors.IsSensitivePath("cp 'My Keys/Login Data' out", pathNamed: false, command: true));
+        Assert.True(PathDetectors.IsSensitivePath("cp \"My Keys/Login Data", pathNamed: false, command: true));
+        Assert.True(PathDetectors.IsSensitivePath("cp x\"My Keys/Login Data\" out", pathNamed: false, command: true));
+        Assert.False(PathDetectors.IsSensitivePath("echo 'hello world' a/b", pathNamed: false, command: true));
+        Assert.False(PathDetectors.IsSensitivePath("ls -la 'a b'/c  ", pathNamed: false, command: true));
+    }
+
+    [Fact]
+    public void SensitivePath_AnyWhitespace_MakesAValueProse()
+    {
+        // An em space or an ideographic space separates words just as a space
+        // does, so the value is read word by word rather than as one path.
+        Assert.True(PathDetectors.IsSensitivePath("cat\u2003~/.ssh/id_rsa", pathNamed: false));
+        Assert.False(PathDetectors.IsSensitivePath("add\u2003.env\u1680to\u3000.gitignore", pathNamed: false));
     }
 
     [Theory]
@@ -122,6 +172,8 @@ public sealed class PathDetectorsTests
     [InlineData("..／x")]
     [InlineData("..＼x")]
     [InlineData("..⧵x")]
+    [InlineData("%25252e%25252e%25252f")]
+    [InlineData("%2e%2E%5C")]
     public void Traversal_FiresOnDotDotSegments(string value) => Assert.True(PathDetectors.HasTraversal(value));
 
     [Theory]

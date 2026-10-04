@@ -180,19 +180,36 @@ public sealed class GuardrailsCallPipeline
     {
         var requestedName = parameters?.Name;
 
+        if (requestedName is not null && _upstream.TryGetUnavailable(requestedName, out var unavailable))
+        {
+            return Error(
+                $"Tool '{requestedName}' belongs to server '{unavailable.Name}', which is not available in " +
+                $"this session. {unavailable.Reason} Tell the user; calling it again will not help.");
+        }
+
         if (requestedName is null ||
             !_upstream.TryResolve(requestedName, out var connection, out var downstreamName))
         {
             return Error($"Unknown tool '{requestedName}'.");
         }
 
-        return await connection.Client.CallToolAsync(
-            new CallToolRequestParams
-            {
-                Name = downstreamName,
-                Arguments = parameters?.Arguments,
-            },
-            cancellationToken);
+        try
+        {
+            return await connection.Client.CallToolAsync(
+                new CallToolRequestParams
+                {
+                    Name = downstreamName,
+                    Arguments = parameters?.Arguments,
+                },
+                cancellationToken);
+        }
+        catch (Exception ex) when (UpstreamNeedsOperatorException.Find(ex) is { } needed)
+        {
+            // E.g. a login that expired mid-session and could not be refreshed. A
+            // tool error rather than a protocol error, so the model reads it and
+            // stops, and the audit log records a failed call with this reason.
+            return Error($"Refused '{requestedName}': {needed.Message} Tell the user; calling it again will not help.");
+        }
     }
 
     private static string ToolName(CallToolRequestParams? parameters) =>
