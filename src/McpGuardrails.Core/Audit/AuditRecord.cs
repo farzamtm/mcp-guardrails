@@ -46,6 +46,14 @@ public sealed record AuditRecord
     public string? DownstreamTool { get; init; }
 
     /// <summary>
+    /// Who made the call: the access token's principal claim, under
+    /// <c>access.oauth</c>. Absent otherwise.
+    /// </summary>
+    /// <remarks>An identifier the authorization server vouched for; never the token.</remarks>
+    [JsonPropertyName("principal")]
+    public string? Principal { get; init; }
+
+    /// <summary>
     /// Arguments the client supplied.
     /// </summary>
     /// <remarks>

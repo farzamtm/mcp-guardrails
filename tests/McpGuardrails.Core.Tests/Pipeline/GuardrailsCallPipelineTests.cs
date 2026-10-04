@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text.Json;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
@@ -161,7 +162,8 @@ public sealed class GuardrailsCallPipelineTests
 
         public ValueTask<CallToolResult> CallAsync(
             CallToolRequestParams? parameters,
-            CancellationToken cancellationToken = default) =>
+            CancellationToken cancellationToken = default,
+            CallerIdentity? caller = null) =>
             Pipeline.InvokeAsync(
                 parameters,
                 InBand,
@@ -170,6 +172,7 @@ public sealed class GuardrailsCallPipelineTests
                     Forwarded++;
                     return await Pipeline.ForwardAsync(parameters, token);
                 },
+                caller,
                 cancellationToken);
 
         public ValueTask<CallToolResult> CallAsync(string tool, string? message = "hello") =>
@@ -813,6 +816,7 @@ public sealed class GuardrailsCallPipelineTests
                     RedactionEffect.Redacted));
                 return ValueTask.FromResult(result);
             },
+            caller: null,
             CancellationToken.None);
 
         var record = h.Record;
@@ -849,6 +853,7 @@ public sealed class GuardrailsCallPipelineTests
                     new RedactionOutcome(result, SecretReport.Clean, RedactionEffect.None));
                 return ValueTask.FromResult(result);
             },
+            caller: null,
             CancellationToken.None);
 
         var record = h.Record;
@@ -875,6 +880,7 @@ public sealed class GuardrailsCallPipelineTests
             await h.Pipeline.AuditAsync(
                 Call("fs__echo"),
                 _ => throw new TimeoutException("slow"),
+                caller: null,
                 CancellationToken.None));
 
         Assert.Null(h.Record.Decision);
@@ -928,5 +934,90 @@ public sealed class GuardrailsCallPipelineTests
 
         Assert.True(result.IsError);
         Assert.Equal("nope", Text(result));
+    }
+
+    // ------------------------------------------------------------- caller
+
+    private const string _identityPolicy = """
+        access:
+          oauth:
+            issuer: https://login.example.com
+            audience: api://mcp-guardrails
+        rules:
+          - name: alice-may-echo
+            match: { tool: fs__echo, principal: alice }
+            decision: allow
+          - name: ops-may-echo
+            match: { tool: fs__echo, groups: [ops] }
+            decision: allow
+          - name: nobody-else
+            decision: deny
+        budgets:
+          principal: { max_calls: 1 }
+        """;
+
+    [Fact]
+    public async Task TheCaller_IsMatchedByPolicy_AndRecordedInTheAuditLog()
+    {
+        await using var h = await Harness.StartAsync(_identityPolicy);
+
+        var result = await h.CallAsync(Call("fs__echo"), caller: new CallerIdentity("alice", []));
+
+        Assert.NotEqual(true, result.IsError);
+        Assert.Equal(1, h.Forwarded);
+        Assert.Equal("alice", h.Record.Principal);
+        Assert.Equal("alice-may-echo", h.Record.Rule);
+    }
+
+    [Fact]
+    public async Task TheCallersGroups_AreMatchedByPolicy()
+    {
+        await using var h = await Harness.StartAsync(_identityPolicy);
+
+        await h.CallAsync(Call("fs__echo"), caller: new CallerIdentity("bob", ["ops"]));
+
+        Assert.Equal("ops-may-echo", h.Record.Rule);
+        Assert.Equal(1, h.Forwarded);
+    }
+
+    [Fact]
+    public async Task AnotherCaller_FallsThroughToTheCatchAll()
+    {
+        await using var h = await Harness.StartAsync(_identityPolicy);
+
+        var result = await h.CallAsync(Call("fs__echo"), caller: new CallerIdentity("mallory", ["guests"]));
+
+        Assert.True(result.IsError);
+        Assert.Equal("nobody-else", h.Record.Rule);
+        Assert.Equal("mallory", h.Record.Principal);
+        Assert.Equal(0, h.Forwarded);
+    }
+
+    [Fact]
+    public async Task NoCaller_MatchesNoIdentityRule_AndIsNotRecordedAsOne()
+    {
+        await using var h = await Harness.StartAsync(_identityPolicy);
+
+        await h.CallAsync(Call("fs__echo"));
+
+        Assert.Equal("nobody-else", h.Record.Rule);
+        Assert.Null(h.Record.Principal);
+    }
+
+    [Fact]
+    public async Task EachCaller_SpendsTheirOwnBudget()
+    {
+        await using var h = await Harness.StartAsync(_identityPolicy);
+        var alice = new CallerIdentity("alice", []);
+        var bob = new CallerIdentity("bob", ["ops"]);
+
+        await h.CallAsync(Call("fs__echo"), caller: alice);
+        var refused = await h.CallAsync(Call("fs__echo"), caller: alice);
+        await h.CallAsync(Call("fs__echo"), caller: bob);
+
+        Assert.True(refused.IsError);
+        Assert.Contains("the identity you call as", Text(refused), StringComparison.Ordinal);
+        Assert.Equal(["alice-may-echo", "principal.max_calls", "ops-may-echo"], h.Sink.Records.Select(r => r.Rule));
+        Assert.Equal(2, h.Forwarded);
     }
 }

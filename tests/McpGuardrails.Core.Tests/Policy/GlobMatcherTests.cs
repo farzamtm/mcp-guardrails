@@ -17,6 +17,14 @@ public sealed class GlobMatcherTests
         Assert.Equal(expected, GlobMatcher.IsMatch(pattern, value));
 
     [Theory]
+    [InlineData("*@contractor.example", "bob@Contractor.Example", true)]
+    [InlineData("alice", "ALICE", true)]
+    [InlineData("alice", "ALİCE", false)]
+    [InlineData("*@contractor.example", "bob@contractor.example.org", false)]
+    public void IgnoreCase_ComparesLikeOrdinalIgnoreCase(string pattern, string value, bool expected) =>
+        Assert.Equal(expected, GlobMatcher.IsMatch(pattern, value, ignoreCase: true));
+
+    [Theory]
     [InlineData("*", "anything", true)]
     [InlineData("*", "", true)]
     [InlineData("fs__*", "fs__write_file", true)]

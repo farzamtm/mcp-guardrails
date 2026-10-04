@@ -34,6 +34,8 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
+from oauth_fixture import FixtureIssuer
+
 BIN = (
     sys.argv[1]
     if len(sys.argv) > 1
@@ -1411,6 +1413,14 @@ def main() -> int:
     # Phase 15: the offline scan command, over a clean and a hostile fixture.
     print("\n--- scan command ---")
     failures += run_scan_command_phase()
+
+    # Phase 16: OAuth access tokens over HTTP, from a fixture authorization
+    # server - discovery, the 401 challenge, scopes, principals in policy,
+    # budgets and the audit log, and the startup refusals.
+    print("\n--- oauth ---")
+    oauth_failures, oauth_stderr = run_oauth_phase()
+    failures += oauth_failures
+    http_stderr += oauth_stderr
 
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
@@ -3314,6 +3324,294 @@ def run_scan_command_phase() -> int:
         "scan: no audit log and no pins file were written",
     )
     return check.failures
+
+
+OAUTH_DIR = f"{SANDBOX}/oauth"
+OAUTH_AUDIENCE = "api://smoke-guardrails"
+
+
+def oauth_policy(issuer: str) -> str:
+    return f"""access:
+  oauth:
+    issuer: {issuer}
+    audience: {OAUTH_AUDIENCE}
+    required_scopes: [mcp.tools]
+    allow_insecure_localhost: true
+rules:
+  - name: alice-echoes
+    match: {{ tool: fixture__echo, principal: alice }}
+    decision: allow
+  - name: ops-echo
+    match: {{ tool: fixture__echo, groups: [ops] }}
+    decision: allow
+  - name: nobody-else-echoes
+    match: {{ tool: fixture__echo }}
+    decision: deny
+budgets:
+  principal: {{ max_calls: 2 }}
+"""
+
+
+def http_exchange(
+    url: str,
+    message: dict | None,
+    *,
+    token: str | None = None,
+    origin: str | None = None,
+) -> tuple[int, dict[str, str], str]:
+    """One HTTP request; the status, the headers and the raw body.
+
+    A GET when there is no message. Unlike http_post this keeps the headers,
+    because the 401 challenge is the point of half the OAuth checks.
+    """
+    headers = {"Accept": "application/json, text/event-stream"}
+    data = None
+    if message is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(message).encode("utf-8")
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if origin is not None:
+        headers["Origin"] = origin
+
+    req = urllib.request.Request(
+        url, data=data, headers=headers, method="POST" if data else "GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return (
+                response.status,
+                dict(response.headers),
+                response.read().decode("utf-8"),
+            )
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers), exc.read().decode("utf-8")
+
+
+def start_oauth_proxy(
+    env: dict[str, str],
+) -> tuple[subprocess.Popen, str | None, list[str]]:
+    """Start the proxy over HTTP; return it, its endpoint and its stderr lines."""
+    proc = subprocess.Popen(
+        [BIN, "--transport", "http", "--port", "0"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={**os.environ, **env},
+    )
+    stderr = proc.stderr
+    if stderr is None:
+        raise RuntimeError("failed to open the proxy's stderr")
+
+    lines: list[str] = []
+    found = threading.Event()
+    endpoint: list[str] = []
+
+    def drain() -> None:
+        pattern = re.compile(r"at (http://\S+/mcp)")
+        for line in stderr:
+            lines.append(line)
+            match = pattern.search(line)
+            if match and not endpoint:
+                endpoint.append(match.group(1))
+                found.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+    return proc, endpoint[0] if found.wait(timeout=60) else None, lines
+
+
+def run_oauth_phase() -> tuple[int, list[str]]:
+    """The proxy as an OAuth protected resource, end to end."""
+    os.makedirs(OAUTH_DIR, exist_ok=True)
+    audit = f"{OAUTH_DIR}/audit.jsonl"
+    policy = f"{OAUTH_DIR}/policy.yaml"
+    servers = f"{OAUTH_DIR}/servers.yaml"
+    if os.path.exists(audit):
+        os.remove(audit)
+
+    issuer = FixtureIssuer()
+    with open(policy, "w", encoding="utf-8") as handle:
+        handle.write(oauth_policy(issuer.url))
+    with open(servers, "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  fixture:\n"
+            f"    command: {json.dumps(sys.executable)}\n"
+            f"    args: [{json.dumps(FIXTURE)}]\n"
+        )
+
+    env = {
+        "GUARDRAILS_POLICY": policy,
+        "GUARDRAILS_SERVERS": servers,
+        "GUARDRAILS_AUDIT": audit,
+    }
+    check = Checker()
+    proc, url, stderr = start_oauth_proxy(env)
+
+    def token(
+        subject: str,
+        *,
+        audience: str = OAUTH_AUDIENCE,
+        scope: str | None = "mcp.tools",
+        groups: list[str] | None = None,
+        expires_in: int = 300,
+    ) -> str:
+        return issuer.token(
+            subject,
+            audience=audience,
+            scope=scope,
+            groups=groups,
+            expires_in=expires_in,
+        )
+
+    try:
+        if url is None:
+            print("FAIL  oauth: the proxy never reported a listening address")
+            return 1, stderr
+
+        check.expect(
+            any("auth: OAuth access tokens" in line for line in stderr),
+            "oauth: the startup line says clients authenticate with access tokens",
+        )
+
+        metadata_url = url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp")
+        status, _, body = http_exchange(metadata_url, None)
+        metadata = json.loads(body) if status == 200 else {}
+        check.expect(
+            metadata.get("resource") == url
+            and metadata.get("authorization_servers") == [issuer.url]
+            and metadata.get("scopes_supported") == ["mcp.tools"],
+            "oauth: the protected resource metadata names this proxy and the issuer",
+        )
+
+        status, headers, _ = http_exchange(url, request(1, "tools/list"))
+        challenge = headers.get("WWW-Authenticate", "")
+        check.expect(
+            status == 401 and f'resource_metadata="{metadata_url}"' in challenge,
+            f"oauth: no token -> 401 pointing at the metadata (got {status})",
+        )
+
+        status, headers, _ = http_exchange(
+            url, request(2, "tools/list"), token=token("alice", audience="api://other")
+        )
+        check.expect(
+            status == 401
+            and 'error="invalid_token"' in headers.get("WWW-Authenticate", ""),
+            f"oauth: a token for another audience -> 401 invalid_token (got {status})",
+        )
+
+        status, headers, _ = http_exchange(
+            url, request(3, "tools/list"), token=token("alice", expires_in=-600)
+        )
+        check.expect(status == 401, f"oauth: an expired token -> 401 (got {status})")
+
+        status, headers, _ = http_exchange(
+            url, request(4, "tools/list"), token=token("alice", scope="openid")
+        )
+        challenge = headers.get("WWW-Authenticate", "")
+        check.expect(
+            status == 403
+            and 'error="insufficient_scope"' in challenge
+            and 'scope="mcp.tools"' in challenge,
+            f"oauth: a token without the scope -> 403 naming it (got {status})",
+        )
+
+        alice = token("alice")
+        status, _, _ = http_exchange(
+            url, request(5, "tools/list"), token=alice, origin="https://evil.example"
+        )
+        check.expect(
+            status == 403,
+            f"oauth: a foreign Origin -> 403 even with a token ({status})",
+        )
+
+        status, msg = http_post(url, request(6, "tools/list"), token=alice)
+        names = tool_names(msg["result"]) if status == 200 and msg else set()
+        check.expect("fixture__echo" in names, "oauth: a valid token lists the tools")
+
+        def echo(rid: int, bearer: str) -> dict:
+            status, msg = http_post(
+                url, call(rid, "fixture__echo", {"message": "hi"}), token=bearer
+            )
+            return msg.get("result", {}) if status == 200 and msg else {}
+
+        first = echo(7, alice)
+        check.expect(
+            not first.get("isError") and "echo: hi" in result_text(first),
+            "oauth: alice's call is allowed by her principal rule",
+        )
+        bob = echo(8, token("bob"))
+        check.expect(
+            denied_with(bob, "nobody-else-echoes"),
+            "oauth: bob's call falls through to the deny rule",
+        )
+        ops = echo(9, token("carol", groups=["ops"]))
+        check.expect(
+            not ops.get("isError"), "oauth: a caller in the ops group is allowed"
+        )
+        echo(10, alice)
+        third = echo(11, alice)
+        check.expect(
+            denied_with(third, "principal.max_calls"),
+            "oauth: alice's third call exhausts her own budget",
+        )
+        carol = echo(12, token("carol", groups=["ops"]))
+        check.expect(
+            not carol.get("isError"),
+            "oauth: ...while carol still has hers",
+        )
+
+        wait_for_lines(audit, 6, timeout=10)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    entries = read_audit(audit, "oauth audit log")
+    if entries is None:
+        check.failures += 1
+    else:
+        calls = [e for e in entries if e.get("event") == "tool_call"]
+        check.expect(
+            [e.get("principal") for e in calls]
+            == ["alice", "bob", "carol", "alice", "alice", "carol"],
+            "oauth: every call in the audit log names its principal",
+        )
+        with open(audit, encoding="utf-8") as handle:
+            text = handle.read()
+        check.expect(
+            alice.split(".")[2] not in text and "Bearer" not in text,
+            "oauth: no token reaches the audit log",
+        )
+
+    # The refusals at startup, each before anything listens.
+    both = run_cli(
+        ["--transport", "http", "--port", "0"],
+        {**env, "GUARDRAILS_HTTP_TOKEN": "0123456789abcdef0123"},
+    )
+    check.expect(
+        both.returncode == 2 and "Choose one" in both.stderr,
+        f"oauth: a static token as well is refused (exit {both.returncode})",
+    )
+
+    stdio = run_cli([], env)
+    check.expect(
+        stdio.returncode == 2 and "only applies to '--transport http'" in stdio.stderr,
+        f"oauth: access.oauth over stdio is refused (exit {stdio.returncode})",
+    )
+
+    issuer.close()
+    unreachable = run_cli(["--transport", "http", "--port", "0"], env)
+    check.expect(
+        unreachable.returncode == 1
+        and "Cannot fetch the signing keys" in unreachable.stderr,
+        f"oauth: an unreachable issuer stops the proxy (exit {unreachable.returncode})",
+    )
+
+    return check.failures, stderr
 
 
 if __name__ == "__main__":

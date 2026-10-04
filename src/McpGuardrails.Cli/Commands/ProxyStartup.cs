@@ -88,6 +88,13 @@ internal sealed class ProxyStartup : IAsyncDisposable
     /// <exception cref="CommandFailedException">Anything that makes the proxy refuse to start.</exception>
     public static async Task<ProxyStartup> LoadAsync(string[] args, bool listing)
     {
+        // The policy is read first, before anything is spawned, because how HTTP
+        // clients authenticate is in it: 'access.oauth' decides whether a
+        // non-loopback bind is acceptable and whether the static token may be
+        // set. The gates it configures are built further down.
+        var policyPath = CliPaths.ConfigPath("GUARDRAILS_POLICY", "policy.yaml");
+        var document = ReadPolicy(policyPath);
+
         // Which transport the server half listens on. Parsed before anything is
         // spawned, so a bad or unsafe command line fails in milliseconds rather
         // than after every downstream server has started - and fails rather than
@@ -96,7 +103,10 @@ internal sealed class ProxyStartup : IAsyncDisposable
         ServeOptions serve;
         try
         {
-            serve = ServeOptions.Parse(args, Environment.GetEnvironmentVariable(ServeOptions.TokenVariable));
+            serve = ServeOptions.Parse(
+                args,
+                Environment.GetEnvironmentVariable(ServeOptions.TokenVariable),
+                document.EffectiveAccess.OAuth);
         }
         catch (ServeOptionsException ex)
         {
@@ -174,9 +184,8 @@ internal sealed class ProxyStartup : IAsyncDisposable
             // cheap and opens no connection until used.
             classifierHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
 
-            var policyPath = CliPaths.ConfigPath("GUARDRAILS_POLICY", "policy.yaml");
-            var (document, policy, budgets, injection, scanner, secrets) =
-                LoadPolicy(policyPath, classifierFlag, classifierHttp);
+            var (policy, budgets, injection, scanner, secrets) =
+                LoadPolicy(document, policyPath, classifierFlag, classifierHttp);
 
             // A valid policy can still ask for something the chosen transport
             // cannot do: a session budget over stateless HTTP would quietly
@@ -259,26 +268,35 @@ internal sealed class ProxyStartup : IAsyncDisposable
         return result;
     }
 
-    /// <summary>
-    /// Loads the policy and builds the gates it configures.
-    /// </summary>
+    /// <summary>Reads and validates the policy file.</summary>
     /// <remarks>
     /// A missing file is not an error: no policy means pure passthrough with
     /// audit logging, which is the adoption story. A MALFORMED file is fatal -
     /// failing open on a broken security policy is exactly the wrong default.
     /// </remarks>
+    private static PolicyDocument ReadPolicy(string policyPath)
+    {
+        try
+        {
+            return PolicyLoader.LoadFromFileOrEmpty(policyPath);
+        }
+        catch (PolicyException ex)
+        {
+            throw new CommandFailedException(1, $"Invalid policy file '{policyPath}': {ex.Message}");
+        }
+    }
+
+    /// <summary>Builds the gates the policy configures.</summary>
     private static (
-        PolicyDocument Document,
         PolicyEvaluator Policy,
         BudgetPolicy Budgets,
         ScannerSettings Injection,
         InjectionGate Scanner,
-        SecretGate Secrets) LoadPolicy(string policyPath, bool classifierFlag, HttpClient classifierHttp)
+        SecretGate Secrets) LoadPolicy(
+            PolicyDocument document, string policyPath, bool classifierFlag, HttpClient classifierHttp)
     {
         try
         {
-            var document = PolicyLoader.LoadFromFileOrEmpty(policyPath);
-
             var policy = new PolicyEvaluator(document);
             var budgets = document.EffectiveBudgets;
 
@@ -316,7 +334,7 @@ internal sealed class ProxyStartup : IAsyncDisposable
                         secretSettings.IncludePii))
                 : new InjectionGate(injection);
 
-            return (document, policy, budgets, injection, scanner, secrets);
+            return (policy, budgets, injection, scanner, secrets);
         }
         catch (PolicyException ex)
         {

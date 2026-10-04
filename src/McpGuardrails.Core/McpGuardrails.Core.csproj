@@ -9,6 +9,12 @@
          than a JSON file because concurrent proxies must check-and-charge
          atomically, and a database transaction is that primitive for free. -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.11" />
+    <!-- JWT access-token validation for 'access.oauth'. Signature checking is
+         security-critical code best left to the library every ASP.NET Core JWT
+         bearer handler is built on, and a trimmed Native AOT publish with it
+         has no warnings. JWKS fetching, caching and the claim checks stay in
+         this repository (Access/), where they are unit-tested. -->
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.23.0" />
   </ItemGroup>
 
   <ItemGroup>

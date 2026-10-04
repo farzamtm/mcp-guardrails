@@ -41,37 +41,32 @@ internal static class HttpHost
     }
 
     /// <summary>Maps the endpoint behind the access guard, then runs until shutdown.</summary>
-    public static async Task RunAsync(WebApplication app, ServeOptions options)
+    /// <param name="app">The built host.</param>
+    /// <param name="options">The validated transport options.</param>
+    /// <param name="oauth">The access-token guard, when the policy configures <c>access.oauth</c>.</param>
+    public static async Task RunAsync(WebApplication app, ServeOptions options, OAuthAccessGuard? oauth)
     {
-        var guard = new HttpAccessGuard(options.BearerToken);
+        IHttpAccessGuard guard = oauth ?? (IHttpAccessGuard)new HttpAccessGuard(options.BearerToken);
 
         // Ahead of the endpoint, so a refused request never reaches the MCP
         // handler - or the audit log, which records tool calls, not HTTP noise.
+        // Every decision, including which paths are the OAuth metadata, is the
+        // guard's; this only carries the request in and the answer out.
         app.Use(async (context, next) =>
         {
-            var verdict = guard.Check(
-                context.Request.Headers.Authorization.ToString() is { Length: > 0 } auth
-                    ? auth
-                    : null,
-                context.Request.Headers.Origin.ToString() is { Length: > 0 } origin
-                    ? origin
-                    : null);
+            var request = context.Request;
+            var result = await guard.CheckAsync(
+                new HttpAccessRequest(
+                    request.Method,
+                    request.Path.Value ?? "",
+                    request.Scheme,
+                    request.Host.HasValue ? request.Host.Value : null,
+                    Endpoint,
+                    Header(request.Headers.Authorization),
+                    Header(request.Headers.Origin)),
+                context.RequestAborted);
 
-            switch (verdict)
-            {
-                case HttpAccessVerdict.Allowed:
-                    await next(context);
-                    break;
-
-                case HttpAccessVerdict.Unauthorized:
-                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                    context.Response.Headers[HeaderNames.WWWAuthenticate] = "Bearer";
-                    break;
-
-                default:
-                    context.Response.StatusCode = StatusCodes.Status403Forbidden;
-                    break;
-            }
+            await Respond(context, next, result);
         });
 
         app.MapMcp(Endpoint);
@@ -86,9 +81,56 @@ internal static class HttpHost
                 "Serving MCP over Streamable HTTP (stateless) at {Url}{Endpoint}; auth: {Auth}",
                 url,
                 Endpoint,
-                options.RequiresToken ? "bearer token" : "none (loopback only)");
+                options.AuthenticationName);
         }
 
         await app.WaitForShutdownAsync();
+    }
+
+    private static string? Header(Microsoft.Extensions.Primitives.StringValues value) =>
+        value.ToString() is { Length: > 0 } text ? text : null;
+
+    /// <summary>Passes an allowed request on, or answers a refused one.</summary>
+    /// <remarks>
+    /// The validated caller rides on HttpContext.User, which the MCP SDK hands
+    /// to the tool-call filters as the message's user. Assigned only here, from
+    /// a token this proxy checked, so no other component can supply an identity.
+    /// </remarks>
+    private static async Task Respond(HttpContext context, RequestDelegate next, HttpAccessResult result)
+    {
+        switch (result.Verdict)
+        {
+            case HttpAccessVerdict.Allowed:
+                if (result.Caller is { } caller)
+                {
+                    context.User = caller.ToClaimsPrincipal();
+                }
+
+                await next(context);
+                break;
+
+            case HttpAccessVerdict.Unauthorized:
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                context.Response.Headers[HeaderNames.WWWAuthenticate] = result.Challenge;
+                break;
+
+            case HttpAccessVerdict.InsufficientScope:
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                context.Response.Headers[HeaderNames.WWWAuthenticate] = result.Challenge;
+                break;
+
+            case HttpAccessVerdict.Unavailable:
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                break;
+
+            case HttpAccessVerdict.Metadata:
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(result.Document!, context.RequestAborted);
+                break;
+
+            default:
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                break;
+        }
     }
 }

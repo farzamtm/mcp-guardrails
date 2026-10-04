@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
@@ -136,11 +137,16 @@ public sealed class GuardrailsCallPipeline
     /// The innermost step: in the host, the SDK's call handler, which is
     /// <see cref="ForwardAsync"/>.
     /// </param>
+    /// <param name="caller">
+    /// Who made the call, when an access token said so; null over stdio and
+    /// over HTTP without <c>access.oauth</c>.
+    /// </param>
     /// <param name="cancellationToken">The client's cancellation.</param>
     public ValueTask<CallToolResult> InvokeAsync(
         CallToolRequestParams? parameters,
         IApprovalChannel inBand,
         Func<CancellationToken, ValueTask<CallToolResult>> forward,
+        CallerIdentity? caller = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(inBand);
@@ -155,7 +161,9 @@ public sealed class GuardrailsCallPipeline
                     parameters,
                     scanning => ScanAsync(parameters, forward, scanning),
                     redacting),
+                caller,
                 gated),
+            caller,
             cancellationToken);
     }
 
@@ -194,6 +202,7 @@ public sealed class GuardrailsCallPipeline
     internal async ValueTask<CallToolResult> AuditAsync(
         CallToolRequestParams? parameters,
         Func<CancellationToken, ValueTask<CallToolResult>> next,
+        CallerIdentity? caller,
         CancellationToken cancellationToken)
     {
         // Opens the per-call scope that lets the inner layers report their
@@ -255,7 +264,7 @@ public sealed class GuardrailsCallPipeline
         {
             var elapsed = Stopwatch.GetElapsedTime(startedAt);
             var record = ToAuditRecord(
-                toolName, server, downstreamTool, arguments, scope, elapsed, result, thrown);
+                toolName, server, downstreamTool, caller, arguments, scope, elapsed, result, thrown);
 
             // Same duration and decision as the record, so a dashboard and the
             // log never disagree about the same call.
@@ -272,6 +281,7 @@ public sealed class GuardrailsCallPipeline
         string toolName,
         string? server,
         string? downstreamTool,
+        CallerIdentity? caller,
         ArgumentScan arguments,
         GuardrailsCallScope scope,
         TimeSpan elapsed,
@@ -289,6 +299,7 @@ public sealed class GuardrailsCallPipeline
             Tool = toolName,
             Server = server,
             DownstreamTool = downstreamTool,
+            Principal = caller?.Principal,
             Arguments = arguments.Redacted,
             Decision = decision?.Verdict.ToWireName(),
             Rule = decision?.RuleName,
@@ -330,6 +341,7 @@ public sealed class GuardrailsCallPipeline
         CallToolRequestParams? parameters,
         IApprovalChannel inBand,
         Func<CancellationToken, ValueTask<CallToolResult>> next,
+        CallerIdentity? caller,
         CancellationToken cancellationToken)
     {
         var toolName = ToolName(parameters);
@@ -351,7 +363,7 @@ public sealed class GuardrailsCallPipeline
         var resolved = _upstream.TryResolve(toolName, out var owner, out _);
         var server = resolved ? owner.Name : null;
 
-        var facts = PolicyFacts.ForCall(toolName, parameters, tool, server);
+        var facts = PolicyFacts.ForCall(toolName, parameters, tool, server, caller);
 
         // Seven gates, in this order, and the order is the design.
         //
@@ -395,7 +407,7 @@ public sealed class GuardrailsCallPipeline
             new ApprovalChannelRouter(inBand, _webhook),
             cancellationToken);
 
-        decision = _budget.Apply(decision, resolved);
+        decision = _budget.Apply(decision, resolved, caller?.Principal);
 
         GuardrailsCallScope.RecordDecision(decision);
 

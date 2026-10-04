@@ -27,18 +27,40 @@ public sealed record BudgetPolicy
     [JsonPropertyName("daily")]
     public BudgetLimits? Daily { get; init; }
 
+    /// <summary>Caps per caller, for the lifetime of this proxy process.</summary>
+    /// <remarks>
+    /// The HTTP counterpart of <see cref="Session"/>: stateless HTTP has no
+    /// session to hang a counter on, but a caller authenticated through
+    /// <c>access.oauth</c> has an identity, and one agent looping is then one
+    /// principal running out rather than every client sharing a pool.
+    /// </remarks>
+    [JsonPropertyName("principal")]
+    public BudgetLimits? Principal { get; init; }
+
     /// <summary>No budgets configured: every call passes the gate.</summary>
     public static BudgetPolicy None { get; } = new();
 
     /// <summary>True when nothing is capped.</summary>
     [JsonIgnore]
-    public bool IsEmpty => Session is null && Daily is null;
+    public bool IsEmpty => Session is null && Daily is null && Principal is null;
 
     /// <summary>Validates the section, throwing with a message naming the problem.</summary>
     public void Validate()
     {
         Session?.Validate(BudgetGate.SessionScope);
         Daily?.Validate(BudgetGate.DailyScope);
+        Principal?.Validate(BudgetGate.PrincipalScope);
+
+        // Never enforceable together: a session exists only over stdio and a
+        // principal only over HTTP with access.oauth. Refused here rather than
+        // left for the transport check, so the file says one thing.
+        if (Session is not null && Principal is not null)
+        {
+            throw new PolicyException(
+                $"'budgets.{BudgetGate.SessionScope}' and 'budgets.{BudgetGate.PrincipalScope}' cannot both be " +
+                "set: a session cap applies over stdio, a principal cap over HTTP with 'access.oauth'. Keep " +
+                "the one for the transport you serve.");
+        }
     }
 }
 

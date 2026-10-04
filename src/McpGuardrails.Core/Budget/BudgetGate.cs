@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using McpGuardrails.Core.Policy;
 
 namespace McpGuardrails.Core.Budget;
@@ -25,21 +26,29 @@ public sealed class BudgetGate
     /// <summary>The scope name for the per-UTC-day budget.</summary>
     public const string DailyScope = "daily";
 
+    /// <summary>The scope name for the per-caller budget.</summary>
+    public const string PrincipalScope = "principal";
+
     private readonly IBudgetStore _store;
     private readonly string _scope;
 
-    // Set only when both scopes are configured. See ApplyBoth for why the session
-    // has to be the concrete in-memory store rather than any IBudgetStore.
+    // Set only when a session and a daily cap are configured together. See
+    // ApplyBoth for why the session has to be the concrete in-memory store
+    // rather than any IBudgetStore.
     private readonly InMemoryBudgetStore? _session;
     private readonly IBudgetStore? _daily;
 
-    // A plain object rather than System.Threading.Lock because ApplyBoth needs
-    // Monitor.Wait/PulseAll, which Lock does not offer. Guards _pending only;
-    // it is never held across a call into the daily store.
-    private readonly object _pair = new();
+    // Set only for per-principal budgets, which pick their in-memory store per
+    // call and otherwise follow the session's rules, including with a daily cap.
+    private readonly PrincipalBudgetStore? _principals;
 
-    // Session charges whose daily charge has not settled yet. See ApplyBoth.
-    private int _pending;
+    // One pairing per in-memory store charged before the daily store: the
+    // session's single store, or each principal's own. Per store rather than one
+    // for the gate, because a caller at its own cap can only be freed by a refund
+    // to that same store - waiting on other callers' charges would hold a
+    // request thread for traffic that can never give it budget back. Weak keys,
+    // so a pairing lives exactly as long as its store.
+    private readonly ConditionalWeakTable<InMemoryBudgetStore, Pairing> _pairings = new();
 
     /// <param name="store">Where the running totals live.</param>
     /// <param name="scope">
@@ -67,6 +76,18 @@ public sealed class BudgetGate
         _daily = daily;
     }
 
+    /// <summary>A gate enforcing a budget per caller, and a daily budget if given.</summary>
+    /// <param name="principals">The per-principal counters.</param>
+    /// <param name="daily">The per-day counters, or null for no daily cap.</param>
+    public BudgetGate(PrincipalBudgetStore principals, IBudgetStore? daily = null)
+        : this(daily ?? new InMemoryBudgetStore(), daily is null ? PrincipalScope : DailyScope)
+    {
+        ArgumentNullException.ThrowIfNull(principals);
+
+        _principals = principals;
+        _daily = daily;
+    }
+
     /// <summary>Builds the gate a policy file's <c>budgets:</c> section asks for.</summary>
     /// <param name="budgets">The validated budget section.</param>
     /// <param name="openDaily">
@@ -81,6 +102,15 @@ public sealed class BudgetGate
     {
         ArgumentNullException.ThrowIfNull(budgets);
         ArgumentNullException.ThrowIfNull(openDaily);
+
+        // Principal and session never come together: BudgetPolicy.Validate
+        // refuses the pair, because no transport could enforce both.
+        if (budgets.Principal is { } principal)
+        {
+            return new BudgetGate(
+                new PrincipalBudgetStore(principal),
+                budgets.Daily is { } perDay ? openDaily(perDay) : null);
+        }
 
         return (budgets.Session, budgets.Daily) switch
         {
@@ -101,7 +131,10 @@ public sealed class BudgetGate
     public static BudgetGate Unlimited { get; } = new(new InMemoryBudgetStore());
 
     /// <summary>The totals so far, for logging and tests.</summary>
-    /// <remarks>The session store when both scopes are configured.</remarks>
+    /// <remarks>
+    /// The session store when both scopes are configured; with per-principal
+    /// budgets, the daily store, or an unlimited one when there is none.
+    /// </remarks>
     public IBudgetStore Store => _store;
 
     /// <summary>The daily store when both scopes are configured, otherwise null.</summary>
@@ -117,12 +150,15 @@ public sealed class BudgetGate
     /// anything, so the call is not charged. Defaults to true, so a caller that
     /// does not say is charged - the safe direction for a bound.
     /// </param>
+    /// <param name="principal">
+    /// Who made the call, for per-principal budgets. Ignored otherwise.
+    /// </param>
     /// <returns>
     /// The original decision when the call fits the budget (or was already
     /// blocked, or names no known tool), otherwise a denial explaining which cap
     /// ran out.
     /// </returns>
-    public Decision Apply(Decision decision, bool toolResolved = true)
+    public Decision Apply(Decision decision, bool toolResolved = true, string? principal = null)
     {
         ArgumentNullException.ThrowIfNull(decision);
 
@@ -148,17 +184,53 @@ public sealed class BudgetGate
             return decision;
         }
 
+        if (_principals is not null)
+        {
+            return ApplyPrincipal(decision, _principals, principal);
+        }
+
         if (_session is not null && _daily is not null)
         {
-            return ApplyBoth(decision, _session, _daily);
+            return ApplyBoth(decision, _session, SessionScope, _daily);
         }
 
-        if (TryCharge(_store, decision.Cost, out var charge) is { } failure)
+        return ApplyOne(decision, _store, _scope);
+    }
+
+    private static Decision ApplyOne(Decision decision, IBudgetStore store, string scope)
+    {
+        if (TryCharge(store, decision.Cost, out var charge) is { } failure)
         {
-            return Unavailable(decision, _scope, failure);
+            return Unavailable(decision, scope, failure);
         }
 
-        return charge.Allowed ? decision : Refuse(charge, decision, _scope);
+        return charge.Allowed ? decision : Refuse(charge, decision, scope);
+    }
+
+    /// <remarks>
+    /// A call with no principal under a per-principal budget is refused rather
+    /// than waved through: it cannot happen through the HTTP listener, which
+    /// rejects a request without a valid token, so reaching it means the gate is
+    /// wired wrong - and an uncharged call is a cap that does not hold.
+    /// </remarks>
+    private Decision ApplyPrincipal(Decision decision, PrincipalBudgetStore principals, string? principal)
+    {
+        if (principal is null)
+        {
+            return decision.RefusedBy(
+                DecisionSource.Budget,
+                $"{PrincipalScope}.unidentified",
+                "the call carries no authenticated principal, so the per-principal budget cannot be " +
+                "charged and the call is refused. Stop calling tools and tell the user the guardrails " +
+                "proxy is misconfigured.",
+                $"budget '{PrincipalScope}': no principal -> deny");
+        }
+
+        var own = principals.For(principal);
+
+        return _daily is not null
+            ? ApplyBoth(decision, own, PrincipalScope, _daily)
+            : ApplyOne(decision, own, PrincipalScope);
     }
 
     /// <remarks>
@@ -175,18 +247,21 @@ public sealed class BudgetGate
     /// process behind it, including calls the session cap would refuse at once.
     ///
     /// That leaves one window to close. Between a call's session charge and its
-    /// refund, a concurrent call could see the session full and be refused for
-    /// budget that was never really spent. So a session refusal while other
-    /// charges are still pending is not final: the caller waits for them to
-    /// settle and tries again, and is refused only once nothing is in flight.
-    /// Only a call already at the session cap ever waits, so the common path
-    /// stays lock-free across I/O. Neither cap can be overshot either way: each
-    /// store's own check-and-charge is atomic, and a refund only returns a charge
-    /// this call made.
+    /// refund, a concurrent call on the same store could see it full and be
+    /// refused for budget that was never really spent. So a refusal while other
+    /// charges against that store are still pending is not final: the caller
+    /// waits for them to settle and tries again, and is refused only once
+    /// nothing is in flight. Only a call already at its cap ever waits, and only
+    /// on charges against its own store - for per-principal budgets, the other
+    /// callers' traffic never delays a refusal. Neither cap can be overshot
+    /// either way: each store's own check-and-charge is atomic, and a refund
+    /// only returns a charge this call made.
     /// </remarks>
-    private Decision ApplyBoth(Decision decision, InMemoryBudgetStore session, IBudgetStore daily)
+    private Decision ApplyBoth(Decision decision, InMemoryBudgetStore session, string sessionScope, IBudgetStore daily)
     {
-        lock (_pair)
+        var pairing = _pairings.GetValue(session, static _ => new Pairing());
+
+        lock (pairing)
         {
             while (true)
             {
@@ -194,32 +269,32 @@ public sealed class BudgetGate
 
                 if (sessionCharge.Allowed)
                 {
-                    _pending++;
+                    pairing.Pending++;
                     break;
                 }
 
-                if (_pending == 0)
+                if (pairing.Pending == 0)
                 {
-                    return Refuse(sessionCharge, decision, SessionScope);
+                    return Refuse(sessionCharge, decision, sessionScope);
                 }
 
-                Monitor.Wait(_pair);
+                Monitor.Wait(pairing);
             }
         }
 
         var failure = TryCharge(daily, decision.Cost, out var dailyCharge);
 
-        lock (_pair)
+        lock (pairing)
         {
-            // Refunded inside the same lock that decrements _pending, so a waiter
+            // Refunded inside the same lock that decrements Pending, so a waiter
             // that wakes up sees the refund and the settled count together.
             if (failure is not null || !dailyCharge.Allowed)
             {
                 session.Refund(decision.Cost);
             }
 
-            _pending--;
-            Monitor.PulseAll(_pair);
+            pairing.Pending--;
+            Monitor.PulseAll(pairing);
         }
 
         if (failure is not null)
@@ -304,6 +379,16 @@ public sealed class BudgetGate
     /// </remarks>
     private static string Explain(BudgetCharge charge, string scope) => (scope, charge.Exceeded) switch
     {
+        (PrincipalScope, BudgetDimension.Cost) =>
+            $"this call costs {Number(charge.Requested)} and the identity you call as has already " +
+            $"spent {Number(charge.Used)} of its {Number(charge.Cap)} budget. Stop calling tools and " +
+            "tell the user the budget is exhausted; only they can raise " +
+            $"'budgets.{PrincipalScope}.max_cost', otherwise it resets when the proxy restarts.",
+        (PrincipalScope, _) =>
+            $"the identity you call as has made {Number(charge.Used)} tool calls, which is its limit " +
+            $"of {Number(charge.Cap)}. Stop calling tools and tell the user the budget is exhausted; " +
+            $"only they can raise 'budgets.{PrincipalScope}.max_calls', otherwise it resets when the " +
+            "proxy restarts.",
         (DailyScope, BudgetDimension.Cost) =>
             $"this call costs {Number(charge.Requested)} and {Number(charge.Used)} of today's " +
             $"{Number(charge.Cap)} budget is already spent (days are UTC). Stop calling tools " +
@@ -331,4 +416,16 @@ public sealed class BudgetGate
     /// with the operator's locale makes the audit log harder to grep for no gain.
     /// </remarks>
     private static string Number(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>The lock and in-flight count for one in-memory store. See ApplyBoth.</summary>
+    /// <remarks>
+    /// A plain class used as its own monitor rather than System.Threading.Lock,
+    /// because ApplyBoth needs Monitor.Wait/PulseAll, which Lock does not offer.
+    /// Never held across a call into the daily store.
+    /// </remarks>
+    private sealed class Pairing
+    {
+        /// <summary>Charges against the store whose daily charge has not settled yet.</summary>
+        public int Pending;
+    }
 }

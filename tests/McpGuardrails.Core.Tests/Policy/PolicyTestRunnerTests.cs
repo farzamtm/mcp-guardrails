@@ -252,4 +252,68 @@ public sealed class PolicyTestRunnerTests
 
         Assert.Empty(report.Cases);
     }
+
+    [Fact]
+    public void ACase_CanNameTheCaller()
+    {
+        const string policy = """
+            access:
+              oauth:
+                issuer: https://login.example.com
+                audience: api://mcp-guardrails
+            rules:
+              - name: ops-write
+                match: { server: fs, groups: [ops] }
+                decision: allow
+              - name: alice-write
+                match: { server: fs, principal: alice }
+                decision: allow
+              - name: nobody-else
+                decision: deny
+            """;
+
+        var report = Run("""
+            policy: p.yaml
+            tools: { fs__write: {} }
+            cases:
+              - call: fs__write
+                principal: bob
+                groups: [ops]
+                expect: allow
+                rule: ops-write
+              - call: fs__write
+                principal: alice
+                expect: allow
+                rule: alice-write
+              - call: fs__write
+                expect: deny
+                rule: nobody-else
+              - call: fs__nope
+                unknown: true
+                principal: alice
+                expect: deny
+            """, policy);
+
+        Assert.Empty(report.Failures);
+    }
+
+    [Theory]
+    [InlineData("fs__write", "")]
+    [InlineData("fs__nope", "unknown: true")]
+    public void GroupsWithoutAPrincipal_AreRefused(string call, string unknown)
+    {
+        // No validated token has groups but no principal, so such a case would
+        // test a caller the proxy can never see.
+        var ex = Assert.Throws<PolicyException>(() => Run($$"""
+            policy: p.yaml
+            tools: { fs__write: {} }
+            cases:
+              - call: {{call}}
+                {{unknown}}
+                groups: [ops]
+                expect: deny
+            """));
+
+        Assert.Contains("'groups:' without 'principal:'", ex.Message, StringComparison.Ordinal);
+    }
 }

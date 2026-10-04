@@ -22,7 +22,7 @@ internal enum MatchState
 /// so <c>--explain</c> can name it.
 /// </summary>
 /// <param name="State">Matched, not matched, or undecidable.</param>
-/// <param name="Condition">The deciding condition: tool, server, annotations or argument.</param>
+/// <param name="Condition">The deciding condition: tool, server, principal, groups, annotations or argument.</param>
 /// <param name="Detail">
 /// The argument path, when the deciding condition was a predicate. A reference to
 /// the rule's own string, never a newly built one.
@@ -63,6 +63,8 @@ internal static class RuleMatcher
 {
     internal const string ToolCondition = "tool";
     internal const string ServerCondition = "server";
+    internal const string PrincipalCondition = "principal";
+    internal const string GroupsCondition = "groups";
     internal const string AnnotationsCondition = "annotations";
     internal const string ArgumentCondition = "argument";
 
@@ -79,6 +81,24 @@ internal static class RuleMatcher
             (facts.Server is not { } server || !GlobMatcher.IsMatch(serverPattern, server)))
         {
             return MatchOutcome.Failed(ServerCondition);
+        }
+
+        // No caller - stdio, or HTTP without access.oauth - matches no identity
+        // condition, for the same reason no server matches no server pattern.
+        // Case-insensitive, unlike tool names: principals are often email
+        // addresses or UPNs, which identity providers emit in whatever case the
+        // account was created with, and a deny rule for "*@contractor.example"
+        // that missed "bob@Contractor.Example" would fail open.
+        if (match.Principal is { } principalPattern &&
+            (facts.Principal is not { } principal || !GlobMatcher.IsMatch(principalPattern, principal, ignoreCase: true)))
+        {
+            return MatchOutcome.Failed(PrincipalCondition);
+        }
+
+        if (match.Groups is { } groups &&
+            !groups.Any(group => facts.EffectiveGroups.Contains(group, StringComparer.Ordinal)))
+        {
+            return MatchOutcome.Failed(GroupsCondition);
         }
 
         if (match.Annotations is { } annotations &&

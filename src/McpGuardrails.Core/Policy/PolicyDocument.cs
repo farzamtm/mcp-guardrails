@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Scanners;
@@ -77,6 +78,17 @@ public sealed record PolicyDocument
     /// <summary>The scanner section, or the defaults when the file omits it.</summary>
     [JsonIgnore]
     public ScannerPolicy EffectiveScanners => Scanners ?? ScannerPolicy.Default;
+
+    /// <summary>
+    /// Who may reach the proxy over HTTP, or null for the static bearer token.
+    /// </summary>
+    /// <remarks>Nullable for the same reason as <see cref="Budgets"/>.</remarks>
+    [JsonPropertyName("access")]
+    public AccessPolicy? Access { get; init; }
+
+    /// <summary>The access section, or an empty one when the file omits it.</summary>
+    [JsonIgnore]
+    public AccessPolicy EffectiveAccess => Access ?? AccessPolicy.None;
 
     /// <summary>An empty policy: everything allowed, nothing configured.</summary>
     public static PolicyDocument Empty { get; } = new();
@@ -234,10 +246,10 @@ public sealed record PolicyRule
 /// The conditions of a rule. All specified conditions must hold (logical AND).
 /// </summary>
 /// <remarks>
-/// Four kinds of condition, deliberately ordered cheapest-first in
-/// <see cref="RuleMatcher"/>: a tool-name glob, a server-name glob, the tool's
-/// advertised behaviour hints, and predicates over the arguments the model
-/// supplied. Most rules never get past the name.
+/// Five kinds of condition, deliberately ordered cheapest-first in
+/// <see cref="RuleMatcher"/>: a tool-name glob, a server-name glob, the caller's
+/// identity, the tool's advertised behaviour hints, and predicates over the
+/// arguments the model supplied. Most rules never get past the name.
 /// </remarks>
 public sealed record PolicyMatch
 {
@@ -276,6 +288,31 @@ public sealed record PolicyMatch
     [JsonPropertyName("server")]
     public string? Server { get; init; }
 
+    /// <summary>
+    /// The caller's identity, from the access token's principal claim.
+    /// </summary>
+    /// <remarks>
+    /// A glob, like <see cref="Tool"/>. Only HTTP calls authenticated through
+    /// <c>access.oauth</c> have a principal; for any other call the condition
+    /// never matches, the same way <see cref="Server"/> never matches an unknown
+    /// tool. A policy using it without <c>access.oauth</c> is refused at load,
+    /// because a deny rule that can never match is a guardrail that is not there.
+    /// </remarks>
+    [JsonPropertyName("principal")]
+    public string? Principal { get; init; }
+
+    /// <summary>
+    /// Groups, from the access token's groups claim; the caller must be in at
+    /// least one.
+    /// </summary>
+    /// <remarks>Exact, case-sensitive names. Requires <c>access.oauth</c>, like <see cref="Principal"/>.</remarks>
+    [JsonPropertyName("groups")]
+    public IReadOnlyList<string>? Groups { get; init; }
+
+    /// <summary>True when the match keys on who is calling.</summary>
+    [JsonIgnore]
+    public bool UsesIdentity => Principal is not null || Groups is not null;
+
     /// <summary>Behaviour hints the tool must advertise, if any.</summary>
     [JsonPropertyName("annotations")]
     public AnnotationMatch? Annotations { get; init; }
@@ -298,7 +335,7 @@ public sealed record PolicyMatch
     /// </remarks>
     [JsonIgnore]
     public bool IsCatchAll =>
-        Tool is null && Server is null && Annotations is null && Arguments is null;
+        Tool is null && Server is null && !UsesIdentity && Annotations is null && Arguments is null;
 
     internal void Validate(string ruleName)
     {
@@ -314,6 +351,20 @@ public sealed record PolicyMatch
             throw new PolicyException(
                 $"Rule '{ruleName}' has an empty 'server'. " +
                 "Omit the field entirely to match tools from every server.");
+        }
+
+        if (Principal is not null && string.IsNullOrWhiteSpace(Principal))
+        {
+            throw new PolicyException(
+                $"Rule '{ruleName}' has an empty 'principal'. " +
+                "Omit the field entirely to match every caller.");
+        }
+
+        if (Groups is not null && (Groups.Count == 0 || Groups.Any(string.IsNullOrWhiteSpace)))
+        {
+            throw new PolicyException(
+                $"Rule '{ruleName}' has an empty 'groups' list or an empty group name. " +
+                "Omit the field entirely to match regardless of groups.");
         }
 
         Annotations?.Validate(ruleName);
