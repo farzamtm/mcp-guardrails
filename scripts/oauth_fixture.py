@@ -126,6 +126,9 @@ class FixtureIssuer:
         self.clients: dict[str, list[str]] = {}
         self.codes: dict[str, dict] = {}
         self.refresh_tokens: set[str] = set()
+        #: False answers a refresh without a new refresh_token, as servers that
+        #: do not rotate them may (RFC 6749 section 6).
+        self.rotate_refresh_tokens = True
         self.token_requests: dict[str, int] = {
             "authorization_code": 0,
             "refresh_token": 0,
@@ -250,21 +253,23 @@ class FixtureIssuer:
         else:
             return 400, {"error": "unsupported_grant_type"}
 
-        refresh = secrets.token_urlsafe(24)
-        self.refresh_tokens.add(refresh)
         access = self.token(
             self.LOGIN_SUBJECT,
             audience=self.audience,
             scope="mcp.tools",
             expires_in=self.access_token_lifetime,
         )
-        return 200, {
+        response = {
             "access_token": access,
             "token_type": "Bearer",
             "expires_in": self.access_token_lifetime,
-            "refresh_token": refresh,
             "scope": "mcp.tools",
         }
+        if grant == "authorization_code" or self.rotate_refresh_tokens:
+            refresh = secrets.token_urlsafe(24)
+            self.refresh_tokens.add(refresh)
+            response["refresh_token"] = refresh
+        return 200, response
 
     def revoke_refresh_tokens(self) -> None:
         self.refresh_tokens.clear()

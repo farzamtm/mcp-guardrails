@@ -302,6 +302,34 @@ public sealed class UpstreamRegistryTests
     }
 
     [Fact]
+    public async Task ConnectAsync_StartsWithoutARequiredServerWhoseTokenStoreIsLocked()
+    {
+        // A locked keychain is one server's problem, not the proxy's: the rest
+        // are served, and the OAuth server's tools say what to do.
+        await using var server = InMemoryMcpServer.Start("fixture", EchoTool());
+        var serving = UpstreamOAuth.ServingTransports(new Tests.UpstreamAuth.FailingTokenStore());
+        var remote = new UpstreamServerConfig
+        {
+            Name = "linear",
+            Transport = UpstreamTransport.Http,
+            Url = new Uri("https://mcp.example.com/mcp"),
+            OAuth = new UpstreamOAuthSettings([]),
+        };
+
+        UpstreamTransportFactory factory = (config, logging) => config.OAuth is null
+            ? server.TransportFactory(config, logging)
+            : serving(config, logging);
+
+        await using var registry = await UpstreamRegistry.ConnectAsync(
+            [Config("fs"), remote], NullLoggerFactory.Instance, factory);
+
+        Assert.Contains(registry.Connections, c => c.Name == "fs");
+        var missing = Assert.Single(registry.Unavailable);
+        Assert.Equal("linear", missing.Name);
+        Assert.Contains("could not be read", missing.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TryGetUnavailable_FindsTheServerByTheToolsPrefix()
     {
         await using var server = InMemoryMcpServer.Start("fixture", EchoTool());

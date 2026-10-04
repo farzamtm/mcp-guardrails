@@ -151,6 +151,7 @@ internal sealed class AuthCommand : ICliCommand
             (status.ExpiresAt is { } expires ? $", access token expires {expires.ToUniversalTime():u}" : string.Empty) +
             (status.CanRefresh ? ", refreshed automatically" : ", no refresh token: log in again when it expires"),
         LoginState.OtherUrl => "logged in at a different URL; those tokens are not used. Run 'auth login' again",
+        LoginState.Unreadable when status.Problem is { } problem => $"the token store could not be read ({problem})",
         LoginState.Unreadable => "the stored login cannot be read. Run 'auth login' again",
         _ => "not logged in",
     };

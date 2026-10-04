@@ -42,17 +42,20 @@ public static class UpstreamOAuth
         ArgumentNullException.ThrowIfNull(store);
 
         var oauth = config.OAuth ?? throw new ArgumentException($"Server '{config.Name}' has no OAuth settings.", nameof(config));
-        var cache = new StoredTokenCache(store, config.Name, config.Url!);
+        var cache = new StoredTokenCache(store, config.Name, config.Url!) { ForServing = true };
 
         // Checked before connecting rather than left to the SDK: with no tokens it
         // would register a new client with the authorization server on every
         // start, only to stop at the step that needs a person.
-        switch (cache.Status().State)
+        var status = cache.Status();
+        switch (status.State)
         {
             case LoginState.None:
                 throw new UpstreamLoginRequiredException(config.Name, "has never been logged in");
             case LoginState.OtherUrl:
                 throw new UpstreamLoginRequiredException(config.Name, "was logged in at a different URL");
+            case LoginState.Unreadable when status.Problem is { } problem:
+                throw new UpstreamLoginRequiredException(config.Name, $"has a stored login that could not be read ({problem})");
             case LoginState.Unreadable:
                 throw new UpstreamLoginRequiredException(config.Name, "has a stored login this proxy cannot read");
         }

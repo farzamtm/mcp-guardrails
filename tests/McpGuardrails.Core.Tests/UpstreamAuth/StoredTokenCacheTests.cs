@@ -17,6 +17,25 @@ internal sealed class MemoryTokenStore : ITokenStore
     public bool Delete(string server) => Items.Remove(server);
 }
 
+/// <summary>A token store whose reads or writes fail the way a locked keychain does.</summary>
+internal sealed class FailingTokenStore(bool reads = true, bool writes = true) : ITokenStore
+{
+    public string Description => "a locked keychain";
+
+    public string? Read(string server) =>
+        reads ? throw new TokenStoreException("Cannot read the macOS Keychain: security exited 51 (locked).") : null;
+
+    public void Write(string server, string secret)
+    {
+        if (writes)
+        {
+            throw new TokenStoreException("Cannot write the macOS Keychain: security exited 51 (locked).");
+        }
+    }
+
+    public bool Delete(string server) => false;
+}
+
 public sealed class StoredTokenCacheTests
 {
     private static readonly Uri _url = new("https://mcp.example.com/mcp");
@@ -128,6 +147,83 @@ public sealed class StoredTokenCacheTests
 
         await login.StoreTokensAsync(Tokens(refresh: "refresh-2"));
         Assert.Equal("refresh-2", (await login.GetTokensAsync())!.RefreshToken);
+    }
+
+    [Fact]
+    public async Task ARefreshWithoutANewRefreshToken_KeepsTheOldOne()
+    {
+        // RFC 6749 section 6: a server that does not rotate refresh tokens leaves
+        // refresh_token out of the refresh response, and the SDK hands that over
+        // as null. Dropping the stored one would end the login an hour later.
+        var store = new MemoryTokenStore();
+        await new StoredTokenCache(store, "linear", _url).StoreTokensAsync(Tokens(refresh: "refresh-1"));
+
+        var serving = new StoredTokenCache(store, "linear", _url);
+        await serving.StoreTokensAsync(Tokens(refresh: null));
+
+        Assert.Equal("refresh-1", (await serving.GetTokensAsync())!.RefreshToken);
+        Assert.True(serving.Status().CanRefresh);
+    }
+
+    [Fact]
+    public async Task ARotatedRefreshToken_ReplacesTheOldOne()
+    {
+        var store = new MemoryTokenStore();
+        await new StoredTokenCache(store, "linear", _url).StoreTokensAsync(Tokens(refresh: "refresh-1"));
+
+        var serving = new StoredTokenCache(store, "linear", _url);
+        await serving.StoreTokensAsync(Tokens(refresh: "refresh-2"));
+
+        Assert.Equal("refresh-2", (await serving.GetTokensAsync())!.RefreshToken);
+    }
+
+    [Fact]
+    public async Task ARefreshTokenIsNeverCarriedOver_FromAnotherUrlOrIntoAFreshLogin()
+    {
+        var store = new MemoryTokenStore();
+        await new StoredTokenCache(store, "linear", new Uri("https://old.example.com/mcp")).StoreTokensAsync(Tokens(refresh: "old"));
+
+        var moved = new StoredTokenCache(store, "linear", _url);
+        await moved.StoreTokensAsync(Tokens(refresh: null));
+        Assert.Null((await moved.GetTokensAsync())!.RefreshToken);
+
+        await new StoredTokenCache(store, "linear", _url).StoreTokensAsync(Tokens(refresh: "refresh-1"));
+        var login = new StoredTokenCache(store, "linear", _url, ignoreStored: true);
+        await login.StoreTokensAsync(Tokens(refresh: null));
+        Assert.Null((await login.GetTokensAsync())!.RefreshToken);
+    }
+
+    [Fact]
+    public async Task AStoreThatCannotBeRead_IsNoLogin_AndSaysWhy()
+    {
+        var cache = new StoredTokenCache(new FailingTokenStore(), "linear", _url);
+
+        Assert.Null(await cache.GetTokensAsync());
+        var status = cache.Status();
+        Assert.Equal(LoginState.Unreadable, status.State);
+        Assert.Contains("locked", status.Problem, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AFailedWrite_WhenServing_NeedsANewLogin()
+    {
+        // Mid-session, a refresh whose tokens cannot be saved becomes the
+        // "run auth login" tool error rather than an exception out of the SDK.
+        var serving = new StoredTokenCache(new FailingTokenStore(reads: false), "linear", _url) { ForServing = true };
+
+        var ex = await Assert.ThrowsAsync<UpstreamLoginRequiredException>(
+            async () => await serving.StoreTokensAsync(Tokens()));
+
+        Assert.Contains("could not save its refreshed tokens", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("auth login linear", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AFailedWrite_DuringALogin_IsTheStoresOwnError()
+    {
+        var login = new StoredTokenCache(new FailingTokenStore(reads: false), "linear", _url, ignoreStored: true);
+
+        await Assert.ThrowsAsync<TokenStoreException>(async () => await login.StoreTokensAsync(Tokens()));
     }
 
     [Fact]
