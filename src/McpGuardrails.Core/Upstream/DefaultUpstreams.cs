@@ -4,10 +4,12 @@ namespace McpGuardrails.Core.Upstream;
 /// The downstream servers the proxy connects to.
 /// </summary>
 /// <remarks>
-/// Fixed in code: there is no configuration file for upstream servers, and the
-/// policy file deliberately does not describe them - it says what calls may do,
-/// not where they go. The one server is sandboxed by its own launch arguments,
-/// so the policy is a layer above that containment rather than the only one.
+/// Used when there is no servers file, so a proxy started with no configuration
+/// at all still does something useful - and so existing launcher configs, written
+/// before the servers file existed, keep working. The policy file deliberately
+/// does not describe servers - it says what calls may do, not where they go. The
+/// one server is sandboxed by its own launch arguments, so the policy is a layer
+/// above that containment rather than the only one.
 /// </remarks>
 public static class DefaultUpstreams
 {
@@ -35,18 +37,19 @@ public static class DefaultUpstreams
     /// <summary>
     /// The official filesystem server, sandboxed to a scratch directory.
     /// </summary>
-    public static IReadOnlyList<UpstreamServerConfig> Create(string sandboxPath) =>
-    [
-        new UpstreamServerConfig
-        {
-            Name = "fs",
-            Command = "npx",
-            Arguments =
-            [
-                "-y",
-                $"{FilesystemServerPackage}@{FilesystemServerVersion}",
-                sandboxPath,
-            ],
-        },
-    ];
+    public static IReadOnlyList<UpstreamServerConfig> Create(string sandboxPath)
+    {
+        string[] arguments = ["-y", $"{FilesystemServerPackage}@{FilesystemServerVersion}", sandboxPath];
+
+        return
+        [
+            new UpstreamServerConfig
+            {
+                Name = "fs",
+                Command = "npx",
+                Arguments = arguments,
+                DisplayTemplate = ServersLoader.DisplayCommandLine("npx", arguments),
+            },
+        ];
+    }
 }

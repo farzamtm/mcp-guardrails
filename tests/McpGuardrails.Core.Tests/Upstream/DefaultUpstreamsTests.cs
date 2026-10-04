@@ -1,5 +1,6 @@
 using McpGuardrails.Core.Upstream;
 using Microsoft.Extensions.Logging.Abstractions;
+using ModelContextProtocol.Client;
 
 namespace McpGuardrails.Core.Tests.Upstream;
 
@@ -17,6 +18,9 @@ public sealed class DefaultUpstreamsTests
 
         Assert.Equal("fs", config.Name);
         Assert.Equal("npx", config.Command);
+        Assert.Equal(
+            "npx -y @modelcontextprotocol/server-filesystem@2026.8.31 /tmp/sandbox",
+            config.DisplayTemplate);
     }
 
     [Fact]
@@ -59,10 +63,10 @@ public sealed class DefaultUpstreamsTests
     }
 }
 
-public sealed class StdioTransportFactoryTests
+public sealed class TransportFactoryTests
 {
     [Fact]
-    public void CreateStdioTransport_MapsConfigOntoTheTransport()
+    public void StdioOptions_MapsEveryFieldOntoTheLaunchOptions()
     {
         var config = new UpstreamServerConfig
         {
@@ -70,25 +74,83 @@ public sealed class StdioTransportFactoryTests
             Command = "npx",
             Arguments = ["-y", "server-filesystem", "/tmp"],
             EnvironmentVariables = new Dictionary<string, string?> { ["TOKEN"] = "secret" },
+            InheritEnvironment = false,
+            WorkingDirectory = "/srv",
+            ShutdownTimeout = TimeSpan.FromSeconds(9),
         };
 
-        var transport = UpstreamRegistry.CreateStdioTransport(
-            config, NullLoggerFactory.Instance);
+        var options = UpstreamRegistry.StdioOptions(config);
 
-        Assert.NotNull(transport);
-        Assert.Equal("fs", transport.Name);
+        Assert.Equal("fs", options.Name);
+        Assert.Equal("npx", options.Command);
+        Assert.Equal(["-y", "server-filesystem", "/tmp"], options.Arguments);
+        Assert.Equal("secret", options.EnvironmentVariables!["TOKEN"]);
+        // The switch that keeps the proxy's own secrets out of the child: a
+        // mapping that dropped it would quietly undo env_isolation.
+        Assert.False(options.InheritEnvironmentVariables);
+        Assert.Equal("/srv", options.WorkingDirectory);
+        Assert.Equal(TimeSpan.FromSeconds(9), options.ShutdownTimeout);
     }
 
     [Fact]
-    public void CreateStdioTransport_HandlesAbsentEnvironmentVariables()
+    public void StdioOptions_KeepsTheSdkDefaultsWhenTheConfigIsBare()
     {
         // EnvironmentVariables is nullable; the null-conditional ToDictionary must
         // not blow up when a config omits it (which most do).
-        var config = new UpstreamServerConfig { Name = "fs", Command = "npx" };
+        var options = UpstreamRegistry.StdioOptions(new UpstreamServerConfig { Name = "fs", Command = "npx" });
 
-        var transport = UpstreamRegistry.CreateStdioTransport(
-            config, NullLoggerFactory.Instance);
+        Assert.Null(options.EnvironmentVariables);
+        Assert.True(options.InheritEnvironmentVariables);
+        Assert.Equal(new StdioClientTransportOptions { Command = "x" }.ShutdownTimeout, options.ShutdownTimeout);
+    }
 
-        Assert.NotNull(transport);
+    [Theory]
+    [InlineData(UpstreamTransport.Http, HttpTransportMode.StreamableHttp)]
+    [InlineData(UpstreamTransport.Sse, HttpTransportMode.Sse)]
+    public void HttpOptions_NamesTheTransportModeExplicitly(UpstreamTransport transport, HttpTransportMode expected)
+    {
+        // Never AutoDetect: its silent fallback to SSE is a downgrade nobody chose.
+        var options = UpstreamRegistry.HttpOptions(new UpstreamServerConfig
+        {
+            Name = "docs",
+            Transport = transport,
+            Url = new Uri("https://mcp.example.com/mcp"),
+            Headers = new Dictionary<string, string> { ["Authorization"] = "Bearer t" },
+        });
+
+        Assert.Equal(expected, options.TransportMode);
+        Assert.Equal(new Uri("https://mcp.example.com/mcp"), options.Endpoint);
+        Assert.Equal("Bearer t", options.AdditionalHeaders!["authorization"]);
+    }
+
+    [Fact]
+    public void HttpOptions_AllowsNoHeaders()
+    {
+        var options = UpstreamRegistry.HttpOptions(new UpstreamServerConfig
+        {
+            Name = "docs",
+            Transport = UpstreamTransport.Http,
+            Url = new Uri("https://mcp.example.com/mcp"),
+        });
+
+        Assert.Null(options.AdditionalHeaders);
+    }
+
+    [Fact]
+    public async Task CreateTransport_PicksTheTransportForTheConfig()
+    {
+        var stdio = UpstreamRegistry.CreateTransport(
+            new UpstreamServerConfig { Name = "fs", Command = "npx" }, NullLoggerFactory.Instance);
+        await using var http = (HttpClientTransport)UpstreamRegistry.CreateTransport(
+            new UpstreamServerConfig
+            {
+                Name = "docs",
+                Transport = UpstreamTransport.Http,
+                Url = new Uri("https://mcp.example.com/mcp"),
+            },
+            NullLoggerFactory.Instance);
+
+        Assert.IsType<StdioClientTransport>(stdio);
+        Assert.Equal("docs", http.Name);
     }
 }

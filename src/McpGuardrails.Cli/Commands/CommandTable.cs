@@ -32,6 +32,10 @@ internal static class CommandTable
     private static readonly (string Name, Func<ICliCommand> Create)[] _commands =
     [
         ("list-upstream", () => new ListUpstreamCommand()),
+        ("validate", () => new ValidateCommand()),
+        ("import", () => new ImportCommand()),
+        ("wrap", () => new WrapCommand()),
+        ("unwrap", () => new UnwrapCommand()),
     ];
 
     /// <summary>Runs the named subcommand, or serves when none is named.</summary>

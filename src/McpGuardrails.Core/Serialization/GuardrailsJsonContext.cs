@@ -5,6 +5,7 @@ using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
+using McpGuardrails.Core.Upstream;
 
 namespace McpGuardrails.Core.Serialization;
 
@@ -70,4 +71,10 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(SecretResultAction))]
 [JsonSerializable(typeof(ClassifierSettings))]
 [JsonSerializable(typeof(ClassifierMode))]
+// The servers file, bound the same way as the policy. Unknown keys are refused
+// per type with [JsonUnmappedMemberHandling] on the records themselves, because
+// a misspelt option in the file that decides what the proxy launches must not be
+// skipped quietly.
+[JsonSerializable(typeof(ServerDefaultsDocument))]
+[JsonSerializable(typeof(ServerEntryDocument))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;
