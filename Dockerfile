@@ -39,6 +39,9 @@ RUN case "$TARGETARCH" in \
  && dotnet restore src/McpGuardrails.Cli -p:RuntimeIdentifier="$(cat /tmp/rid)"
 
 COPY src/ src/
+# The policy packs are compiled into the binary as resources; the build fails
+# without them rather than shipping an init with nothing to offer.
+COPY packs/ packs/
 # README, LICENSE and NOTICE are referenced by the project as package content.
 COPY README.md LICENSE NOTICE ./
 RUN dotnet publish src/McpGuardrails.Cli \

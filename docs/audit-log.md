@@ -13,6 +13,26 @@ Default location `~/.mcp-guardrails/audit.jsonl`, overridable with `GUARDRAILS_A
  "duration_ms":5.87,"is_error":false}
 ```
 
+Each downstream server is recorded once at startup, when serving begins, with
+what it was launched from. `identity` is the command line or URL as written in
+the [servers file](servers.md), with `${VAR}` references unexpanded and
+anything secret-shaped masked; `tool` is absent because the line is about a
+server:
+
+```json
+{"ts":"2026-10-04T10:00:00.120000+00:00","event":"upstream_connected","server":"github",
+ "transport":"stdio","tool_count":26,
+ "identity":"docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server",
+ "duration_ms":0,"is_error":false}
+```
+
+`transport` is `stdio`, `http` or `sse`.
+
+```bash
+# Which servers did each session talk to?
+jq -r 'select(.event == "upstream_connected") | [.ts, .server, .transport, .identity] | @tsv' ~/.mcp-guardrails/audit.jsonl
+```
+
 A call whose result matched a scanner carries two more fields. Their absence on a
 forwarded call means the result was clean; their absence on a refused call means
 nothing came back to scan. A third, `scanner_structured_content_withheld`, is
@@ -36,6 +56,29 @@ with the same two fields:
  "duration_ms":0,"is_error":false}
 ```
 
+[Pinning](pins.md) writes its own events at startup and from the `pins`
+commands: `pin_created` when a server is pinned on first use, `pin_changed`
+for each tool that differs from its pin, `pin_removed` for each pinned tool
+that is gone, and `pin_accepted` / `pin_reset` when someone reviews a change.
+`pin_change` says why a tool differs (`changed`, `added` or `identity_changed`)
+and `scanner_action` what was done about it:
+
+```json
+{"ts":"2026-10-04T10:00:00.130000+00:00","event":"pin_changed","tool":"github__create_issue",
+ "server":"github","downstream_tool":"create_issue","pin_change":"changed",
+ "scanner_action":"blocked","duration_ms":0,"is_error":false}
+```
+
+```bash
+# Which tools changed since they were pinned, and what was done about it?
+jq -r 'select(.event == "pin_changed") | [.ts, .tool, .pin_change, .scanner_action] | @tsv' ~/.mcp-guardrails/audit.jsonl
+
+# What was accepted, and when?
+jq -r 'select(.event == "pin_accepted") | [.ts, .tool] | @tsv' ~/.mcp-guardrails/audit.jsonl
+```
+
+These are names and verdicts only, never the text of a definition.
+
 A call that carried or returned a secret says which detectors fired and what
 was done, and its `arguments` hold markers rather than the values:
 
@@ -50,6 +93,30 @@ was done, and its `arguments` hold markers rather than the values:
 `forwarded` is the value to search for: the key is out of the log, but it did
 reach the server. The others are `redacted` and `blocked`; results use
 `result_secrets` and `result_secrets_action` (`redacted` or `blocked`).
+
+A call whose arguments matched an [argument detector](argument-scanning.md)
+names the detectors and what was done:
+
+```json
+{"ts":"2026-10-04T11:02:17.330412+00:00","event":"tool_call","tool":"web__fetch",
+ "server":"web","downstream_tool":"fetch","decision":"allow",
+ "arguments":{"url":"http://169.254.169.254/latest/meta-data/"},
+ "argument_hits":["ssrf"],"argument_hits_action":"audited",
+ "duration_ms":212.4,"is_error":false}
+```
+
+`argument_hits` lists detector names: `ssrf`, `sensitive-path`,
+`path-traversal`, `shell-metachar`, and `argument-too-large` when the arguments
+were too big to read in full. `argument_hits_action` is `audited` (forwarded
+unchanged), `approval` (put to a human; `approval` says what they answered) or
+`blocked` (`rule` is then `arguments.<detector>`). Hits are recorded on refused
+calls too. When an earlier gate had already refused the call there was nothing
+left to do, so `argument_hits_action` is absent.
+
+```bash
+# What would `action: block` have refused? Run this before switching it on.
+jq -r 'select(.argument_hits) | [.ts, .tool, (.argument_hits | join(","))] | @tsv' ~/.mcp-guardrails/audit.jsonl
+```
 
 When the classifier ran, there are up to three more fields:
 

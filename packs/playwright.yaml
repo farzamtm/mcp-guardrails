@@ -1,0 +1,65 @@
+# Pack: playwright — browse and interact freely, approve the steps that run
+# code or move local files into a page, and never open local files or browser
+# internals.
+#
+# Protects: local files, and code execution in the page and in the browser.
+# Allows: navigating to web URLs, clicking, typing, snapshots, screenshots and
+# the other read-only tools.
+# Threat: a page the agent visits carries instructions to upload a local file,
+# run a script, or open file:// URLs to read the disk.
+# Not covered: anything the agent types into a page leaves the machine. That is
+# the point of a browser agent; review what it is asked to do.
+# https://github.com/farzamtm/mcp-guardrails/blob/main/docs/threat-model.md#a1-malicious-tool-result--indirect-prompt-injection
+pack:
+  name: playwright
+  version: 1
+  description: Browse freely, approve uploads and scripts, never open local files.
+  recognizes:
+    - "@playwright/mcp"
+    - mcr.microsoft.com/playwright/mcp
+
+rules:
+  - name: "{{server}}-no-unsafe-code"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__browser_run_code_unsafe"
+    decision: deny
+    message: >-
+      Running arbitrary code in the browser is disabled. Use the page
+      interaction tools instead.
+
+  - name: "{{server}}-no-local-urls"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.url
+          matches: '(?i)^\s*(file|chrome|chrome-extension|about|view-source|data|javascript|blob):'
+    decision: deny
+    message: >-
+      Only web URLs can be opened. Local files and browser-internal pages are
+      off-limits to the agent.
+
+  - name: "{{server}}-approve-scripts"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__browser_evaluate"
+    decision: require_approval
+    message: >-
+      Running JavaScript in the page needs the user's approval. If it is
+      declined, use the snapshot and interaction tools instead.
+
+  - name: "{{server}}-approve-uploads"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__browser_file_upload"
+    decision: require_approval
+    message: >-
+      Uploading a local file to a web page needs the user's approval. If it is
+      declined, do not retry.
+
+  # Every other tool is browsing itself: clicks, typing, navigation, tabs.
+  # Asking about each would make the server unusable.
+  - name: "{{server}}-browse"
+    match:
+      server: "{{server}}"
+    decision: allow

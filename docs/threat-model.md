@@ -47,15 +47,20 @@ This is the long version.
 | **Proxy ↔ downstream server** | `tools/list` once at startup, `tools/call` per call, results back | Semi-trusted. The proxy spawns the server, so it starts it, but does not sandbox it; it gates what is *asked* of the server and labels what comes back. |
 | **Tool results** | Text, structured content, embedded resources | **Untrusted.** Anything a server returns may have been written by a third party — a README, a database row, a fetched page. This is the primary attack the project targets. |
 | **Tool metadata** | Names, descriptions, input schemas, annotations from `tools/list` | **Untrusted.** Scanned once at startup with the result heuristics; a flagged tool is advertised with a warning in its description or, under `block`, withheld and refused. Annotations are still taken at face value. See [tool metadata](#tool-metadata-is-scanned-not-verified). |
+| **Proxy ↔ remote server** | The same, over Streamable HTTP or SSE, with the static headers from the servers file | Semi-trusted, like a stdio server, and reached over the network: https is required except to loopback, redirects are not followed (a 3xx would carry the `Authorization` header elsewhere), and the transport is never auto-detected, so nothing silently downgrades to SSE. |
+| **Servers file** | Read once at startup from `--servers`, `GUARDRAILS_SERVERS` or `~/.mcp-guardrails/servers.yaml` ([servers.md](servers.md)) | Trusted, and **it is code execution**: whoever can write it chooses what the proxy launches and where it sends headers. Unknown keys are errors, unset variables stop the start, and on Unix the proxy warns when the file is group- or world-writable. |
 | **Policy file** | Read once at startup from `GUARDRAILS_POLICY` or `~/.mcp-guardrails/policy.yaml` | Trusted. Anyone who can write it has already won. |
+| **Pins file** | Read at startup, written on a server's first use and by `pins accept` / `pins reset`, at `GUARDRAILS_PINS`, `scanners.pins.file` or `~/.mcp-guardrails/pins.json` ([pins.md](pins.md)) | Trusted: whoever can write it can accept any tool change. A file that exists but cannot be parsed stops the proxy rather than being re-pinned from what the servers serve now. |
 | **Audit log** | Appended to `GUARDRAILS_AUDIT` or `~/.mcp-guardrails/audit.jsonl` | Trusted by whoever reads it, protected only by filesystem permissions. |
-| **Environment** | `GUARDRAILS_*` variables; inherited by every spawned server | Trusted. |
+| **Environment** | `GUARDRAILS_*` variables, API keys, other servers' tokens | Trusted. Under `env_isolation: true` a stdio server receives only an allowlist, its `env_passthrough` and its own `env`; otherwise it inherits everything, which this release warns about at startup. See [environment isolation](servers.md#environment-isolation). |
 
 Wiring for all of this is in
 [`src/McpGuardrails.Cli/Commands/ServeCommand.cs`](../src/McpGuardrails.Cli/Commands/ServeCommand.cs). The
-filter order — audit outermost, then policy/approval/budget, then the scanner
-innermost — is the security design, and the comments there explain each
-position.
+filter order — audit outermost, then policy, the tool metadata and pin gates,
+the secret and argument scanners, approval and budget, then the result scanner
+innermost — is the security design, and the comments in
+[`GuardrailsCallPipeline`](../src/McpGuardrails.Core/Pipeline/GuardrailsCallPipeline.cs)
+explain each position.
 
 ## Attackers
 
@@ -92,16 +97,20 @@ send it somewhere, call a destructive tool, hide what it did from the user.
   acts on it, and acting means another `tools/call`. That call still goes
   through policy, approval and budget like any other. A policy that denies the
   egress tool, or requires approval for anything destructive, holds even when
-  the model has been fully talked round. This is the stronger defence of the
-  two; the scanner is the early warning.
+  the model has been fully talked round. The [argument detectors](argument-scanning.md)
+  look at that next call too, for the shapes an injection usually asks for: a
+  fetch of the cloud metadata address, a read of `~/.ssh/id_rsa`. This is the
+  stronger defence of the two; the scanner is the early warning.
 
 **What still gets through:** most things a careful attacker writes. See
 [scanner gaps](#the-scanner-is-a-label-not-a-filter).
 
 ### A2. Compromised or malicious downstream server
 
-**Who:** the author of an MCP server, or whoever compromised its package. Note
-the default upstream is fetched with `npx -y @modelcontextprotocol/server-filesystem@<version>`,
+**Who:** the author of an MCP server, or whoever compromised its package. With
+a servers file this is every server listed in it; `validate` and `import` warn
+about `npx`/`uvx` launches without a pinned version. Note the default upstream
+(used when there is no servers file) is fetched with `npx -y @modelcontextprotocol/server-filesystem@<version>`,
 pinned to one exact release
 ([`DefaultUpstreams.FilesystemServerVersion`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)),
 so a newly published version is not picked up silently on the next start. The
@@ -141,7 +150,27 @@ hash checking what npm serves for it.
   it, as a scanner decision before approval, so a stale client list or a guessed
   name does not reach it. Each flagged tool is logged once at startup, to stderr
   and as a `tool_metadata` audit line.
-- **The audit log** records every call it received and how long it took.
+- **Pinned definitions**
+  ([`ToolPinGate`](../src/McpGuardrails.Core/Pins/ToolPinGate.cs),
+  [`PinCheck`](../src/McpGuardrails.Core/Pins/PinCheck.cs)). Every server's tool
+  definitions are hashed on first use and compared on every later start, so an
+  update that changes a description, a schema or an annotation — a rug pull —
+  is noticed even when it does not look like an injection, and so is a server
+  name that now launches a different program. Under `warn` (the default) the
+  changed tool carries a warning; under `block` it is withheld and refused
+  until someone runs `pins accept`. Pins never update themselves after first
+  use.
+- **Environment isolation**
+  ([`EnvironmentIsolation`](../src/McpGuardrails.Core/Upstream/EnvironmentIsolation.cs)).
+  With `env_isolation: true` a stdio server starts with only the variables
+  programs need to run, plus what the servers file passes to it by name, so it
+  never sees the classifier's API key, the HTTP bearer token or another server's
+  token. Opt-in for this release, with a startup warning listing the variable
+  names a server would lose; it becomes the default later.
+- **The audit log** records every call it received and how long it took, an
+  `upstream_connected` line per server at startup naming what was launched (the
+  unexpanded template), so a later edit to the servers file shows up, and a
+  `pin_changed` line for every tool that differs from its pin.
 
 **What it can still do:** see [what a downstream server can still do](#what-a-downstream-server-can-still-do).
 
@@ -197,6 +226,23 @@ the fastest route to "clean up the repo" is `rm`.
   so no rule can refund budget, and `cost: 0` calls still count against
   `max_calls` so a free tool is not an unbounded loop. The refusal tells the
   model to stop rather than try another route.
+- **Argument detectors** —
+  [`ArgumentGate`](../src/McpGuardrails.Core/Scanners/ArgumentGate.cs),
+  [`ArgumentScanner`](../src/McpGuardrails.Core/Scanners/ArgumentScanner.cs).
+  Built-in checks for the attack shapes a policy author may not think to write
+  a rule for: internal addresses (`ssrf`, decoding decimal, octal, hex,
+  zero-padded and IPv6-embedded forms, and applying the clean-up a URL parser
+  does first: deleting tabs and newlines, folding full-width and enclosed
+  characters, reading userinfo up to the last `@`), credential files
+  (`sensitive-path`, resolving `.` and `..` segments and Windows trailing dots),
+  `..` in any encoding (`path-traversal`), and shell metacharacters in command
+  arguments (`shell-metachar`). Hits name argument keys only when they are
+  plain identifiers, so a key the model wrote cannot put words into an
+  approval question or the audit log. Linear-time, no regex. They run after the policy and
+  before approval, and an explicit policy `allow` does not silence them; only
+  an override in `scanners.arguments` exempts a tool. Arguments too large or
+  too deep to read in full are a finding (`argument-too-large`), not a skipped
+  check. The default is `audit`: hits are logged, nothing is refused.
 - **Model-readable refusals** — every denial is a tool error written as an
   instruction, so the agent changes approach rather than retrying
   ([`Decision.ToModelMessage`](../src/McpGuardrails.Core/Policy/Decision.cs)).
@@ -205,6 +251,8 @@ the fastest route to "clean up the repo" is `rm`.
 `allow fs__write_file` means the agent may write the wrong thing to the right
 place. Prefix rules compare the literal string — `/workspace/../etc/passwd`
 starts with `/workspace/` — so path containment has to stay the server's job.
+The `path-traversal` detector flags that path, but under the default `audit` it
+only says so in the log.
 
 ### A4. Local attacker with file access
 
@@ -228,6 +276,8 @@ already won. Concretely, so nobody mistakes this for a defended boundary:
 - **Write to the sandbox directory** → plant files for the agent to read: this
   is A1 delivered locally.
 - **Control `PATH` or the npm cache** → replace what `npx` launches.
+- **Write to the pins file** → accept any tool change, or **delete it** → the
+  next start trusts whatever every server serves, as on first use.
 
 The audit file and its directory are created with the process's default
 permissions (umask); the proxy does not tighten them. That is a filesystem
@@ -329,10 +379,93 @@ so it inherits every gap in [the scanner section](#the-scanner-is-a-label-not-a-
   is not addressed to the model and an icon is a URL.
 - **Startup only.** The list is read once at connect time, so a server cannot
   change a scanned definition later through the proxy — but whatever it said at
-  startup is what was judged.
+  startup is what was judged. A change *between* starts is what
+  [pinning](#pins-detect-change-not-malice) is for.
 - **Policy on the call is still the stronger defence.** A description that slips
   past the heuristics still has to turn into a `tools/call` that policy,
   approval and budget allow.
+
+### Pins detect change, not malice
+
+[Pinning](pins.md) remembers what each server's tools looked like and flags any
+difference on a later start. Its limits:
+
+- **Trust on first use.** The first start pins whatever a server serves. A
+  server that is hostile from day one is pinned hostile; catching that is the
+  metadata scanner's job and the operator's review.
+- **`warn` delivers the change.** The default puts a warning in front of the new
+  description and still advertises the tool, for the reason result scanning
+  annotates: a guardrail that breaks every upgrade gets switched off. `block`
+  is the setting that keeps a changed tool away from the model until review.
+- **Definitions, not behaviour.** A tool whose definition is byte-for-byte the
+  same can still do something different on the server side.
+- **Identity is the command line, not the code.** The identity hash covers the
+  expanded command and arguments of a stdio server and the URL of a remote one.
+  An unpinned `npx -y package` that silently resolves to a new version keeps the
+  same identity; only its tools' hashes notice the change. Environment values
+  are left out on purpose, so a secret in `env` never feeds a committed hash —
+  but a secret in `args` does, as one input to a SHA-256.
+- **No canonical Unicode normalization.** Strings are compared by code point,
+  so a server that re-encodes accents raises a false alarm rather than a missed
+  change.
+
+### Packs are opinions, not proofs
+
+The [policy packs](packs.md) turn the threats above into rules for specific
+servers: credential paths and files that run code later for the filesystem
+server, the exfiltration step of an issue-borne injection for GitHub, internal
+addresses for fetch, option-shaped refs for git, multi-statement SQL for
+Postgres. They inherit every limit of the policy engine, and add some of their
+own:
+
+- **Annotations decide "read".** A pack's "reads allowed" rule trusts the
+  server's `readOnlyHint`, which a hostile server can set on anything. The tools
+  that matter are named explicitly; the annotation rule is the net beneath them.
+- **Text heuristics.** The SQL rules match keywords and the fetch rules match
+  host names as written. They lean towards asking or refusing, but a public name
+  resolving to a private address, an IP in decimal, or SQL that hides a write
+  from a keyword list gets past them. The `ssrf` [argument detector](argument-scanning.md)
+  decodes the IP forms; nothing here resolves names.
+- **One element per array.** A predicate checks one path in a JSON value, so a
+  tool taking an array of paths cannot be checked element by element. The
+  filesystem pack refuses `read_multiple_files` for that reason.
+- **Generated once.** A policy written by `init` does not change when the packs
+  do. That is deliberate - nothing changes behaviour without a file changing -
+  but it means a fix to a pack reaches you only when you run `init` again and
+  review the diff.
+
+### Argument detectors classify, they do not contain
+
+The [argument detectors](argument-scanning.md) judge the literal arguments. They
+cannot know what a server will do with them:
+
+- **No DNS resolution.** `ssrf` sees `http://attacker.example/`, not the
+  private address it resolves to, and DNS rebinding — a name that resolves to a
+  public address when checked and a private one when used — is out of reach of
+  any check that does not proxy the connection itself.
+- **`shell-metachar` is scoped by name.** It reads arguments named like
+  commands (`command`, `cmd`, `script`, `args`...) and every argument of a tool
+  whose name has the word `exec` or `shell`, or `run`/`execute` then
+  `command`/`cmd`. A shell tool with an innocuous name and an argument called
+  `input` is not covered unless an override says so.
+- **Prose is not read as paths.** A value with whitespace is split into words,
+  and only words with a separator are checked, so "add .env to .gitignore" does
+  not fire. In a command a quoted word is kept whole, but a credential path
+  with spaces in prose, outside quotes, in an argument whose name does not say
+  "path" is missed.
+- **Shell quoting and globs are not undone.** `cat ~/.s""sh/id_rsa` and
+  `cat /etc/sha?ow` reach the file through the shell but match no name.
+- **Values, not keys.** Object keys count against the size cap but are not
+  scanned; a server that reads a URL out of a key is not covered.
+- **Known encodings only.** The path detectors decode percent-escapes up to
+  three levels deep, overlong UTF-8 and `%u` forms, plus a few Unicode
+  look-alikes of `.`, `/` and `\`. A server with its own decoding quirks can be fooled
+  by forms not on the list.
+- **`audit` is the default.** Nothing is refused until an operator chooses
+  `approve` or `block`, for the whole section or per tool with `overrides`.
+- **An override is an exemption.** `action: off` for a tool switches every
+  detector off for it, and a broad glob exempts more than intended. Overrides
+  sit in `scanners.arguments`, where a reviewer can see them.
 
 ### Approval has limits of its own
 
@@ -362,10 +495,12 @@ The proxy gates calls *to* a server; it does nothing about the server itself.
 
 - **Anything its process can do.** It runs as the user, with the user's files
   and network. It does not need a tool call to read `~/.ssh` and post it.
-- **Read the proxy's environment.** Spawned servers inherit the proxy's full
-  environment — `DefaultUpstreams` sets no `EnvironmentVariables`, and the SDK's
-  stdio transport inherits by default. Any secret in the client's `env` block
-  for the proxy is visible to every server.
+- **Read the proxy's environment, unless isolated.** A stdio server inherits
+  the proxy's full environment unless the servers file sets
+  `env_isolation: true`, and the built-in filesystem server always does. Then
+  any secret in the client's `env` block for the proxy is visible to it. With
+  isolation, a server sees only the allowlist, what `env_passthrough` names and
+  its own `env`.
 - **Lie in annotations** — declare a delete tool read-only and slip past
   annotation rules. Name the tools you care about explicitly.
 - **Poison tool descriptions in ways the heuristics miss** — see above.
@@ -375,7 +510,8 @@ The proxy gates calls *to* a server; it does nothing about the server itself.
 - **Take a long time.** The proxy applies no per-call timeout of its own; a call
   ends when the server answers or the client cancels.
 - **Stop the proxy starting.** Upstreams connect at startup and a failure
-  there is fatal for the whole proxy.
+  there is fatal for the whole proxy, unless that server is marked
+  `optional: true` in the servers file.
 - **Change its tools after startup.** The tool list is read once at connect
   time; later changes are not picked up, and the policy matches the startup
   annotations.
@@ -461,7 +597,8 @@ loader **rejects** it rather than accepting a setting that does nothing.
 | --- | --- |
 | Slack approval (`approval.mode: slack`) | Not a recognised mode, so rejected at load; `in_band` elicitation or a signed webhook |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
-| Configurable upstream servers | One hard-coded filesystem server ([`DefaultUpstreams`](../src/McpGuardrails.Core/Upstream/DefaultUpstreams.cs)) |
-| Policy reload without restart | Read once at startup |
+| Environment isolation by default | Opt-in with `env_isolation: true`; a startup warning names what each server would lose |
+| OAuth to remote upstream servers | Static headers only |
+| Policy or servers reload without restart | Both read once at startup |
 
 When one of these lands, this page should change in the same pull request.

@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text.Json;
 using McpGuardrails.Core.Upstream;
 using Microsoft.Extensions.Logging.Abstractions;
+using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
@@ -219,5 +220,90 @@ public sealed class UpstreamRegistryTests
 
         await registry.DisposeAsync();
         await registry.DisposeAsync(); // must not throw
+    }
+
+    // --------------------------------------------------- optional and failures
+
+    private static UpstreamTransportFactory Failing(string message) =>
+        (_, _) => throw new InvalidOperationException(message);
+
+    [Fact]
+    public async Task ConnectAsync_StartsWithoutAnOptionalServerThatFails()
+    {
+        await using var server = InMemoryMcpServer.Start("fixture", EchoTool());
+
+        UpstreamTransportFactory factory = (config, logging) => config.Name == "down"
+            ? throw new InvalidOperationException("connection refused")
+            : server.TransportFactory(config, logging);
+
+        await using var registry = await UpstreamRegistry.ConnectAsync(
+            [Config("fs"), Config("down") with { Optional = true }],
+            NullLoggerFactory.Instance,
+            factory);
+
+        Assert.Equal("fs", Assert.Single(registry.Connections).Name);
+        var missing = Assert.Single(registry.Unavailable);
+        Assert.Equal("down", missing.Name);
+        Assert.Contains("connection refused", missing.Reason, StringComparison.Ordinal);
+        Assert.False(registry.TryResolve("down__echo", out _, out _));
+    }
+
+    [Fact]
+    public async Task ConnectAsync_NamesTheRequiredServerThatFailedAndClosesTheOthers()
+    {
+        // One in-memory server per connection: a stream pair carries one session.
+        await using var fs = InMemoryMcpServer.Start("fixture", EchoTool());
+        await using var later = InMemoryMcpServer.Start("fixture", EchoTool());
+        var connected = new List<string>();
+
+        UpstreamTransportFactory factory = (config, logging) =>
+        {
+            if (config.Name == "down")
+            {
+                throw new InvalidOperationException("connection refused");
+            }
+
+            connected.Add(config.Name);
+            return (config.Name == "fs" ? fs : later).TransportFactory(config, logging);
+        };
+
+        var exception = await Assert.ThrowsAsync<UpstreamConnectionException>(
+            async () => await UpstreamRegistry.ConnectAsync(
+                [Config("fs"), Config("down"), Config("later") with { Optional = true }],
+                NullLoggerFactory.Instance,
+                factory));
+
+        Assert.Equal("down", exception.Server);
+        Assert.Contains("'down'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("connection refused", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("fs", connected);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_ReportsTheFirstOfSeveralFailures()
+    {
+        var exception = await Assert.ThrowsAsync<UpstreamConnectionException>(
+            async () => await UpstreamRegistry.ConnectAsync(
+                [Config("one"), Config("two")],
+                NullLoggerFactory.Instance,
+                Failing("refused")));
+
+        Assert.Equal("one", exception.Server);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_ClosesAClientThatConnectedButCouldNotListTools()
+    {
+        // A server with no tools capability: the handshake succeeds and
+        // tools/list is refused, which must not leak the open session.
+        await using var server = InMemoryMcpServer.Start("fixture");
+
+        var exception = await Assert.ThrowsAsync<UpstreamConnectionException>(
+            async () => await UpstreamRegistry.ConnectAsync(
+                [Config("fs")], NullLoggerFactory.Instance, server.TransportFactory));
+
+        Assert.Equal("fs", exception.Server);
+        // Refused by the server after the handshake, not a transport failure.
+        Assert.IsType<McpProtocolException>(exception.InnerException);
     }
 }

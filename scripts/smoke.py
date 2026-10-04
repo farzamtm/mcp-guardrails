@@ -22,6 +22,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -255,6 +256,76 @@ scanners:
 
 CLASSIFIER_KEY = "smoke-test-key-not-a-real-one"
 
+# The servers-file phase. Two copies of the filesystem server, each sandboxed to
+# its own directory, a dependency-free fixture server whose env_names tool shows
+# which environment variables it was given, and a remote upstream - the proxy's
+# own HTTP mode, fronting a second fixture - reached over Streamable HTTP.
+SERVERS_DIR = f"{SANDBOX}/servers-phase"
+SERVERS_A = f"{SERVERS_DIR}/a"
+SERVERS_B = f"{SERVERS_DIR}/b"
+SERVERS_FILE = f"{SERVERS_DIR}/servers.yaml"
+SERVERS_UPSTREAM_FILE = f"{SERVERS_DIR}/upstream.yaml"
+SERVERS_POLICY = f"{SERVERS_DIR}/policy.yaml"
+SERVERS_AUDIT = f"{SANDBOX}/audit-servers.jsonl"
+SERVERS_UPSTREAM_AUDIT = f"{SANDBOX}/audit-servers-upstream.jsonl"
+SERVERS_PROBE = f"{SERVERS_A}/probe.txt"
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture_server.py")
+# Must match DefaultUpstreams.FilesystemServerVersion, so npx reuses its cache.
+FS_PACKAGE = "@modelcontextprotocol/server-filesystem@2026.8.31"
+# Set in the proxy's environment, and must never reach an isolated child.
+PROXY_SECRET_ENV = "GUARDRAILS_SMOKE_PROXY_SECRET"
+UPSTREAM_TOKEN = "smoke-upstream-token-0123456789"
+
+# A Claude Desktop config for the wrap phase. The token is assembled at runtime
+# for the same reason as AWS_KEY above; it was never valid.
+# Every phase pins into this file rather than the developer's own
+# ~/.mcp-guardrails/pins.json, and it is removed before each run so the first
+# start of every phase is a genuine first use.
+SMOKE_PINS = f"{SANDBOX}/smoke-pins.json"
+PINS_DIR = f"{SANDBOX}/pins-phase"
+PINS_FILE = f"{PINS_DIR}/pins.json"
+PINS_SERVERS = f"{PINS_DIR}/servers.yaml"
+PINS_BLOCK_POLICY = f"{PINS_DIR}/block.yaml"
+PINS_NO_POLICY = f"{PINS_DIR}/no-such-policy.yaml"
+PINS_AUDIT = f"{SANDBOX}/audit-pins.jsonl"
+PINS_ORIGINAL = "Echoes a message back."
+PACKS_DIR = f"{SANDBOX}/packs-phase"
+PACKS_POLICY = f"{PACKS_DIR}/policy.yaml"
+PACKS_AUDIT = f"{SANDBOX}/audit-packs.jsonl"
+PACKS_READABLE = f"{SANDBOX}/smoke-packs-readme.txt"
+PACKS_DECLINED = f"{SANDBOX}/smoke-packs-declined.txt"
+PACKS_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs")
+DEMO_POISONED = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "examples",
+    "demo",
+    "workspace",
+    "notes",
+    "vendor-email.md",
+)
+PACKS_POISONED = f"{SANDBOX}/smoke-packs-vendor-email.md"
+PINS_UPGRADED = "Echoes a message back, louder."
+WRAP_TOKEN = "ghp" + "_" + "smoketest" + "0" * 27
+WRAP_CONFIG = f"{SERVERS_DIR}/claude_desktop_config.json"
+WRAP_SERVERS = f"{SERVERS_DIR}/wrapped-servers.yaml"
+ARGS_DIR = f"{SANDBOX}/arguments-phase"
+ARGS_POLICY = f"{ARGS_DIR}/policy.yaml"
+ARGS_AUDIT = f"{SANDBOX}/audit-arguments.jsonl"
+# One override per action besides the default: reads are blocked on credential
+# paths, file info goes to a human, everything else is only audited.
+ARGS_POLICY_TEXT = """
+scanners:
+  arguments:
+    action: audit
+    overrides:
+      - tool: fs__read_text_file
+        detectors: [sensitive-path]
+        action: block
+      - tool: fs__get_file_info
+        action: approve
+"""
+
 
 class FakeAnthropic:
     """A stand-in for POST /v1/messages that answers with a fixed verdict.
@@ -483,10 +554,22 @@ def read_audit_text(path: str, what: str) -> tuple[str, list[dict]] | None:
     return raw, lines
 
 
+def startup_event(event: str | None) -> bool:
+    """Lines a serving session writes at startup, before any call."""
+    return event == "upstream_connected" or (event or "").startswith("pin_")
+
+
 def read_audit(path: str, what: str) -> list[dict] | None:
-    """read_audit_text for the callers that only need the parsed records."""
+    """The per-call records, for the checks that count them.
+
+    Leaves out the upstream_connected and pin_* lines a serving session starts
+    with: they are about the servers, not the calls, and the servers and pins
+    phases read them through read_audit_text instead.
+    """
     audit = read_audit_text(path, what)
-    return None if audit is None else audit[1]
+    if audit is None:
+        return None
+    return [line for line in audit[1] if not startup_event(line.get("event"))]
 
 
 CHECKS: list[Check] = [
@@ -1032,6 +1115,13 @@ HTTP_CHECKS: list[Check] = [
 
 
 def main() -> int:
+    # Empty means "no servers file": every phase but the servers phase runs the
+    # built-in filesystem server, even on a machine whose own
+    # ~/.mcp-guardrails/servers.yaml would otherwise be picked up. The servers
+    # phase names its file explicitly.
+    os.environ["GUARDRAILS_SERVERS"] = ""
+    os.environ["GUARDRAILS_PINS"] = SMOKE_PINS
+
     try:
         os.makedirs(SANDBOX, exist_ok=True)
     except OSError as exc:
@@ -1085,6 +1175,7 @@ def main() -> int:
         OTEL_AUDIT,
         OTEL_PROBE,
         ESCAPE,
+        SMOKE_PINS,
     ):
         try:
             os.remove(stale)
@@ -1289,6 +1380,33 @@ def main() -> int:
         exists = os.path.exists(path)
         print(f"{'FAIL' if exists else 'PASS'}  {label}")
         failures += 1 if exists else 0
+
+    # Phase 11: servers from a servers file - several stdio servers, an isolated
+    # environment, a remote upstream - and the commands that manage the file.
+    print("\n--- servers file ---")
+    servers_failures, servers_stderr = run_servers_phase()
+    failures += servers_failures
+    http_stderr += servers_stderr
+
+    # Phase 12: pinned tool definitions - pinned on first use, a changed
+    # definition noticed on the next start, and the review commands.
+    print("\n--- pins ---")
+    pins_failures, pins_stderr = run_pins_phase()
+    failures += pins_failures
+    http_stderr += pins_stderr
+
+    # Phase 13: a policy generated from the built-in packs, enforced by a real
+    # proxy, and the policy test command run over every shipped pack.
+    print("\n--- policy packs ---")
+    packs_failures, packs_stderr = run_packs_phase()
+    failures += packs_failures
+    http_stderr += packs_stderr
+
+    # Phase 14: the argument attack detectors, one call per action.
+    print("\n--- argument detectors ---")
+    arguments_failures, arguments_stderr = run_arguments_phase()
+    failures += arguments_failures
+    http_stderr += arguments_stderr
 
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
@@ -1642,12 +1760,21 @@ def run_http_session(
 
 
 def wait_for_lines(path: str, count: int, *, timeout: float) -> None:
-    """Return once path holds at least count lines, or when timeout runs out."""
+    """Return once path holds at least count call records, or at the timeout.
+
+    Startup's upstream_connected and pin_* lines are not counted, or the wait
+    would end one call early and race the flush of the last one.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             with open(path, encoding="utf-8") as handle:
-                if sum(1 for line in handle if line.strip()) >= count:
+                records = (
+                    line
+                    for line in handle
+                    if line.strip() and not startup_event(json.loads(line).get("event"))
+                )
+                if sum(1 for _ in records) >= count:
                     return
         except FileNotFoundError:
             pass
@@ -2257,6 +2384,761 @@ def check_audit_log() -> int:
         )
 
     return check.failures
+
+
+def servers_yaml(upstream_url: str) -> str:
+    """The servers file for the phase, as a user would write it."""
+    return f"""
+version: 1
+defaults:
+  shutdown_timeout: 5s
+servers:
+  fs-a:
+    command: npx
+    args: ["-y", "{FS_PACKAGE}", '{SERVERS_A}']
+    env_isolation: false
+  fs-b:
+    command: npx
+    args: ["-y", "{FS_PACKAGE}", "${{GUARDRAILS_SMOKE_SANDBOX_B:-{SERVERS_B}}}"]
+    env_isolation: false
+  fixture:
+    command: '{sys.executable}'
+    args: ['{FIXTURE}']
+    env_isolation: true
+    env:
+      FIXTURE_OWN: "set-by-the-servers-file"
+  remote:
+    type: http
+    url: {upstream_url}
+    headers:
+      Authorization: "Bearer ${{SMOKE_UPSTREAM_TOKEN}}"
+  retired:
+    command: definitely-not-installed
+    disabled: true
+"""
+
+
+# A rule scoped by server: echo is refused from the local fixture and allowed
+# from the remote one, although the downstream tool is the same.
+SERVERS_POLICY_TEXT = """
+rules:
+  - name: no-local-echo
+    match:
+      server: fixture
+      tool: "*__echo"
+    decision: deny
+    message: Echo is only allowed from the remote server.
+"""
+
+
+def tool_names(result: dict) -> set[str]:
+    return {t["name"] for t in result.get("tools", [])}
+
+
+def env_names(result: dict) -> set[str]:
+    """The variable names fixture__env_names reported, one per line."""
+    text = "".join(c.get("text", "") for c in result.get("content", []))
+    return set(text.split("\n"))
+
+
+def start_http_upstream(env: dict[str, str]) -> tuple[subprocess.Popen, str | None]:
+    """Start the proxy in HTTP mode as somebody else's upstream; return its URL."""
+    proc = subprocess.Popen(
+        [BIN, "--transport", "http", "--port", "0"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={**os.environ, **env},
+    )
+    stderr = proc.stderr
+    if stderr is None:
+        raise RuntimeError("failed to open the upstream's stderr")
+
+    found = threading.Event()
+    endpoint: list[str] = []
+
+    def drain() -> None:
+        pattern = re.compile(r"at (http://\S+/mcp)")
+        for line in stderr:
+            match = pattern.search(line)
+            if match and not endpoint:
+                endpoint.append(match.group(1))
+                found.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+    return proc, endpoint[0] if found.wait(timeout=60) else None
+
+
+def run_servers_phase() -> tuple[int, list[str]]:
+    """Every downstream server comes from a servers file."""
+    for directory in (SERVERS_A, SERVERS_B):
+        os.makedirs(directory, exist_ok=True)
+    for stale in (SERVERS_AUDIT, SERVERS_UPSTREAM_AUDIT, SERVERS_PROBE, WRAP_SERVERS):
+        if os.path.exists(stale):
+            os.remove(stale)
+
+    with open(SERVERS_UPSTREAM_FILE, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"version: 1\nservers:\n  fixture:\n    command: '{sys.executable}'\n"
+            f"    args: ['{FIXTURE}']\n    env_isolation: true\n"
+        )
+    with open(SERVERS_POLICY, "w", encoding="utf-8") as handle:
+        handle.write(SERVERS_POLICY_TEXT)
+
+    upstream, url = start_http_upstream(
+        {
+            "GUARDRAILS_SERVERS": SERVERS_UPSTREAM_FILE,
+            "GUARDRAILS_POLICY": f"{SANDBOX}/no-such-policy.yaml",
+            "GUARDRAILS_AUDIT": SERVERS_UPSTREAM_AUDIT,
+            "GUARDRAILS_HTTP_TOKEN": UPSTREAM_TOKEN,
+        }
+    )
+    try:
+        if url is None:
+            print("FAIL  servers: the HTTP upstream never reported a listening address")
+            return 1, []
+
+        with open(SERVERS_FILE, "w", encoding="utf-8") as handle:
+            handle.write(servers_yaml(url))
+
+        checks: list[Check] = [
+            (
+                request(1, "tools/list"),
+                "servers: every configured server's tools are advertised, namespaced",
+                lambda r: (
+                    {
+                        "fs-a__write_file",
+                        "fs-b__read_text_file",
+                        "fixture__env_names",
+                        "remote__fixture__echo",
+                    }
+                    <= tool_names(r)
+                ),
+            ),
+            (
+                request(2, "tools/list"),
+                "servers: a disabled server is not connected",
+                lambda r: not any(n.startswith("retired__") for n in tool_names(r)),
+            ),
+            (
+                call(
+                    3, "fs-a__write_file", {"path": SERVERS_PROBE, "content": CONTENT}
+                ),
+                "servers: fs-a writes inside its own sandbox",
+                lambda r: not r.get("isError"),
+            ),
+            (
+                call(4, "fs-b__read_text_file", {"path": SERVERS_PROBE}),
+                "servers: fs-b cannot read fs-a's sandbox",
+                lambda r: bool(r.get("isError")),
+            ),
+            (
+                call(5, "fixture__env_names", {}),
+                "servers: an isolated child never sees the proxy's secrets",
+                lambda r: (
+                    PROXY_SECRET_ENV not in env_names(r)
+                    and "SMOKE_UPSTREAM_TOKEN" not in env_names(r)
+                ),
+            ),
+            (
+                call(6, "fixture__env_names", {}),
+                "servers: ...but gets PATH and its own env",
+                lambda r: {"PATH", "FIXTURE_OWN"} <= env_names(r),
+            ),
+            (
+                call(7, "remote__fixture__echo", {"message": "over http"}),
+                "servers: a remote upstream answers through Streamable HTTP",
+                lambda r: "echo: over http" in result_text(r),
+            ),
+            (
+                call(8, "fixture__echo", {"message": "local"}),
+                "servers: a 'server:' rule refuses the same tool from one server",
+                lambda r: denied_with(r, "only allowed from the remote server"),
+            ),
+        ]
+
+        failures, stderr_lines = run_session(
+            checks,
+            {
+                "GUARDRAILS_SERVERS": SERVERS_FILE,
+                "GUARDRAILS_POLICY": SERVERS_POLICY,
+                "GUARDRAILS_AUDIT": SERVERS_AUDIT,
+                "SMOKE_UPSTREAM_TOKEN": UPSTREAM_TOKEN,
+                PROXY_SECRET_ENV: "the-proxy-keeps-this",
+            },
+        )
+    finally:
+        upstream.terminate()
+        try:
+            upstream.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            upstream.kill()
+
+    check = Checker(failures)
+    audit = read_audit_text(SERVERS_AUDIT, "servers audit log")
+    if audit is None:
+        return check.failures + 1, stderr_lines
+
+    raw, lines = audit
+    connected = {
+        line["server"]: line for line in lines if line["event"] == "upstream_connected"
+    }
+    check.expect(
+        set(connected) == {"fs-a", "fs-b", "fixture", "remote"},
+        "servers: one upstream_connected line per connected server",
+    )
+    check.expect(
+        connected.get("remote", {}).get("transport") == "http"
+        and connected.get("fixture", {}).get("tool_count") == 2,
+        "servers: the audit records transport and tool count",
+    )
+    check.expect(
+        "${GUARDRAILS_SMOKE_SANDBOX_B:-"
+        in connected.get("fs-b", {}).get("identity", ""),
+        "servers: the audit records the unexpanded template",
+    )
+    check.expect(
+        UPSTREAM_TOKEN not in raw, "servers: no header value reaches the audit log"
+    )
+
+    check.failures += check_servers_commands()
+    return check.failures, stderr_lines
+
+
+def run_cli(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [BIN, *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, **env},
+        check=False,
+    )
+
+
+def check_servers_commands() -> int:
+    """validate, a refused start, and wrap/unwrap on a fixture client config."""
+    check = Checker()
+    no_policy = {"GUARDRAILS_POLICY": f"{SANDBOX}/no-such-policy.yaml"}
+
+    valid = run_cli(
+        ["validate", "--servers", SERVERS_FILE],
+        {**no_policy, "SMOKE_UPSTREAM_TOKEN": UPSTREAM_TOKEN},
+    )
+    check.expect(
+        valid.returncode == 0 and "valid" in valid.stdout,
+        f"validate: a good servers file exits 0 (got {valid.returncode})",
+    )
+
+    unset = f"{SERVERS_DIR}/unset.yaml"
+    with open(unset, "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  a:\n    command: npx\n"
+            '    args: ["${GUARDRAILS_SMOKE_DEFINITELY_UNSET}"]\n'
+            "  b: { command: definitely-not-installed }\n"
+        )
+
+    invalid = run_cli(["validate", "--servers", unset], no_policy)
+    check.expect(
+        invalid.returncode == 1
+        and "GUARDRAILS_SMOKE_DEFINITELY_UNSET" in invalid.stdout
+        and "definitely-not-installed" in invalid.stdout,
+        f"validate: every error is reported, exit 1 (got {invalid.returncode})",
+    )
+
+    refused = run_cli(["list-upstream", "--servers", unset], no_policy)
+    check.expect(
+        refused.returncode == 1
+        and "GUARDRAILS_SMOKE_DEFINITELY_UNSET" in refused.stderr,
+        "servers: an unset variable stops the proxy and names the variable",
+    )
+
+    missing = run_cli(
+        ["list-upstream", "--servers", f"{SERVERS_DIR}/nope.yaml"], no_policy
+    )
+    check.expect(
+        missing.returncode == 1 and "does not exist" in missing.stderr,
+        "servers: a named servers file that is missing is an error, not a fallback",
+    )
+
+    config = json.dumps(
+        {
+            "mcpServers": {
+                "fixture": {
+                    "command": sys.executable,
+                    "args": [FIXTURE],
+                    "env": {"GITHUB_TOKEN": WRAP_TOKEN},
+                }
+            },
+            "globalShortcut": "",
+        },
+        indent=2,
+    )
+    with open(WRAP_CONFIG, "w", encoding="utf-8", newline="") as handle:
+        handle.write(config)
+
+    wrap_args = [
+        "--client",
+        "claude-desktop",
+        "--path",
+        WRAP_CONFIG,
+        "-o",
+        WRAP_SERVERS,
+    ]
+    dry = run_cli(["wrap", *wrap_args, "--dry-run"], no_policy)
+    with open(WRAP_CONFIG, encoding="utf-8", newline="") as handle:
+        untouched = handle.read() == config
+    check.expect(
+        dry.returncode == 0
+        and '"guardrails"' in dry.stdout
+        and untouched
+        and not os.path.exists(WRAP_SERVERS),
+        f"wrap --dry-run: shows the change and writes nothing (exit {dry.returncode})",
+    )
+    check.expect(
+        WRAP_TOKEN not in dry.stdout + dry.stderr,
+        "wrap --dry-run: never prints the secret it lifts",
+    )
+
+    wrapped = run_cli(["wrap", *wrap_args], no_policy)
+    servers_text = ""
+    if os.path.exists(WRAP_SERVERS):
+        with open(WRAP_SERVERS, encoding="utf-8") as handle:
+            servers_text = handle.read()
+    check.expect(
+        wrapped.returncode == 0
+        and "${FIXTURE_GITHUB_TOKEN}" in servers_text
+        and WRAP_TOKEN not in servers_text,
+        "wrap: the servers file references the secret, never holds it "
+        f"(exit {wrapped.returncode})",
+    )
+
+    unwrapped = run_cli(
+        ["unwrap", "--client", "claude-desktop", "--path", WRAP_CONFIG], {}
+    )
+    with open(WRAP_CONFIG, encoding="utf-8", newline="") as handle:
+        restored = handle.read() == config
+    check.expect(
+        unwrapped.returncode == 0 and restored,
+        "unwrap: the original config is back byte for byte "
+        f"(exit {unwrapped.returncode})",
+    )
+
+    if check.failures:
+        for result in (valid, invalid, refused, dry, wrapped, unwrapped):
+            print(result.stdout[-600:], result.stderr[-600:], file=sys.stderr)
+
+    return check.failures
+
+
+def tool_description(result: dict, name: str) -> str | None:
+    """The description tools/list gave one tool, or None when it was not listed."""
+    for tool in result.get("tools", []):
+        if tool["name"] == name:
+            return tool.get("description", "")
+    return None
+
+
+def run_pins_phase() -> tuple[int, list[str]]:
+    """Pin on first use, notice a changed definition, review and accept it."""
+    os.makedirs(PINS_DIR, exist_ok=True)
+    for stale in (PINS_FILE, PINS_AUDIT):
+        if os.path.exists(stale):
+            os.remove(stale)
+
+    # The upgrade is an environment value of the servers file, which is not part
+    # of the server's identity: the same program, serving a changed tool.
+    with open(PINS_SERVERS, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"version: 1\nservers:\n  fixture:\n    command: '{sys.executable}'\n"
+            f"    args: ['{FIXTURE}']\n    env_isolation: false\n    env:\n"
+            f'      FIXTURE_ECHO_DESCRIPTION: "${{SMOKE_ECHO:-{PINS_ORIGINAL}}}"\n'
+        )
+    with open(PINS_BLOCK_POLICY, "w", encoding="utf-8") as handle:
+        handle.write("scanners:\n  pins:\n    mode: block\n")
+
+    base = {
+        "GUARDRAILS_SERVERS": PINS_SERVERS,
+        "GUARDRAILS_PINS": PINS_FILE,
+        "GUARDRAILS_AUDIT": PINS_AUDIT,
+        "GUARDRAILS_POLICY": PINS_NO_POLICY,
+    }
+    upgraded = {**base, "SMOKE_ECHO": PINS_UPGRADED}
+    blocking = {**upgraded, "GUARDRAILS_POLICY": PINS_BLOCK_POLICY}
+    check = Checker()
+    stderr: list[str] = []
+
+    def session(checks: list[Check], env: dict[str, str]) -> None:
+        failures, lines = run_session(checks, env)
+        check.failures += failures
+        stderr.extend(lines)
+
+    session(
+        [
+            (
+                request(1, "tools/list"),
+                "pins: the first start advertises the tool untouched",
+                lambda r: tool_description(r, "fixture__echo") == PINS_ORIGINAL,
+            )
+        ],
+        base,
+    )
+    pinned = ""
+    if os.path.exists(PINS_FILE):
+        with open(PINS_FILE, encoding="utf-8") as handle:
+            pinned = handle.read()
+    check.expect(
+        '"fixture"' in pinned and '"echo"' in pinned and "sha256:" in pinned,
+        "pins: the first start pins every tool in the pins file",
+    )
+
+    session(
+        [
+            (
+                request(1, "tools/list"),
+                "pins: under warn, a changed tool is advertised with a warning",
+                lambda r: (
+                    (tool_description(r, "fixture__echo") or "").startswith(
+                        "[guardrails] WARNING: its definition changed"
+                    )
+                    and PINS_UPGRADED in (tool_description(r, "fixture__echo") or "")
+                ),
+            ),
+            (
+                call(2, "fixture__echo", {"message": "warned"}),
+                "pins: ...and still works",
+                lambda r: "echo: warned" in result_text(r),
+            ),
+        ],
+        upgraded,
+    )
+
+    session(
+        [
+            (
+                request(1, "tools/list"),
+                "pins: under block, a changed tool is withheld from tools/list",
+                lambda r: (
+                    "fixture__echo" not in tool_names(r)
+                    and "fixture__env_names" in tool_names(r)
+                ),
+            ),
+            (
+                call(2, "fixture__echo", {"message": "blocked"}),
+                "pins: ...and a call to it is refused, naming the review command",
+                lambda r: (
+                    denied_with(r, "pins.changed")
+                    and denied_with(r, "pins diff fixture echo")
+                ),
+            ),
+        ],
+        blocking,
+    )
+
+    status = run_cli(["pins", "status"], upgraded)
+    check.expect(
+        status.returncode == 1 and "changed  echo" in status.stdout,
+        f"pins status: reports the change and exits 1 (got {status.returncode})",
+    )
+
+    diff = run_cli(["pins", "diff", "fixture", "echo"], upgraded)
+    check.expect(
+        diff.returncode == 0
+        and f'-   "description": "{PINS_ORIGINAL}"' in diff.stdout
+        and f'+   "description": "{PINS_UPGRADED}"' in diff.stdout,
+        f"pins diff: shows the old and new description (got {diff.returncode})",
+    )
+
+    accept = run_cli(["pins", "accept", "fixture", "echo"], upgraded)
+    clean = run_cli(["pins", "status"], upgraded)
+    check.expect(
+        accept.returncode == 0
+        and clean.returncode == 0
+        and "pins match" in clean.stdout,
+        "pins accept: the accepted change is clean "
+        f"(accept {accept.returncode}, status {clean.returncode})",
+    )
+
+    session(
+        [
+            (
+                call(1, "fixture__echo", {"message": "accepted"}),
+                "pins: after accept, the tool works again under block",
+                lambda r: "echo: accepted" in result_text(r),
+            )
+        ],
+        blocking,
+    )
+
+    read = read_audit_text(PINS_AUDIT, "pins audit log")
+    if read is None:
+        check.failures += 1
+    else:
+        audit = read[1]
+        events = [(line["event"], line.get("scanner_action")) for line in audit]
+        check.expect(
+            ("pin_created", None) in events, "pins: the audit log records pin_created"
+        )
+        check.expect(
+            ("pin_changed", "annotated") in events
+            and ("pin_changed", "blocked") in events,
+            "pins: the audit log records pin_changed, annotated then blocked",
+        )
+        check.expect(
+            any(
+                line["event"] == "pin_accepted" and line.get("tool") == "fixture__echo"
+                for line in audit
+            ),
+            "pins: the audit log records pin_accepted",
+        )
+        check.expect(
+            not any(PINS_UPGRADED in json.dumps(line) for line in audit),
+            "pins: no definition text reaches the audit log",
+        )
+
+    reset = run_cli(["pins", "reset", "fixture"], base)
+    unpinned = run_cli(["pins", "status"], base)
+    check.expect(
+        reset.returncode == 0
+        and unpinned.returncode == 1
+        and "not pinned yet" in unpinned.stdout,
+        "pins reset: the server is forgotten "
+        f"(reset {reset.returncode}, status {unpinned.returncode})",
+    )
+
+    with open(PINS_FILE, "w", encoding="utf-8") as handle:
+        handle.write("{ not json")
+    corrupt = run_cli(["list-upstream"], base)
+    check.expect(
+        corrupt.returncode == 1 and "not valid" in corrupt.stderr,
+        f"pins: a corrupt pins file stops the proxy (got {corrupt.returncode})",
+    )
+
+    return check.failures, stderr
+
+
+def run_packs_phase() -> tuple[int, list[str]]:
+    """init writes a policy from the packs; the proxy enforces it; policy test runs."""
+    os.makedirs(PACKS_DIR, exist_ok=True)
+    for stale in (PACKS_POLICY, PACKS_AUDIT, PACKS_DECLINED, PACKS_POISONED):
+        if os.path.exists(stale):
+            os.remove(stale)
+    with open(PACKS_READABLE, "w", encoding="utf-8") as handle:
+        handle.write("readable by policy")
+    # The demo's poisoned file, read the way docs/demo.md step 4 reads it.
+    shutil.copyfile(DEMO_POISONED, PACKS_POISONED)
+
+    check = Checker()
+    stderr: list[str] = []
+
+    listing = run_cli(["init", "--list"], {})
+    check.expect(
+        listing.returncode == 0 and "github" in listing.stdout,
+        "init --list: shows the built-in packs",
+    )
+
+    # No --pack: the built-in filesystem server is recognized by its package.
+    first = run_cli(["init", "-o", PACKS_POLICY], {})
+    check.expect(
+        first.returncode == 0
+        and "pack filesystem -> server 'fs'" in first.stderr
+        and os.path.exists(PACKS_POLICY),
+        f"init: recognizes the built-in server, writes a policy ({first.returncode})",
+    )
+
+    again = run_cli(["init", "-o", PACKS_POLICY], {})
+    check.expect(
+        again.returncode == 0 and "already up to date" in again.stderr,
+        "init: running it again changes nothing",
+    )
+
+    with open(PACKS_POLICY, "a", encoding="utf-8") as handle:
+        handle.write("  # a local edit\n")
+    refused = run_cli(["init", "-o", PACKS_POLICY], {})
+    check.expect(
+        refused.returncode == 1
+        and "a local edit" in refused.stderr
+        and "--force" in refused.stderr,
+        "init: an edited policy is not replaced without --force, and the diff is shown",
+    )
+    forced = run_cli(["init", "-o", PACKS_POLICY, "--force"], {})
+    check.expect(forced.returncode == 0, "init --force: replaces it")
+
+    valid = run_cli(["validate", "--policy", PACKS_POLICY], {})
+    check.expect(
+        valid.returncode == 0 and "warning" not in valid.stdout,
+        f"validate: the generated policy is valid (got {valid.returncode})",
+    )
+
+    tests = sorted(
+        os.path.join(PACKS_SOURCE, name)
+        for name in os.listdir(PACKS_SOURCE)
+        if name.endswith(".test.yaml")
+    )
+    tested = run_cli(["policy", "test", *tests], {})
+    check.expect(
+        tested.returncode == 0 and tested.stdout.count(" passed") == len(tests),
+        f"policy test: every shipped pack passes its tests ({len(tests)} files)",
+    )
+
+    broken = f"{PACKS_DIR}/broken.test.yaml"
+    pack = os.path.abspath(os.path.join(PACKS_SOURCE, "filesystem.yaml"))
+    with open(broken, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"policy: {pack}\n"
+            "server: fs\ntools:\n  fs__write_file: {}\ncases:\n"
+            "  - call: fs__write_file\n    expect: allow\n"
+        )
+    failing = run_cli(["policy", "test", broken], {})
+    check.expect(
+        failing.returncode == 1
+        and "FAIL" in failing.stdout
+        and "fs-approve-changes" in failing.stdout,
+        "policy test: a wrong expectation fails with the decision trail",
+    )
+
+    failures, lines = run_session(
+        [
+            (
+                call(1, "fs__read_text_file", {"path": PACKS_READABLE}),
+                "packs: a read in the sandbox is allowed",
+                lambda r: "readable by policy" in result_text(r),
+            ),
+            (
+                call(2, "fs__read_text_file", {"path": f"{SANDBOX}/.env"}),
+                "packs: reading a .env file is refused",
+                lambda r: denied_with(r, "fs-no-credentials"),
+            ),
+            (
+                call(
+                    3,
+                    "fs__write_file",
+                    {"path": f"{SANDBOX}/.git/hooks/pre-commit", "content": "x"},
+                ),
+                "packs: writing a git hook is refused",
+                lambda r: denied_with(r, "fs-no-code-that-runs-later"),
+            ),
+            (
+                call(4, "fs__read_text_file", {"path": PACKS_POISONED}),
+                "packs: the demo's poisoned file is allowed, but fenced and flagged",
+                lambda r: (
+                    "begin untrusted output" in result_text(r)
+                    and "instruction-override" in result_text(r)
+                    and "exfiltration" in result_text(r)
+                ),
+            ),
+            (
+                call(5, "fs__write_file", {"path": PACKS_DECLINED, "content": "x"}),
+                "packs: an ordinary write asks the human, who declines",
+                lambda r: bool(r.get("isError")),
+            ),
+        ],
+        {"GUARDRAILS_POLICY": PACKS_POLICY, "GUARDRAILS_AUDIT": PACKS_AUDIT},
+        handshake=True,
+        elicit="decline",
+    )
+    check.failures += failures
+    stderr.extend(lines)
+
+    declined = os.path.exists(PACKS_DECLINED)
+    check.expect(not declined, "packs: the declined write never reached the disk")
+
+    lines_read = read_audit(PACKS_AUDIT, "packs audit log")
+    if lines_read is None:
+        check.failures += 1
+    else:
+        check.expect(
+            any(
+                entry.get("rule") == "fs-approve-changes"
+                and entry.get("decision") == "deny"
+                and entry.get("approval") == "declined"
+                for entry in lines_read
+            ),
+            "packs: the audit log records the pack's rule and the human's answer",
+        )
+    return check.failures, stderr
+
+
+def run_arguments_phase() -> tuple[int, list[str]]:
+    """The argument detectors audit, block and escalate, and the log says which."""
+    os.makedirs(f"{ARGS_DIR}/sub", exist_ok=True)
+    if os.path.exists(ARGS_AUDIT):
+        os.remove(ARGS_AUDIT)
+    with open(ARGS_POLICY, "w", encoding="utf-8") as handle:
+        handle.write(ARGS_POLICY_TEXT)
+
+    questions: list[str] = []
+    failures, stderr = run_session(
+        [
+            (
+                call(1, "fs__list_directory", {"path": f"{ARGS_DIR}/sub/.."}),
+                "arguments: a traversal is audited and the call still goes through",
+                lambda r: not r.get("isError") and "policy.yaml" in result_text(r),
+            ),
+            (
+                call(2, "fs__read_text_file", {"path": f"{SANDBOX}/.ssh/id_rsa"}),
+                "arguments: a read of a private key is blocked under its override",
+                lambda r: denied_with(r, "arguments.sensitive-path"),
+            ),
+            (
+                call(
+                    3,
+                    "fs__get_file_info",
+                    {"path": f"{ARGS_DIR}/sub/../policy.yaml"},
+                ),
+                "arguments: under approve the call is put to the human, who allows it",
+                lambda r: not r.get("isError"),
+            ),
+        ],
+        {"GUARDRAILS_POLICY": ARGS_POLICY, "GUARDRAILS_AUDIT": ARGS_AUDIT},
+        handshake=True,
+        elicit="approve",
+        questions=questions,
+    )
+    check = Checker(failures)
+
+    check.expect(
+        len(questions) == 1
+        and "Guardrails rule 'arguments.path-traversal' requires your approval."
+        in questions[0]
+        and "path-traversal in 'path'" in questions[0],
+        "arguments: the approver is told which detector fired, and where",
+    )
+
+    entries = read_audit(ARGS_AUDIT, "arguments audit log")
+    if entries is None:
+        check.failures += 1
+        return check.failures, stderr
+
+    calls = {entry.get("tool"): entry for entry in entries}
+    listed = calls.get("fs__list_directory", {})
+    read = calls.get("fs__read_text_file", {})
+    info = calls.get("fs__get_file_info", {})
+    check.expect(
+        listed.get("argument_hits") == ["path-traversal"]
+        and listed.get("argument_hits_action") == "audited"
+        and listed.get("decision") == "allow",
+        "arguments: the audit log records the audited hit by name",
+    )
+    check.expect(
+        read.get("argument_hits") == ["sensitive-path"]
+        and read.get("argument_hits_action") == "blocked"
+        and read.get("rule") == "arguments.sensitive-path",
+        "arguments: the audit log records the block and its rule",
+    )
+    check.expect(
+        info.get("argument_hits_action") == "approval"
+        and info.get("approval") == "approved"
+        and info.get("rule") == "arguments.path-traversal",
+        "arguments: the audit log records the escalation and the human's answer",
+    )
+    check.expect(
+        "id_rsa" not in json.dumps([entry.get("argument_hits") for entry in entries]),
+        "arguments: hits are detector names, never argument values",
+    )
+    return check.failures, stderr
 
 
 if __name__ == "__main__":

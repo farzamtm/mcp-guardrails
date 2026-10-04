@@ -29,8 +29,13 @@ public sealed record AuditRecord
     public required string Event { get; init; }
 
     /// <summary>Client-visible tool name, e.g. "fs__write_file".</summary>
+    /// <remarks>
+    /// Present on every per-tool event. Absent on <c>upstream_connected</c>,
+    /// <c>pin_created</c> and <c>pin_reset</c>, which are about a server rather
+    /// than one of its tools.
+    /// </remarks>
     [JsonPropertyName("tool")]
-    public required string Tool { get; init; }
+    public string? Tool { get; init; }
 
     /// <summary>Downstream server that served the call, when it resolved.</summary>
     [JsonPropertyName("server")]
@@ -142,6 +147,24 @@ public sealed record AuditRecord
     [JsonPropertyName("argument_secrets_action")]
     public string? ArgumentSecretsAction { get; init; }
 
+    /// <summary>
+    /// Argument detectors that fired, e.g. <c>ssrf</c> or <c>path-traversal</c>.
+    /// </summary>
+    /// <remarks>
+    /// Names only, like the other scanner fields: the matched value is the part
+    /// of the call an attacker chose. Recorded on refused calls too.
+    /// </remarks>
+    [JsonPropertyName("argument_hits")]
+    public IReadOnlyList<string>? ArgumentHits { get; init; }
+
+    /// <summary>What the argument gate did about them: audited, approval or blocked.</summary>
+    /// <remarks>
+    /// Absent when there were hits but an earlier gate had already refused the
+    /// call, so there was nothing left for this one to do.
+    /// </remarks>
+    [JsonPropertyName("argument_hits_action")]
+    public string? ArgumentHitsAction { get; init; }
+
     /// <summary>Detectors that found a secret in the result.</summary>
     [JsonPropertyName("result_secrets")]
     public IReadOnlyList<string>? ResultSecrets { get; init; }
@@ -149,6 +172,35 @@ public sealed record AuditRecord
     /// <summary>What the proxy did about them: redacted or blocked.</summary>
     [JsonPropertyName("result_secrets_action")]
     public string? ResultSecretsAction { get; init; }
+
+    /// <summary>How the proxy reaches the server: stdio, http or sse. <c>upstream_connected</c> only.</summary>
+    [JsonPropertyName("transport")]
+    public string? Transport { get; init; }
+
+    /// <summary>How many tools the server advertised. <c>upstream_connected</c> and <c>pin_created</c> only.</summary>
+    [JsonPropertyName("tool_count")]
+    public int? ToolCount { get; init; }
+
+    /// <summary>
+    /// What was connected to, as written in the servers file: the command line
+    /// or the URL, with <c>${VAR}</c> references unexpanded. <c>upstream_connected</c>,
+    /// <c>pin_created</c> and, on a changed identity, <c>pin_changed</c>.
+    /// </summary>
+    /// <remarks>
+    /// The template rather than the expanded value, so a token passed as
+    /// <c>${GITHUB_TOKEN}</c> is recorded as that reference and never as itself;
+    /// anything secret-shaped written into the file literally is masked too.
+    /// </remarks>
+    [JsonPropertyName("identity")]
+    public string? Identity { get; init; }
+
+    /// <summary>
+    /// Why a tool differs from its pin: changed, added or identity_changed, on
+    /// <c>pin_changed</c>; removed, on a <c>pin_accepted</c> that dropped the pin
+    /// of a tool the server no longer serves.
+    /// </summary>
+    [JsonPropertyName("pin_change")]
+    public string? PinChange { get; init; }
 
     [JsonPropertyName("duration_ms")]
     public required double DurationMs { get; init; }

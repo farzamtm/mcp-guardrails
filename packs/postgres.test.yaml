@@ -1,0 +1,59 @@
+policy: postgres.yaml
+server: db
+tools:
+  db__query: {}
+  db__execute_sql: {}
+  db__list_schemas: { readOnlyHint: true }
+cases:
+  - call: db__query
+    args: { sql: "SELECT id, email FROM users LIMIT 10" }
+    expect: allow
+    rule: db-read-queries
+  - call: db__query
+    args: { sql: "  with recent as (select * from orders) select count(*) from recent;" }
+    expect: allow
+  - call: db__query
+    args: { sql: "select updated_at, created_at from audit" }
+    expect: allow
+  - call: db__query
+    args: { sql: "COMMIT; DROP TABLE users" }
+    expect: deny
+    rule: db-one-statement
+  - call: db__query
+    args: { sql: "select 1;\n  delete from users" }
+    expect: deny
+    rule: db-one-statement
+  - call: db__query
+    args: { sql: "select pg_read_file('/etc/passwd')" }
+    expect: deny
+    rule: db-no-server-access
+  - call: db__query
+    args: { sql: "COPY users TO '/tmp/users.csv'" }
+    expect: deny
+  - call: db__query
+    args: { sql: "select dblink_connect('host=evil')" }
+    expect: deny
+  - call: db__execute_sql
+    args: { sql: "DELETE FROM users WHERE id = 1" }
+    expect: require_approval
+    rule: db-approve-writes
+  - name: a write hidden in a CTE still needs approval
+    call: db__execute_sql
+    args: { sql: "WITH gone AS (DELETE FROM users RETURNING *) SELECT * FROM gone" }
+    expect: require_approval
+    rule: db-approve-writes
+  - name: EXPLAIN ANALYZE runs the statement
+    call: db__query
+    args: { sql: "EXPLAIN ANALYZE SELECT 1" }
+    expect: require_approval
+  - call: db__execute_sql
+    args: { sql: "create table t (id int)" }
+    expect: require_approval
+  - call: db__list_schemas
+    expect: allow
+    rule: db-read-tools
+  - name: a call without SQL on a tool with no hints needs approval
+    call: db__execute_sql
+    args: { statement: "select 1" }
+    expect: require_approval
+    rule: db-approve-rest

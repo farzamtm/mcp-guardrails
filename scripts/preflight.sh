@@ -90,9 +90,18 @@ python3 scripts/smoke.py "$BIN"
 # fatal startup error, so a non-zero exit here means we were about to ship an
 # example nobody could use.
 step "validate example policies"
+# A pins file that does not exist, not this machine's own: listing never writes
+# one, and the examples should not be compared against whatever is pinned here.
+PINS="$(mktemp -d)/pins.json"
 for policy in examples/*.yaml; do
   echo "checking $policy"
-  GUARDRAILS_POLICY="$policy" "$BIN" list-upstream >/dev/null
+  # Empty: the built-in server, not whatever servers file this machine has.
+  GUARDRAILS_SERVERS="" GUARDRAILS_PINS="$PINS" GUARDRAILS_POLICY="$policy" "$BIN" list-upstream >/dev/null
 done
+
+# The packs ship inside the binary, so each must behave the way its test file
+# says, not just parse.
+step "test policy packs"
+"$BIN" policy test packs/*.test.yaml
 
 bold $'\nPreflight passed in '"$((SECONDS - START))"$'s - CI should agree.'

@@ -3,8 +3,11 @@ using System.Text.Json.Serialization;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
+using McpGuardrails.Core.Packs;
+using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
+using McpGuardrails.Core.Upstream;
 
 namespace McpGuardrails.Core.Serialization;
 
@@ -70,4 +73,22 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(SecretResultAction))]
 [JsonSerializable(typeof(ClassifierSettings))]
 [JsonSerializable(typeof(ClassifierMode))]
+[JsonSerializable(typeof(ArgumentScannerSettings))]
+[JsonSerializable(typeof(ArgumentOverride))]
+[JsonSerializable(typeof(ArgumentAction))]
+[JsonSerializable(typeof(PinSettings))]
+[JsonSerializable(typeof(PinMode))]
+[JsonSerializable(typeof(NewToolAction))]
+// The servers file, bound the same way as the policy. Unknown keys are refused
+// per type with [JsonUnmappedMemberHandling] on the records themselves, because
+// a misspelt option in the file that decides what the proxy launches must not be
+// skipped quietly.
+[JsonSerializable(typeof(ServerDefaultsDocument))]
+[JsonSerializable(typeof(ServerEntryDocument))]
+// Packs and policy test files, refusing unknown keys for the same reason: a
+// misspelt 'expect:' would leave a test case asserting nothing.
+[JsonSerializable(typeof(PackHeader))]
+[JsonSerializable(typeof(PolicyTestDocument))]
+[JsonSerializable(typeof(PolicyTestTool))]
+[JsonSerializable(typeof(PolicyTestCase))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

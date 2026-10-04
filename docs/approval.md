@@ -29,7 +29,13 @@ Arguments (as sent by the agent; secrets redacted, long values cut):
 {"path": "/srv/app/.env", "content": "DEBUG=1\nAWS_KEY=[REDACTED:aws-access-key]\n"}
 ```
 
-They are summarised exactly as for a [webhook](#asking-a-webhook-instead) —
+When the [argument detectors](argument-scanning.md) flagged the call, a sentence
+saying what they found and in which argument is appended to the prompt, so the
+warning reaches the human however the rule worded its question. Under
+`scanners.arguments.action: approve` a call no rule sent to a human is asked
+about too, under the rule `arguments.<detector>`.
+
+The arguments are summarised exactly as for a [webhook](#asking-a-webhook-instead) —
 secrets redacted, then each value cut at 256 characters — and written as one
 line of JSON, so line breaks or a fake "approved by guardrails" inside an
 argument stay escaped inside a quoted string rather than passing for the

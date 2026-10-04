@@ -12,6 +12,21 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The policy packs ship inside the binary, so init works from a single
+         Native AOT executable with nothing beside it. Their test files are for
+         CI and stay out. -->
+    <EmbeddedResource Include="..\..\packs\*.yaml" Exclude="..\..\packs\*.test.yaml" LogicalName="packs/%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- A wildcard that matches nothing is not an error to MSBuild, so a build
+       context missing packs/ (a Dockerfile that copies only src/, say) would
+       quietly produce a binary whose init has nothing to offer. -->
+  <Target Name="RequirePolicyPacks" BeforeTargets="CoreCompile">
+    <Error Condition="'@(EmbeddedResource->WithMetadataValue('Extension', '.yaml'))' == ''"
+           Text="No policy packs found in packs/. The packs are compiled into the binary; copy the packs folder into the build." />
+  </Target>
+
+  <ItemGroup>
     <!-- Lets tests reach internal members (e.g. the stdio transport factory)
          without widening the public API surface just to make it testable. -->
     <InternalsVisibleTo Include="McpGuardrails.Core.Tests" />

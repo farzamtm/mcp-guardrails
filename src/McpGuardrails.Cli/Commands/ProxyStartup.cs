@@ -1,6 +1,7 @@
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Hosting;
+using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
@@ -10,13 +11,13 @@ namespace McpGuardrails.Cli.Commands;
 
 /// <summary>
 /// What serving and listing have in common: the command line checked, every
-/// downstream server connected, the policy loaded and the tool definitions
-/// scanned.
+/// downstream server connected, the policy loaded, the tool definitions
+/// scanned and compared with their pins.
 /// </summary>
 /// <remarks>
 /// list-upstream runs exactly this and stops, so what it prints is what the
-/// proxy would serve - including the effect of the metadata scanner and a policy
-/// that fails to load.
+/// proxy would serve - including the effect of the metadata scanner, pin
+/// changes and a policy that fails to load.
 /// </remarks>
 internal sealed class ProxyStartup : IAsyncDisposable
 {
@@ -32,7 +33,8 @@ internal sealed class ProxyStartup : IAsyncDisposable
         BudgetPolicy budgets,
         InjectionGate scanner,
         SecretGate secrets,
-        ToolMetadataGate toolMetadata)
+        ToolMetadataGate toolMetadata,
+        PinStartup pins)
     {
         Serve = serve;
         LoggerFactory = loggerFactory;
@@ -46,6 +48,7 @@ internal sealed class ProxyStartup : IAsyncDisposable
         Scanner = scanner;
         Secrets = secrets;
         ToolMetadata = toolMetadata;
+        Pins = pins;
     }
 
     public ServeOptions Serve { get; }
@@ -72,6 +75,9 @@ internal sealed class ProxyStartup : IAsyncDisposable
     public SecretGate Secrets { get; }
 
     public ToolMetadataGate ToolMetadata { get; }
+
+    /// <summary>The pin comparison, and the gate built from it.</summary>
+    public PinStartup Pins { get; }
 
     /// <summary>Runs the shared startup.</summary>
     /// <param name="args">The full command line.</param>
@@ -105,10 +111,10 @@ internal sealed class ProxyStartup : IAsyncDisposable
         // not be able to quietly override it.
         var classifierFlag = args.Contains("--injection-classifier", StringComparer.Ordinal);
 
-        // Where the sandboxed filesystem server is allowed to operate.
-        var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
-                      ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
-        Directory.CreateDirectory(sandbox);
+        // Where calls go: the servers file, or the built-in filesystem server
+        // when there is none. Loaded and validated in full before anything is
+        // spawned, so every mistake in the file is reported at once.
+        var servers = LoadServers(args);
 
         // Where the audit log lands.
         var auditPath = CliPaths.ConfigPath("GUARDRAILS_AUDIT", "audit.jsonl");
@@ -117,6 +123,15 @@ internal sealed class ProxyStartup : IAsyncDisposable
         // whichever of the two wrote it.
         var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
             logging => CliLogging.ToStandardError(logging, listing));
+
+        // Warnings are logged in list-upstream mode too: it is the command an
+        // operator runs to check a new servers file, and where the environment
+        // isolation notice should first be seen.
+        var serversLog = loggerFactory.CreateLogger("McpGuardrails.Servers");
+        foreach (var warning in servers.Warnings)
+        {
+            serversLog.LogWarning("{Warning}", warning);
+        }
 
         // Everything created from here on is owned by the startup once it is
         // returned; until then, a failure has to release it here.
@@ -127,9 +142,25 @@ internal sealed class ProxyStartup : IAsyncDisposable
         {
             // Connect to every downstream server and cache the tools they
             // advertise. Disposing the registry shuts every spawned child down.
-            upstream = await UpstreamRegistry.ConnectAsync(
-                DefaultUpstreams.Create(sandbox),
-                loggerFactory);
+            try
+            {
+                upstream = await UpstreamRegistry.ConnectAsync(servers.Servers, loggerFactory);
+            }
+            catch (UpstreamConnectionException ex)
+            {
+                // Fatal unless the server is marked optional: a proxy serving a
+                // subset of the tools the operator configured is a tool set
+                // nobody reviewed.
+                throw new CommandFailedException(1, $"{ex.Message} Mark it 'optional: true' to start without it.");
+            }
+
+            foreach (var missing in upstream.Unavailable)
+            {
+                serversLog.LogWarning(
+                    "Optional upstream server '{Server}' is unavailable and its tools are absent this session: {Reason}",
+                    missing.Name,
+                    missing.Reason);
+            }
 
             // Created after the registry so it is disposed BEFORE it: the sink
             // drains its queue while the tool calls that feed it are finished.
@@ -162,6 +193,7 @@ internal sealed class ProxyStartup : IAsyncDisposable
             }
 
             var toolMetadata = ScanToolDefinitions(injection, upstream, loggerFactory);
+            var pins = CheckPins(document, policyPath, upstream, toolMetadata, listing, loggerFactory);
 
             return new ProxyStartup(
                 serve,
@@ -175,7 +207,8 @@ internal sealed class ProxyStartup : IAsyncDisposable
                 budgets,
                 scanner,
                 secrets,
-                toolMetadata);
+                toolMetadata,
+                pins);
         }
         catch
         {
@@ -194,6 +227,36 @@ internal sealed class ProxyStartup : IAsyncDisposable
             loggerFactory.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// The servers to connect: from the servers file when there is one, else the
+    /// built-in filesystem server.
+    /// </summary>
+    private static ServersLoadResult LoadServers(string[] args)
+    {
+        var path = CliServers.Path(args);
+
+        if (path is null)
+        {
+            // Where the sandboxed filesystem server is allowed to operate.
+            var sandbox = Environment.GetEnvironmentVariable("GUARDRAILS_SANDBOX")
+                          ?? Path.Combine(Path.GetTempPath(), "guardrails-sandbox");
+            Directory.CreateDirectory(sandbox);
+
+            return new ServersLoadResult(DefaultUpstreams.Create(sandbox), [], [], []);
+        }
+
+        var result = ServersLoader.LoadFile(path, CliHost.Environment);
+        if (!result.IsValid)
+        {
+            throw new CommandFailedException(
+                1,
+                $"Invalid servers file '{path}':{Environment.NewLine}" +
+                string.Join(Environment.NewLine, result.Errors.Select(e => $"  - {e}")));
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -299,6 +362,130 @@ internal sealed class ProxyStartup : IAsyncDisposable
         return toolMetadata;
     }
 
+    /// <summary>
+    /// Compares every connected server's tools with the pins file, pins the
+    /// servers seen for the first time, and builds the gate.
+    /// </summary>
+    /// <remarks>
+    /// Listing compares but never writes: list-upstream is how an operator looks
+    /// at a server before trusting it, and looking should not be what trusts it.
+    /// Serving is what pins on first use.
+    ///
+    /// A pins file that exists but cannot be read is fatal in every mode but off.
+    /// Treating it as empty would re-pin whatever every server serves now, which
+    /// is the one thing pinning exists to refuse. A file that cannot be written
+    /// on first use is fatal under block, where the operator asked for changes to
+    /// be withheld and a pin that was never saved can never withhold anything,
+    /// and a warning under warn.
+    /// </remarks>
+    private static PinStartup CheckPins(
+        PolicyDocument document,
+        string policyPath,
+        UpstreamRegistry upstream,
+        ToolMetadataGate toolMetadata,
+        bool listing,
+        ILoggerFactory loggerFactory)
+    {
+        var settings = document.EffectiveScanners.EffectivePins;
+        var path = PinsFile.ResolvePath(
+            settings, policyPath, Environment.GetEnvironmentVariable, CliHost.Environment.HomeDirectory);
+
+        if (settings.IsOff)
+        {
+            return new PinStartup(settings, path, null, PinCheckResult.None, false,
+                ToolPinGate.Build(settings, [], toolMetadata.Tools));
+        }
+
+        var log = loggerFactory.CreateLogger<ToolPinGate>();
+
+        PinsDocument? existing;
+        try
+        {
+            existing = PinsFile.Load(path);
+        }
+        catch (PinsException ex)
+        {
+            throw new CommandFailedException(1, ex.Message);
+        }
+
+        var result = PinCheck.Run(
+            existing, upstream.Connections.Select(PinSubject.From), DateTimeOffset.UtcNow);
+
+        var saved = false;
+        if (!listing && result.DocumentChanged)
+        {
+            try
+            {
+                PinsFile.Save(path, result.Document);
+                saved = true;
+            }
+            catch (PinsException ex) when (settings.EffectiveMode is PinMode.Warn)
+            {
+                log.LogWarning(
+                    "{Message} The new servers' tools are not pinned, so a change to them will not be noticed on the next start.",
+                    ex.Message);
+            }
+            catch (PinsException ex)
+            {
+                throw new CommandFailedException(
+                    1, $"{ex.Message} 'scanners.pins.mode: block' needs a pins file it can write.");
+            }
+        }
+
+        var gate = ToolPinGate.Build(settings, result.Reports, toolMetadata.Tools);
+
+        foreach (var report in result.Reports.Where(r => r.FirstSeen))
+        {
+            if (listing)
+            {
+                log.LogWarning(
+                    "Server '{Server}' has no pins yet; its {Count} tools will be pinned the first time the proxy serves.",
+                    report.Server,
+                    report.Current.Count);
+            }
+            else if (saved)
+            {
+                log.LogInformation("Pinned the {Count} tools of server '{Server}' in {Path}.", report.Current.Count, report.Server, path);
+            }
+        }
+
+        foreach (var report in result.Reports.Where(r => r.IdentityChanged))
+        {
+            log.LogWarning(
+                "Server '{Server}' is not the program it was pinned from (pinned from: {Pinned}; now: {Current}). Review with 'pins diff {Server}'.",
+                report.Server,
+                report.PinnedHint,
+                report.CurrentHint,
+                report.Server);
+        }
+
+        foreach (var finding in gate.Findings)
+        {
+            log.LogWarning(
+                "Tool '{Tool}': {Explanation}; {Action}. Review with 'pins diff {Server} {DownstreamTool}', then 'pins accept'.",
+                finding.Tool,
+                finding.Explain(),
+                finding.Effect switch
+                {
+                    PinEffect.Blocked => "withheld from tools/list and calls to it are refused",
+                    PinEffect.Annotated => "its description is prefixed with a warning",
+                    _ => "advertised unchanged, as on_new_tool: allow says",
+                },
+                finding.Server,
+                finding.DownstreamTool);
+        }
+
+        foreach (var report in result.Reports.Where(r => r.Removed.Count > 0))
+        {
+            log.LogWarning(
+                "Server '{Server}' no longer serves pinned tools: {Tools}.",
+                report.Server,
+                string.Join(", ", report.Removed));
+        }
+
+        return new PinStartup(settings, path, existing, result, saved, gate);
+    }
+
     public async ValueTask DisposeAsync()
     {
         // Reverse order of creation: the audit sink drains before the registry
@@ -309,3 +496,18 @@ internal sealed class ProxyStartup : IAsyncDisposable
         LoggerFactory.Dispose();
     }
 }
+
+/// <summary>What startup learned from the pins file.</summary>
+/// <param name="Settings">The policy's pin settings.</param>
+/// <param name="Path">Where the pins file is.</param>
+/// <param name="Existing">The file as loaded, or null when there was none, or pinning is off.</param>
+/// <param name="Result">The comparison; empty when pinning is off.</param>
+/// <param name="Saved">True when first-use pins were written.</param>
+/// <param name="Gate">What tools/list serves and what calls are refused.</param>
+internal sealed record PinStartup(
+    PinSettings Settings,
+    string Path,
+    PinsDocument? Existing,
+    PinCheckResult Result,
+    bool Saved,
+    ToolPinGate Gate);
