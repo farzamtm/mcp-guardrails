@@ -51,6 +51,23 @@ internal sealed class FakeHost
 
     public bool IsMacOS { get; init; }
 
+    /// <summary>What the host reports as the proxy's <c>uid:gid</c>; null when it cannot say.</summary>
+    public string? UserAndGroup { get; set; } = "1000:1000";
+
+    /// <summary>Puts <paramref name="command"/> on the fake PATH.</summary>
+    public FakeHost WithCommand(string command)
+    {
+        Files.Add(Path.Combine(Bin, OperatingSystem.IsWindows() ? command + ".exe" : command));
+        return this;
+    }
+
+    /// <summary>Takes <paramref name="command"/> off the fake PATH.</summary>
+    public FakeHost WithoutCommand(string command)
+    {
+        Files.Remove(Path.Combine(Bin, OperatingSystem.IsWindows() ? command + ".exe" : command));
+        return this;
+    }
+
     public static string At(params string[] parts) => Path.Combine([Root, .. parts]);
 
     public HostEnvironment Build() => new()
@@ -68,5 +85,6 @@ internal sealed class FakeHost
         HomeDirectory = Home,
         IsWindows = IsWindows,
         IsMacOS = IsMacOS,
+        UserAndGroup = () => UserAndGroup,
     };
 }

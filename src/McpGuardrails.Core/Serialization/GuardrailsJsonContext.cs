@@ -87,6 +87,8 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(ServerEntryDocument))]
 [JsonSerializable(typeof(ServerExtensionsDocument))]
 [JsonSerializable(typeof(UpstreamOAuthDocument))]
+[JsonSerializable(typeof(ServerIsolationDocument))]
+[JsonSerializable(typeof(ContainerMountDocument))]
 // Packs and policy test files, refusing unknown keys for the same reason: a
 // misspelt 'expect:' would leave a test case asserting nothing.
 [JsonSerializable(typeof(PackHeader))]

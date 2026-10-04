@@ -128,6 +128,12 @@ public static partial class ServersLoader
             Forbid(document.Headers, "headers", "a stdio server");
             Forbid(document.Guardrails?.OAuth, "x-guardrails.oauth", "a stdio server");
 
+            var isolationDocument = document.Guardrails?.Isolation;
+            if (isolationDocument is not null)
+            {
+                ForbidWhenIsolated(document);
+            }
+
             if (string.IsNullOrWhiteSpace(document.Command))
             {
                 Error("needs a 'command'.");
@@ -140,7 +146,10 @@ public static partial class ServersLoader
             }
 
             var command = Expand(document.Command, "command");
-            if (command is not null && CommandLocator.Check(command, host) is { } problem)
+
+            // An isolated server's command runs inside the image, so whether the
+            // host has it on PATH says nothing; the runtime is checked instead.
+            if (command is not null && isolationDocument is null && CommandLocator.Check(command, host) is { } problem)
             {
                 Error($"'command' '{document.Command}' {problem}.");
             }
@@ -153,7 +162,7 @@ public static partial class ServersLoader
             }
 
             string? workingDirectory = null;
-            if (document.Cwd is not null && Expand(document.Cwd, "cwd") is { } cwd)
+            if (document.Cwd is not null && isolationDocument is null && Expand(document.Cwd, "cwd") is { } cwd)
             {
                 workingDirectory = Path.GetFullPath(cwd, baseDirectory);
                 if (!host.DirectoryExists(workingDirectory))
@@ -170,6 +179,8 @@ public static partial class ServersLoader
 
             TimeSpan? shutdown = Duration(document.ShutdownTimeout ?? defaults.ShutdownTimeout);
 
+            var container = isolationDocument is null ? null : ReadIsolation(isolationDocument, own);
+
             if (command is null || HasNewErrors)
             {
                 return null;
@@ -179,6 +190,30 @@ public static partial class ServersLoader
             {
                 warnings.Add($"{_prefix} runs '{package}' through a package runner without a pinned version, " +
                              "so every start may run a different release. Pin it, e.g. 'package@1.2.3'.");
+            }
+
+            if (container is { } isolated)
+            {
+                return new UpstreamServerConfig
+                {
+                    Name = name,
+                    Transport = UpstreamTransport.Stdio,
+                    Command = isolated.Expanded.Executable,
+                    Arguments = isolated.Expanded.RunArguments(name, command, arguments, own.Keys),
+
+                    // The runtime CLI gets what it needs to reach its daemon, plus
+                    // the server's own variables so each '-e NAME' has a value to
+                    // copy. Nothing else of the proxy's environment, isolation or not.
+                    EnvironmentVariables = EnvironmentIsolation.ChildEnvironment(
+                        host, EnvironmentIsolation.ContainerRuntimePassthrough, own),
+                    InheritEnvironment = false,
+                    ShutdownTimeout = shutdown,
+                    Optional = document.Optional is true,
+                    Isolation = isolated.Expanded,
+                    DisplayTemplate = Display(DisplayCommandLine(
+                        isolated.Display.Executable,
+                        isolated.Display.RunArguments(name, document.Command, templateArgs, own.Keys))),
+                };
             }
 
             var (inherit, environment) = Isolate(document, own);
@@ -209,6 +244,7 @@ public static partial class ServersLoader
             Forbid(document.ShutdownTimeout, "shutdown_timeout", Remote);
             Forbid(document.EnvPassthrough, "env_passthrough", Remote);
             Forbid(document.EnvIsolation, "env_isolation", Remote);
+            Forbid(document.Guardrails?.Isolation, "x-guardrails.isolation", Remote);
 
             if (string.IsNullOrWhiteSpace(document.Url))
             {
@@ -259,6 +295,318 @@ public static partial class ServersLoader
                 Optional = document.Optional is true,
                 DisplayTemplate = Display(document.Url),
             };
+        }
+
+        private void ForbidWhenIsolated(ServerEntryDocument document)
+        {
+            if (document.Cwd is not null)
+            {
+                Error("runs in a container but sets 'cwd'. The command runs inside the image, where host " +
+                      "directories do not exist; mount what it needs under 'x-guardrails.isolation.mounts'.");
+            }
+
+            if (document.EnvPassthrough is not null)
+            {
+                Error("runs in a container but sets 'env_passthrough'. A container gets only the variables " +
+                      "declared in 'env'; pass one on with 'env: { NAME: ${NAME} }'.");
+            }
+
+            if (document.EnvIsolation is not null)
+            {
+                Error("runs in a container but sets 'env_isolation'. A container is always isolated: it gets " +
+                      "only the variables declared in 'env'.");
+            }
+        }
+
+        /// <summary>
+        /// Reads <c>x-guardrails.isolation</c> twice over: once expanded, to launch,
+        /// and once from the file's own text, to display.
+        /// </summary>
+        private (ContainerIsolation Expanded, ContainerIsolation Display)? ReadIsolation(
+            ServerIsolationDocument document, Dictionary<string, string?> own)
+        {
+            const string Field = "x-guardrails.isolation";
+            var errorsBefore = errors.Count;
+
+            var runtime = ReadRuntime(document.Runtime);
+
+            string? image = null;
+            if (string.IsNullOrWhiteSpace(document.Image))
+            {
+                Error($"needs '{Field}.image', the container image to run the server in.");
+            }
+            else if (Expand(document.Image, $"{Field}.image") is { } expandedImage)
+            {
+                if (expandedImage.Length == 0 || expandedImage[0] == '-' || expandedImage.Any(c => char.IsWhiteSpace(c) || char.IsControl(c)))
+                {
+                    Error($"'{Field}.image' '{document.Image}' is not an image reference.");
+                }
+                else
+                {
+                    image = expandedImage;
+                    if (!expandedImage.Contains("@sha256:", StringComparison.Ordinal))
+                    {
+                        warnings.Add($"{_prefix} '{Field}.image' '{document.Image}' is not pinned by digest, so the " +
+                                     "tag can be moved to a different image. Pin it, e.g. 'image@sha256:...'.");
+                    }
+                }
+            }
+
+            var network = document.Network ?? "none";
+            switch (network)
+            {
+                case "none" or "bridge":
+                    break;
+                case "host":
+                    Error($"'{Field}.network' is 'host', which shares the host's network and undoes the " +
+                          "isolation. Use none, or bridge for ordinary outbound access.");
+                    break;
+                case "allowlist":
+                    Error($"'{Field}.network: allowlist' is not supported yet. Use none, or bridge for " +
+                          "ordinary outbound access.");
+                    break;
+                default:
+                    Error($"'{Field}.network' '{network}' is not one of none, bridge.");
+                    break;
+            }
+
+            var mounts = ReadMounts(document.Mounts ?? [], $"{Field}.mounts");
+
+            var memory = document.Memory ?? ContainerIsolation.DefaultMemory;
+            if (!IsMemorySize(memory))
+            {
+                Error($"'{Field}.memory' '{memory}' is not a size such as 512m or 2g.");
+            }
+
+            var cpus = document.Cpus ?? ContainerIsolation.DefaultCpus;
+            if (!(cpus > 0))
+            {
+                Error($"'{Field}.cpus' must be a number greater than 0.");
+            }
+
+            var pids = document.PidsLimit ?? ContainerIsolation.DefaultPidsLimit;
+            if (pids < 1)
+            {
+                Error($"'{Field}.pids_limit' must be at least 1.");
+            }
+
+            var user = ReadUser(document.User, $"{Field}.user");
+
+            foreach (var key in own.Keys)
+            {
+                if (!VariableExpander.IsValidName(key))
+                {
+                    Error($"'env.{key}' is not a variable name, so it cannot be passed into the container.");
+                }
+                else if (EnvironmentIsolation.IsPassed(key, EnvironmentIsolation.ContainerRuntimePassthrough))
+                {
+                    Error($"runs in a container but sets 'env.{key}', which the container runtime's own " +
+                          "command reads too. Set it in the image instead.");
+                }
+            }
+
+            if (errors.Count > errorsBefore)
+            {
+                return null;
+            }
+
+            var expanded = new ContainerIsolation
+            {
+                Runtime = runtime!.Value,
+                Image = image!,
+                Network = network,
+                Mounts = [.. mounts.Select(m => m.Expanded)],
+                ReadOnlyRoot = document.ReadOnlyRoot ?? true,
+                Memory = memory,
+                Cpus = cpus,
+                PidsLimit = pids,
+                User = user!,
+            };
+
+            return (expanded, expanded with
+            {
+                Image = document.Image!,
+                Mounts = [.. mounts.Select(m => m.Display)],
+            });
+        }
+
+        /// <remarks>
+        /// An explicit runtime that is missing is an error, and so is detection
+        /// finding none: the proxy never falls back to running an isolated server
+        /// directly on the host.
+        /// </remarks>
+        private ContainerRuntime? ReadRuntime(string? requested)
+        {
+            const string Never = "The proxy never runs an isolated server outside its container.";
+
+            ContainerRuntime[] candidates = requested switch
+            {
+                null => [ContainerRuntime.Docker, ContainerRuntime.Podman],
+                "docker" => [ContainerRuntime.Docker],
+                "podman" => [ContainerRuntime.Podman],
+                _ => [],
+            };
+
+            if (candidates.Length == 0)
+            {
+                Error($"'x-guardrails.isolation.runtime' '{requested}' is not one of docker, podman.");
+                return null;
+            }
+
+            foreach (var candidate in candidates)
+            {
+                if (CommandLocator.Check(ContainerIsolation.ExecutableFor(candidate), host) is null)
+                {
+                    return candidate;
+                }
+            }
+
+            Error(requested is null
+                ? $"runs in a container, but neither docker nor podman was found on PATH. Install one. {Never}"
+                : $"runs in a container with '{requested}', which was not found on PATH. {Never}");
+            return null;
+        }
+
+        private List<(ContainerMount Expanded, ContainerMount Display)> ReadMounts(
+            IReadOnlyList<ContainerMountDocument> documents, string field)
+        {
+            var mounts = new List<(ContainerMount, ContainerMount)>();
+            var targets = new HashSet<string>(StringComparer.Ordinal);
+
+            for (var i = 0; i < documents.Count; i++)
+            {
+                var document = documents[i];
+                var at = $"'{field}[{i}]'";
+
+                if (document is null || string.IsNullOrWhiteSpace(document.Host) || string.IsNullOrWhiteSpace(document.Container))
+                {
+                    Error($"{at} needs both 'host' and 'container' paths.");
+                    continue;
+                }
+
+                MountMode? mode = document.Mode switch
+                {
+                    null or "ro" => MountMode.ReadOnly,
+                    "rw" => MountMode.ReadWrite,
+                    _ => null,
+                };
+
+                if (mode is null)
+                {
+                    Error($"{at} has mode '{document.Mode}'; use ro or rw.");
+                }
+
+                var hostPath = Expand(document.Host, $"{field}[{i}].host") is { } expandedHost
+                    ? Path.GetFullPath(expandedHost, baseDirectory)
+                    : null;
+                var containerPath = Expand(document.Container, $"{field}[{i}].container");
+
+                if (hostPath is null || containerPath is null || mode is null)
+                {
+                    continue;
+                }
+
+                if (!CanBeMounted(hostPath) || !CanBeMounted(containerPath))
+                {
+                    Error($"{at} has a path containing a comma, a quote or a control character, which a " +
+                          "mount cannot express.");
+                    continue;
+                }
+
+                if (!host.DirectoryExists(hostPath) && !host.FileExists(hostPath))
+                {
+                    Error($"{at} host path '{document.Host}' does not exist.");
+                    continue;
+                }
+
+                if (Path.GetFileName(hostPath) is "docker.sock" or "podman.sock")
+                {
+                    Error($"{at} mounts a container runtime's socket. Whoever holds it controls the host, " +
+                          "which is the opposite of isolation.");
+                    continue;
+                }
+
+                if (!containerPath.StartsWith('/') || containerPath.Trim('/').Length == 0)
+                {
+                    Error($"{at} container path '{document.Container}' must be absolute, and not '/'.");
+                    continue;
+                }
+
+                if (!targets.Add(containerPath.TrimEnd('/')))
+                {
+                    Error($"{at} mounts onto '{document.Container}' a second time.");
+                    continue;
+                }
+
+                if (Contains(hostPath, host.HomeDirectory))
+                {
+                    warnings.Add($"{_prefix} {at} mounts '{document.Host}', which holds your whole home directory " +
+                                 "(SSH keys, cloud credentials, browser profiles). Mount only the folder the server needs.");
+                }
+
+                mounts.Add((
+                    new ContainerMount(hostPath, containerPath, mode.Value),
+                    new ContainerMount(document.Host, document.Container, mode.Value)));
+            }
+
+            return mounts;
+        }
+
+        private string? ReadUser(string? requested, string field)
+        {
+            if (requested is null)
+            {
+                if (host.UserAndGroup() is { } own)
+                {
+                    return own;
+                }
+
+                if (!host.IsWindows)
+                {
+                    warnings.Add($"{_prefix} could not read your user id, so the container runs as nobody " +
+                                 $"({ContainerIsolation.FallbackUser}) and may be unable to write to read-write mounts. " +
+                                 $"Set '{field}'.");
+                }
+
+                return ContainerIsolation.FallbackUser;
+            }
+
+            var parts = requested.Split(':');
+            if (parts.Length > 2 || parts.Any(part => part.Length == 0 || part[0] == '-' ||
+                                                      !part.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or '-')))
+            {
+                Error($"'{field}' '{requested}' is not a user such as 1000:1000.");
+                return null;
+            }
+
+            if (parts[0] is "0" or "root")
+            {
+                warnings.Add($"{_prefix} '{field}' runs the server as root inside its container. Capabilities are " +
+                             "still dropped, but a non-root user is one more barrier.");
+            }
+
+            return requested;
+        }
+
+        private static bool CanBeMounted(string path) =>
+            !path.Any(c => c is ',' or '"' || char.IsControl(c));
+
+        /// <summary>Whether mounting <paramref name="mounted"/> exposes <paramref name="inner"/>.</summary>
+        private static bool Contains(string mounted, string inner)
+        {
+            var outer = mounted.TrimEnd('/', '\\');
+            return inner == outer ||
+                   inner.StartsWith(outer + Path.DirectorySeparatorChar, StringComparison.Ordinal) ||
+                   outer.Length == 0;
+        }
+
+        /// <summary>Digits with an optional b, k, m or g unit: the sizes Docker and Podman accept.</summary>
+        private static bool IsMemorySize(string text)
+        {
+            var digits = text.Length > 0 && char.ToLowerInvariant(text[^1]) is 'b' or 'k' or 'm' or 'g'
+                ? text[..^1]
+                : text;
+            return digits.Length is > 0 and <= 12 && digits.All(char.IsAsciiDigit) && digits.Any(c => c != '0');
         }
 
         private (bool Inherit, IReadOnlyDictionary<string, string?> Environment) Isolate(

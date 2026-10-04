@@ -32,6 +32,17 @@ public sealed class HostEnvironment
     /// <summary>The user's home directory, for default paths.</summary>
     public required string HomeDirectory { get; init; }
 
+    /// <summary>
+    /// The proxy's own <c>uid:gid</c>, or null where there is none (Windows) or it
+    /// could not be read.
+    /// </summary>
+    /// <remarks>
+    /// An isolated server runs as this user inside its container, so files it
+    /// writes into a read-write mount belong to the person who started the proxy
+    /// rather than to root. Optional so hosts built for tests need not set it.
+    /// </remarks>
+    public Func<string?> UserAndGroup { get; init; } = static () => null;
+
     /// <summary>True on Windows: PATH uses ';' and commands may need a PATHEXT extension.</summary>
     public bool IsWindows { get; init; }
 

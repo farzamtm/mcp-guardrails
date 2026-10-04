@@ -108,6 +108,65 @@ public sealed record ServerExtensionsDocument
     /// <summary>Log in to the remote server with OAuth.</summary>
     [JsonPropertyName("oauth")]
     public UpstreamOAuthDocument? OAuth { get; init; }
+
+    /// <summary>Run the stdio server inside a container.</summary>
+    [JsonPropertyName("isolation")]
+    public ServerIsolationDocument? Isolation { get; init; }
+}
+
+/// <summary>The <c>x-guardrails.isolation:</c> block of a stdio server.</summary>
+/// <remarks>
+/// Every field is optional except <c>image</c>; an absent one means the strict
+/// default, never "whatever the runtime does".
+/// </remarks>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ServerIsolationDocument
+{
+    /// <summary><c>docker</c> or <c>podman</c>; detected on PATH when omitted.</summary>
+    [JsonPropertyName("runtime")]
+    public string? Runtime { get; init; }
+
+    [JsonPropertyName("image")]
+    public string? Image { get; init; }
+
+    /// <summary><c>none</c> (default) or <c>bridge</c>.</summary>
+    [JsonPropertyName("network")]
+    public string? Network { get; init; }
+
+    [JsonPropertyName("mounts")]
+    public IReadOnlyList<ContainerMountDocument>? Mounts { get; init; }
+
+    [JsonPropertyName("read_only_root")]
+    public bool? ReadOnlyRoot { get; init; }
+
+    /// <summary>A memory size such as <c>512m</c>.</summary>
+    [JsonPropertyName("memory")]
+    public string? Memory { get; init; }
+
+    [JsonPropertyName("cpus")]
+    public double? Cpus { get; init; }
+
+    [JsonPropertyName("pids_limit")]
+    public int? PidsLimit { get; init; }
+
+    /// <summary><c>uid:gid</c> inside the container; the proxy's own user when omitted.</summary>
+    [JsonPropertyName("user")]
+    public string? User { get; init; }
+}
+
+/// <summary>One entry of <c>x-guardrails.isolation.mounts</c>.</summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ContainerMountDocument
+{
+    [JsonPropertyName("host")]
+    public string? Host { get; init; }
+
+    [JsonPropertyName("container")]
+    public string? Container { get; init; }
+
+    /// <summary><c>ro</c> (default) or <c>rw</c>.</summary>
+    [JsonPropertyName("mode")]
+    public string? Mode { get; init; }
 }
 
 /// <summary>The <c>x-guardrails.oauth:</c> block of a remote server.</summary>
