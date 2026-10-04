@@ -557,6 +557,10 @@ public sealed class ServersLoaderIsolationTests
     {
         var host = new FakeHost { IsWindows = false, UserAndGroup = null };
 
+        // A Unix host finds commands without an extension, even when the tests
+        // themselves run on Windows.
+        host.Files.Add(Path.Combine(FakeHost.Bin, "docker"));
+
         var result = Parse($"""
                     image: {_image}
             """, host);
@@ -570,7 +574,7 @@ public sealed class ServersLoaderIsolationTests
     {
         var host = new FakeHost { IsWindows = true, UserAndGroup = null };
         host.Variables["PATHEXT"] = ".EXE";
-        host.WithCommand("docker").Files.Add(Path.Combine(FakeHost.Bin, "docker.EXE"));
+        host.Files.Add(Path.Combine(FakeHost.Bin, "docker.EXE"));
 
         var result = Parse($"""
                     image: {_image}
