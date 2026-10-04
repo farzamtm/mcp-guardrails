@@ -13,15 +13,21 @@ public sealed class ApprovalChannelRouter : IApprovalChannel
 {
     private readonly IApprovalChannel _inBand;
     private readonly IApprovalChannel? _webhook;
+    private readonly IApprovalChannel? _localUi;
 
     /// <param name="inBand">Asks the human at the MCP client.</param>
     /// <param name="webhook">Asks the configured HTTP endpoint, when there is one.</param>
-    public ApprovalChannelRouter(IApprovalChannel inBand, IApprovalChannel? webhook = null)
+    /// <param name="localUi">Asks the local UI's approval inbox, when the host wired one.</param>
+    public ApprovalChannelRouter(
+        IApprovalChannel inBand,
+        IApprovalChannel? webhook = null,
+        IApprovalChannel? localUi = null)
     {
         ArgumentNullException.ThrowIfNull(inBand);
 
         _inBand = inBand;
         _webhook = webhook;
+        _localUi = localUi;
     }
 
     /// <inheritdoc />
@@ -35,6 +41,7 @@ public sealed class ApprovalChannelRouter : IApprovalChannel
         {
             ApprovalMode.InBand => _inBand,
             ApprovalMode.Webhook => _webhook,
+            ApprovalMode.LocalUi => _localUi,
             _ => null,
         };
 

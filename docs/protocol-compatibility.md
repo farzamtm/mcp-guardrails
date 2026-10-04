@@ -24,7 +24,7 @@ marked **(unverified)**.
 | Transport to upstream servers | stdio (spawned child processes), Streamable HTTP (`type: http`) or HTTP+SSE (`type: sse`) from the [servers file](servers.md); never auto-detected |
 | Features proxied | Tools: `tools/list`, `tools/call` |
 | Not proxied | Resources, prompts, completions, logging, subscriptions, `listChanged` notifications, progress |
-| Approval mechanism | Elicitation (`elicitation/create`), form mode, held open until answered — stdio only; or a signed webhook on either transport |
+| Approval mechanism | Elicitation (`elicitation/create`), form mode, held open until answered — stdio only; or a signed webhook/local-UI request on either transport |
 | Tasks extension / MRTR approval | **Not implemented** |
 | Tested end to end | Initialize handshake at 2025-06-18 with and without the elicitation capability, and a client that sends no handshake at all ([`scripts/smoke.py`](../scripts/smoke.py)) |
 
@@ -132,7 +132,7 @@ operator writes on purpose.
 | Declares elicitation with **URL mode only** (2025-11-25) | The proxy sends a form-mode request; the SDK refuses to send form mode to a client that did not declare it and throws, and the gate turns that into a refusal. | `failed` **(unverified)** | No |
 | Client gives up first (its own request timeout, or the user cancels) | The cancellation propagates; nothing is forwarded. The audit line records the error and **no decision**, because none was reached. | *(absent)* | By reading the code |
 | 2026-07-28 client, over stdio | See below. | **(unverified)** | No |
-| Any client, over Streamable HTTP | Stateless HTTP has no channel for a server-to-client request, so the proxy does not try: refused immediately, whatever the client declared. A `mode: webhook` rule is unaffected. | `unavailable` | Yes — smoke test |
+| Any client, over Streamable HTTP | Stateless HTTP has no channel for a server-to-client request, so the proxy does not try: refused immediately, whatever the client declared. A `mode: webhook` or `mode: local_ui` rule is unaffected. | `unavailable` | Yes — smoke test |
 | Tasks-capable client | Tasks are not implemented or advertised; the call is handled exactly as for its protocol revision. A task-augmented `tools/call` is **(unverified)**. | — | No |
 
 ### Why "held open" is the down-level path, and what it costs

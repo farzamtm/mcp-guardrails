@@ -90,6 +90,16 @@ public sealed record AuditRecord
     [JsonPropertyName("approval")]
     public string? Approval { get; init; }
 
+    /// <summary>Where the human was asked, when one was: in_band, webhook or local_ui.</summary>
+    /// <remarks>
+    /// Present exactly when <see cref="Approval"/> is. An auditor reading
+    /// "approved" needs to know whether the yes came from the person at the
+    /// client, from a webhook receiver or from the local UI, because each has a
+    /// different idea of who that person was.
+    /// </remarks>
+    [JsonPropertyName("approval_channel")]
+    public string? ApprovalChannel { get; init; }
+
     /// <summary>
     /// Heuristics the result scanner matched, when the call returned something.
     /// </summary>

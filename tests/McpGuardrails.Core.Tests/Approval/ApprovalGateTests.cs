@@ -156,6 +156,21 @@ public sealed class ApprovalGateTests
     }
 
     [Fact]
+    public async Task ALocalUiThatIsNotRunning_SaysHowToStartIt()
+    {
+        // The local UI is a process of its own, so "unavailable" means something
+        // the user can fix immediately, unlike a client with no elicitation.
+        var result = await ApprovalGate.ApplyAsync(
+            NeedsApproval(settings: new ApprovalSettings { Mode = ApprovalMode.LocalUi }),
+            _call,
+            new FakeChannel(ApprovalOutcome.Unavailable));
+
+        Assert.Equal(Verdict.Deny, result.Verdict);
+        Assert.Equal(ApprovalOutcome.Unavailable, result.ApprovalResult);
+        Assert.Contains("mcp-guardrails ui", result.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task AChannelThatThrows_DeniesRatherThanEscaping()
     {
         // A broken guardrail is a reason to stop. Letting the exception out would

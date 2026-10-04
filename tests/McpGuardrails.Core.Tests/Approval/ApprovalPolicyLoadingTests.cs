@@ -105,6 +105,23 @@ public sealed class ApprovalPolicyLoadingTests
     }
 
     [Fact]
+    public void ALocalUiRule_NeedsNoApproversSection()
+    {
+        // Unlike webhook, local_ui has nothing to configure in the policy: the UI
+        // is found at runtime through the rendezvous file, not a URL the operator
+        // writes down.
+        var document = PolicyLoader.Parse("""
+            rules:
+              - name: approve-deletes
+                decision: require_approval
+                approval:
+                  mode: local_ui
+            """);
+
+        Assert.Equal(ApprovalMode.LocalUi, document.EffectiveRules[0].Approval?.EffectiveMode);
+    }
+
+    [Fact]
     public void AWebhookRuleWithoutAnApprover_FailsAtLoadTime()
     {
         var error = Assert.Throws<PolicyException>(() => PolicyLoader.Parse("""

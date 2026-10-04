@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
+using McpGuardrails.Core.LocalUi;
 using McpGuardrails.Core.Packs;
 using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
@@ -95,4 +96,6 @@ namespace McpGuardrails.Core.Serialization;
 [JsonSerializable(typeof(PolicyTestDocument))]
 [JsonSerializable(typeof(PolicyTestTool))]
 [JsonSerializable(typeof(PolicyTestCase))]
+// Where the local UI listens, read by every proxy with a local_ui rule.
+[JsonSerializable(typeof(UiRendezvousDocument))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

@@ -125,7 +125,8 @@ public sealed class GuardrailsCallPipelineTests
                 Budget,
                 new InjectionGate(injection),
                 Webhook,
-                explain);
+                explain,
+                LocalUi);
         }
 
         public UpstreamRegistry Registry { get; }
@@ -143,6 +144,8 @@ public sealed class GuardrailsCallPipelineTests
         public FakeChannel InBand { get; set; } = new();
 
         public FakeChannel Webhook { get; } = new();
+
+        public FakeChannel LocalUi { get; } = new();
 
         /// <summary>How many calls actually reached the downstream server.</summary>
         public int Forwarded { get; private set; }
@@ -582,6 +585,9 @@ public sealed class GuardrailsCallPipelineTests
         Assert.Equal(1, h.Forwarded);
         Assert.Equal("allow", h.Sink.Records[^1].Decision);
         Assert.Equal("approved", h.Sink.Records[^1].Approval);
+        // No explicit mode on the rule, so the default - in_band - is what gets
+        // recorded, not a null the reader would have to guess the meaning of.
+        Assert.Equal("in_band", h.Sink.Records[^1].ApprovalChannel);
 
         // Approved again, but the budget is gone: the human was asked first, and
         // the budget had the last word.
@@ -616,6 +622,30 @@ public sealed class GuardrailsCallPipelineTests
         Assert.Equal(1, h.Webhook.Asked);
         Assert.Equal(0, h.InBand.Asked);
         Assert.Equal(1, h.Forwarded);
+        Assert.Equal("webhook", h.Sink.Records[^1].ApprovalChannel);
+    }
+
+    [Fact]
+    public async Task ALocalUiRule_IsPutToTheLocalUiNotTheClient()
+    {
+        await using var h = await Harness.StartAsync("""
+            rules:
+              - name: approve-by-local-ui
+                match:
+                  tool: fs__echo
+                decision: require_approval
+                approval:
+                  mode: local_ui
+            """);
+
+        await h.CallAsync("fs__echo");
+
+        Assert.Equal(1, h.LocalUi.Asked);
+        Assert.Equal(0, h.InBand.Asked);
+        Assert.Equal(0, h.Webhook.Asked);
+        Assert.Equal(1, h.Forwarded);
+        Assert.Equal("approved", h.Sink.Records[^1].Approval);
+        Assert.Equal("local_ui", h.Sink.Records[^1].ApprovalChannel);
     }
 
     [Fact]

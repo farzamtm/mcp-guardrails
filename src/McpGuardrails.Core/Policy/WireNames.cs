@@ -60,6 +60,16 @@ public static class WireNames
         _ => throw Unknown(nameof(outcome), outcome),
     };
 
+    /// <summary>in_band, webhook or local_ui.</summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not a defined mode.</exception>
+    public static string ToWireName(this ApprovalMode mode) => mode switch
+    {
+        ApprovalMode.InBand => "in_band",
+        ApprovalMode.Webhook => "webhook",
+        ApprovalMode.LocalUi => "local_ui",
+        _ => throw Unknown(nameof(mode), mode),
+    };
+
     private static ArgumentOutOfRangeException Unknown<T>(string name, T value)
         where T : struct, Enum =>
         new(name, value, $"No wire name is defined for {typeof(T).Name} value {value}.");

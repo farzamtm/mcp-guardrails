@@ -23,6 +23,12 @@ public enum ApprovalMode
     /// </summary>
     [JsonStringEnumMemberName("webhook")]
     Webhook,
+
+    /// <summary>
+    /// Put the question in the approval inbox of the local UI (<c>mcp-guardrails ui</c>).
+    /// </summary>
+    [JsonStringEnumMemberName("local_ui")]
+    LocalUi,
 }
 
 /// <summary>
@@ -89,7 +95,7 @@ public sealed record ApprovalSettings
         if (!Enum.IsDefined(EffectiveMode))
         {
             throw new PolicyException(
-                $"Rule '{ruleName}' has an unknown approval mode. Use in_band or webhook.");
+                $"Rule '{ruleName}' has an unknown approval mode. Use in_band, webhook or local_ui.");
         }
 
         if (TimeoutSeconds is <= 0)

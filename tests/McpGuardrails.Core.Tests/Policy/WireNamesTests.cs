@@ -43,6 +43,15 @@ public sealed class WireNamesTests
         Assert.Equal(expected, outcome.ToWireName());
     }
 
+    [Theory]
+    [InlineData(ApprovalMode.InBand, "in_band")]
+    [InlineData(ApprovalMode.Webhook, "webhook")]
+    [InlineData(ApprovalMode.LocalUi, "local_ui")]
+    public void ApprovalMode_IsSnakeCase(ApprovalMode mode, string expected)
+    {
+        Assert.Equal(expected, mode.ToWireName());
+    }
+
     [Fact]
     public void EveryVerdict_HasADistinctSpelling()
     {
@@ -62,11 +71,18 @@ public sealed class WireNamesTests
     }
 
     [Fact]
+    public void EveryApprovalMode_HasADistinctSpelling()
+    {
+        AssertDistinct(Enum.GetValues<ApprovalMode>().Select(WireNames.ToWireName));
+    }
+
+    [Fact]
     public void AnUndefinedValue_Throws_RatherThanBorrowingAnotherName()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => ((Verdict)99).ToWireName());
         Assert.Throws<ArgumentOutOfRangeException>(() => ((DecisionSource)99).ToWireName());
         Assert.Throws<ArgumentOutOfRangeException>(() => ((ApprovalOutcome)99).ToWireName());
+        Assert.Throws<ArgumentOutOfRangeException>(() => ((ApprovalMode)99).ToWireName());
     }
 
     // Every value maps (no throw) and no two values collide - a copy-pasted arm

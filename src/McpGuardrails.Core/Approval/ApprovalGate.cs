@@ -122,6 +122,16 @@ public static class ApprovalGate
                 "treats silence as refusal. Tell the user the call is waiting on their " +
                 "approval rather than retrying."),
 
+            // The local UI is a process of its own; "unavailable" there means it
+            // is not running, which the user can fix in a few seconds, unlike the
+            // in-band case below.
+            ApprovalOutcome.Unavailable when settings.EffectiveMode is ApprovalMode.LocalUi => Refuse(
+                decision,
+                outcome,
+                "this call needs approval in the local Guardrails UI, and the UI is not " +
+                "running. Do not retry on your own; tell the user to start it with " +
+                "'mcp-guardrails ui', approve the call there, and ask you to try again."),
+
             ApprovalOutcome.Unavailable => Refuse(
                 decision,
                 outcome,
