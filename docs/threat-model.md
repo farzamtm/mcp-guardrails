@@ -230,10 +230,15 @@ the fastest route to "clean up the repo" is `rm`.
   [`ArgumentGate`](../src/McpGuardrails.Core/Scanners/ArgumentGate.cs),
   [`ArgumentScanner`](../src/McpGuardrails.Core/Scanners/ArgumentScanner.cs).
   Built-in checks for the attack shapes a policy author may not think to write
-  a rule for: internal addresses (`ssrf`, decoding decimal, octal, hex and
-  IPv6-embedded forms), credential files (`sensitive-path`), `..` in any
-  encoding (`path-traversal`), and shell metacharacters in command arguments
-  (`shell-metachar`). Linear-time, no regex. They run after the policy and
+  a rule for: internal addresses (`ssrf`, decoding decimal, octal, hex,
+  zero-padded and IPv6-embedded forms, and applying the clean-up a URL parser
+  does first: deleting tabs and newlines, folding full-width and enclosed
+  characters, reading userinfo up to the last `@`), credential files
+  (`sensitive-path`, resolving `.` and `..` segments and Windows trailing dots),
+  `..` in any encoding (`path-traversal`), and shell metacharacters in command
+  arguments (`shell-metachar`). Hits name argument keys only when they are
+  plain identifiers, so a key the model wrote cannot put words into an
+  approval question or the audit log. Linear-time, no regex. They run after the policy and
   before approval, and an explicit policy `allow` does not silence them; only
   an override in `scanners.arguments` exempts a tool. Arguments too large or
   too deep to read in full are a finding (`argument-too-large`), not a skipped
@@ -440,18 +445,21 @@ cannot know what a server will do with them:
   any check that does not proxy the connection itself.
 - **`shell-metachar` is scoped by name.** It reads arguments named like
   commands (`command`, `cmd`, `script`, `args`...) and every argument of a tool
-  named like a shell (`*exec*`, `*shell*`, `*run_command*`). A shell tool with
-  an innocuous name and an argument called `input` is not covered unless an
-  override says so; a SQL tool whose name contains `exec` gets flagged for `;`.
+  whose name has the word `exec` or `shell`, or `run`/`execute` then
+  `command`/`cmd`. A shell tool with an innocuous name and an argument called
+  `input` is not covered unless an override says so.
 - **Prose is not read as paths.** A value with whitespace is split into words,
   and only words with a separator are checked, so "add .env to .gitignore" does
-  not fire. A credential path with spaces in an argument whose name does not
-  say "path" is missed.
+  not fire. In a command a quoted word is kept whole, but a credential path
+  with spaces in prose, outside quotes, in an argument whose name does not say
+  "path" is missed.
+- **Shell quoting and globs are not undone.** `cat ~/.s""sh/id_rsa` and
+  `cat /etc/sha?ow` reach the file through the shell but match no name.
 - **Values, not keys.** Object keys count against the size cap but are not
   scanned; a server that reads a URL out of a key is not covered.
-- **Known encodings only.** `path-traversal` recognises plain, percent-,
-  double-percent-, overlong-UTF-8 and `%u` encodings of `.`, `/` and `\`, plus a
-  few Unicode look-alikes. A server with its own decoding quirks can be fooled
+- **Known encodings only.** The path detectors decode percent-escapes up to
+  three levels deep, overlong UTF-8 and `%u` forms, plus a few Unicode
+  look-alikes of `.`, `/` and `\`. A server with its own decoding quirks can be fooled
   by forms not on the list.
 - **`audit` is the default.** Nothing is refused until an operator chooses
   `approve` or `block`, for the whole section or per tool with `overrides`.
