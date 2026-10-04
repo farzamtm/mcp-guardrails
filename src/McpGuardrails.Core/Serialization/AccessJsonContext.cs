@@ -8,8 +8,10 @@ namespace McpGuardrails.Core.Serialization;
 /// server metadata the proxy reads and the resource metadata it serves.
 /// </summary>
 /// <remarks>
-/// Separate from <see cref="GuardrailsJsonContext"/> because these are wire
-/// formats defined by RFCs, not files an operator writes.
+/// Kept apart from <see cref="GuardrailsJsonContext"/> so the OAuth surface -
+/// the two documents exchanged with authorization servers and clients - can be
+/// read in one place. The <c>access:</c> policy section itself is registered
+/// with the rest of the policy in <see cref="GuardrailsJsonContext"/>.
 /// </remarks>
 [JsonSourceGenerationOptions(DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(AuthorizationServerDocument))]

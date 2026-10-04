@@ -816,6 +816,7 @@ public sealed class GuardrailsCallPipelineTests
                     RedactionEffect.Redacted));
                 return ValueTask.FromResult(result);
             },
+            caller: null,
             CancellationToken.None);
 
         var record = h.Record;
@@ -852,6 +853,7 @@ public sealed class GuardrailsCallPipelineTests
                     new RedactionOutcome(result, SecretReport.Clean, RedactionEffect.None));
                 return ValueTask.FromResult(result);
             },
+            caller: null,
             CancellationToken.None);
 
         var record = h.Record;
@@ -878,6 +880,7 @@ public sealed class GuardrailsCallPipelineTests
             await h.Pipeline.AuditAsync(
                 Call("fs__echo"),
                 _ => throw new TimeoutException("slow"),
+                caller: null,
                 CancellationToken.None));
 
         Assert.Null(h.Record.Decision);
