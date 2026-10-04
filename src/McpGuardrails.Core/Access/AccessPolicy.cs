@@ -122,6 +122,16 @@ public sealed record OAuthSettings
     [JsonPropertyName("jwks_max_age_s")]
     public int? JwksMaxAgeSeconds { get; init; }
 
+    /// <summary>Refuse a token whose <c>typ</c> header is not <c>at+jwt</c> (RFC 9068).</summary>
+    /// <remarks>
+    /// Off by default: Entra ID, Okta and Auth0 send <c>typ: JWT</c> unless told
+    /// otherwise, and turning this on against them refuses every token. Worth
+    /// turning on for an issuer that does send <c>at+jwt</c>, because then no
+    /// other kind of token it signs can pass for an access token.
+    /// </remarks>
+    [JsonPropertyName("require_at_jwt")]
+    public bool? RequireAtJwt { get; init; }
+
     /// <summary>The issuer as a URL. Only meaningful after <see cref="Validate"/>.</summary>
     [JsonIgnore]
     public Uri IssuerUri => new(Issuer!, UriKind.Absolute);
@@ -157,6 +167,16 @@ public sealed record OAuthSettings
     /// <summary>The key maximum age.</summary>
     [JsonIgnore]
     public TimeSpan JwksMaxAge => TimeSpan.FromSeconds(JwksMaxAgeSeconds ?? DefaultJwksMaxAgeSeconds);
+
+    /// <summary>Settings that are valid but weaker than they could be, as sentences for the startup log.</summary>
+    [JsonIgnore]
+    public IReadOnlyList<string> Warnings => EffectiveRequiredScopes.Count > 0
+        ? []
+        : [
+            "'access.oauth.required_scopes' is empty, so any token the issuer signs for this audience is " +
+            "accepted. Requiring a scope the issuer only grants in access tokens shuts out ID tokens and " +
+            "tokens issued for other purposes.",
+        ];
 
     internal void Validate()
     {

@@ -96,7 +96,8 @@ internal sealed class TestIssuer
         TimeSpan? expiresIn = null,
         bool noExpiry = false,
         DateTimeOffset? notBefore = null,
-        IDictionary<string, object>? claims = null)
+        IDictionary<string, object>? claims = null,
+        string? type = null)
     {
         key ??= Rsa;
         var payload = new Dictionary<string, object>(claims ?? new Dictionary<string, object>());
@@ -122,6 +123,7 @@ internal sealed class TestIssuer
             Issuer = issuer,
             Audience = audience,
             Claims = payload,
+            TokenType = type,
             SigningCredentials = new SigningCredentials(
                 key, algorithm ?? (key is ECDsaSecurityKey ? SecurityAlgorithms.EcdsaSha256 : SecurityAlgorithms.RsaSha256)),
         });

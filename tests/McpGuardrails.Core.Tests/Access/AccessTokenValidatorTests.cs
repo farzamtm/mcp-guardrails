@@ -78,6 +78,53 @@ public sealed class AccessTokenValidatorTests
         Assert.Equal(["ops"], check.Caller!.Groups);
     }
 
+    [Fact]
+    public async Task AGroupsClaimAsOneString_IsOneGroup()
+    {
+        var issuer = new TestIssuer();
+        var token = issuer.Token(claims: new Dictionary<string, object> { ["groups"] = "ops" });
+
+        Assert.Equal(["ops"], (await Check(issuer, token)).Caller!.Groups);
+    }
+
+    [Fact]
+    public async Task AnEmptyOrMissingGroupsClaim_IsNoGroups()
+    {
+        var issuer = new TestIssuer();
+        var empty = issuer.Token(claims: new Dictionary<string, object> { ["groups"] = Array.Empty<string>() });
+
+        Assert.Empty((await Check(issuer, empty)).Caller!.Groups);
+        Assert.Empty((await Check(issuer, issuer.Token())).Caller!.Groups);
+    }
+
+    [Fact]
+    public async Task FractionalTimestamps_AreRead_NotTreatedAsMissing()
+    {
+        // RFC 7519 NumericDate allows fractions of a second.
+        var issuer = new TestIssuer();
+        var validator = await issuer.ValidatorAsync();
+        double At(TimeSpan offset) => (TestIssuer.Now + offset).ToUnixTimeSeconds() + 0.5;
+
+        var current = issuer.Token(noExpiry: true, claims: new Dictionary<string, object>
+        {
+            ["exp"] = At(TimeSpan.FromMinutes(5)),
+            ["nbf"] = At(TimeSpan.FromMinutes(-1)),
+        });
+        var expired = issuer.Token(noExpiry: true, claims: new Dictionary<string, object>
+        {
+            ["exp"] = At(TimeSpan.FromMinutes(-5)),
+        });
+        var early = issuer.Token(noExpiry: true, claims: new Dictionary<string, object>
+        {
+            ["exp"] = At(TimeSpan.FromMinutes(10)),
+            ["nbf"] = At(TimeSpan.FromMinutes(5)),
+        });
+
+        Assert.Equal(TokenStatus.Valid, (await validator.ValidateAsync(current)).Status);
+        Assert.Equal("token expired", (await validator.ValidateAsync(expired)).Problem);
+        Assert.Equal("token not yet valid", (await validator.ValidateAsync(early)).Problem);
+    }
+
     // ------------------------------------------------------------- forgeries
 
     [Fact]
@@ -214,6 +261,42 @@ public sealed class AccessTokenValidatorTests
         var check = await Check(issuer, issuer.Token(expiresIn: TimeSpan.FromSeconds(-1)), "    clock_skew_s: 0");
 
         Assert.Equal("token expired", check.Problem);
+    }
+
+    // ------------------------------------------------------- token kind
+
+    [Fact]
+    public async Task AnIdTokenWithANonce_IsRefused()
+    {
+        // Same issuer, audience and keys as an access token when the client and
+        // the API share one app registration; the nonce is what gives it away.
+        var issuer = new TestIssuer();
+        var token = issuer.Token(claims: new Dictionary<string, object> { ["nonce"] = "n-0S6_WzA2Mj" });
+
+        var check = await Check(issuer, token);
+
+        Assert.Equal(TokenStatus.Invalid, check.Status);
+        Assert.Equal("an ID token, not an access token", check.Problem);
+    }
+
+    [Fact]
+    public async Task RequireAtJwt_RefusesEveryOtherType()
+    {
+        var issuer = new TestIssuer();
+        const string strict = "    require_at_jwt: true";
+
+        Assert.Equal(TokenStatus.Valid, (await Check(issuer, issuer.Token(type: "at+jwt"), strict)).Status);
+        Assert.Equal(TokenStatus.Valid, (await Check(issuer, issuer.Token(type: "application/at+jwt"), strict)).Status);
+        Assert.Equal("not an access token (typ)", (await Check(issuer, issuer.Token(type: "JWT"), strict)).Problem);
+    }
+
+    [Fact]
+    public async Task WithoutRequireAtJwt_AnyTypeIsAccepted()
+    {
+        // The default, because Entra ID, Okta and Auth0 send typ: JWT.
+        var issuer = new TestIssuer();
+
+        Assert.Equal(TokenStatus.Valid, (await Check(issuer, issuer.Token(type: "JWT"))).Status);
     }
 
     // ------------------------------------------------------------- principal

@@ -129,6 +129,12 @@ internal sealed class ServeCommand : ICliCommand
 
         if (serve.OAuth is { } oauth)
         {
+            var accessLog = startup.LoggerFactory.CreateLogger("McpGuardrails.Access");
+            foreach (var warning in oauth.Warnings)
+            {
+                accessLog.LogWarning("{Warning}", warning);
+            }
+
             signingKeys = new SigningKeyCache(
                 oauth,
                 SigningKeyCache.CreateHandler(),
