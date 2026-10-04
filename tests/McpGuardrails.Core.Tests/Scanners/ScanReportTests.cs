@@ -11,7 +11,7 @@ namespace McpGuardrails.Core.Tests.Scanners;
 /// Tests for the scan report: every check over one definition, and the report
 /// across servers that <c>scan</c> prints and exits on.
 /// </summary>
-public sealed class DefinitionScanTests
+public sealed class ScanReportTests
 {
     private static JsonElement Json(string json)
     {
@@ -170,13 +170,61 @@ public sealed class DefinitionScanTests
     }
 
     [Fact]
+    public void AReportOfNoServerAtAll_IsNotClean_AndSaysWhatWasDisabled()
+    {
+        // Every server disabled, or an empty file: nothing was checked, and a CI
+        // gate must not turn green on that.
+        var report = ScanReport.Build([], [], ["legacy"]);
+
+        Assert.Equal(0, report.FindingCount);
+        Assert.False(report.IsClean);
+        Assert.Equal(["legacy"], report.Disabled);
+        Assert.Empty(ScanReport.Build([], []).Disabled);
+    }
+
+    [Fact]
+    public void ADescriptionOnlyMismatch_IsAdvisory_AndLeavesTheReportClean()
+    {
+        var report = ScanReport.Build(
+            [(_stdio, "fs", [Tool(description: "Never deletes anything.", annotations: new ToolAnnotations { ReadOnlyHint = true })])],
+            []);
+
+        var finding = Assert.Single(report.Servers[0].Tools[0].Findings);
+        Assert.True(finding.Advisory);
+        Assert.Equal((0, 1, true), (report.FindingCount, report.AdvisoryCount, report.IsClean));
+
+        using var json = JsonDocument.Parse(report.ToJson());
+        Assert.Equal(1, json.RootElement.GetProperty("advisory_count").GetInt32());
+        Assert.True(json.RootElement.GetProperty("servers")[0].GetProperty("tools")[0]
+            .GetProperty("findings")[0].GetProperty("advisory").GetBoolean());
+    }
+
+    [Fact]
+    public void AToolNameWithControlCharacters_IsReportedPrintable_ButHashedAsServed()
+    {
+        var tool = Tool(name: "evil\u001b[2Jtool");
+        var scan = ToolScan.Of(tool);
+
+        Assert.Equal("evil?[2Jtool", scan.Name);
+        Assert.Equal(ToolDefinition.Hash(tool), scan.Hash);
+    }
+
+    [Fact]
+    public void ACheckWithNoDescription_IsABug_NotASilentlyMislabelledLine()
+    {
+        var finding = new ScanFinding { Check = "something-new", Names = ["x"], Where = ["name"] };
+
+        Assert.Throws<System.Diagnostics.UnreachableException>(finding.Describe);
+    }
+
+    [Fact]
     public void TheJsonForm_UsesTheDocumentedNames_AndLeavesOutUnknownSources()
     {
         var report = ScanReport.Build(
             [(null, "fs", [Tool(name: "delete_row", annotations: new ToolAnnotations { ReadOnlyHint = true })])],
             [new UnscannedServer { Name = "docs", Reason = "timed out" }]);
 
-        using var json = JsonDocument.Parse(JsonSerializer.Serialize(report, ScanJsonContext.Default.ScanReport));
+        using var json = JsonDocument.Parse(report.ToJson());
         var root = json.RootElement;
 
         Assert.Equal(1, root.GetProperty("version").GetInt32());
@@ -184,6 +232,8 @@ public sealed class DefinitionScanTests
         Assert.Equal(1, root.GetProperty("finding_count").GetInt32());
         Assert.False(root.GetProperty("clean").GetBoolean());
         Assert.Equal("timed out", root.GetProperty("unavailable")[0].GetProperty("reason").GetString());
+        Assert.Equal(0, root.GetProperty("disabled").GetArrayLength());
+        Assert.EndsWith(Environment.NewLine, report.ToJson(), StringComparison.Ordinal);
 
         var server = root.GetProperty("servers")[0];
         Assert.False(server.TryGetProperty("source", out _));
@@ -207,7 +257,7 @@ public sealed class DefinitionScanTests
             [(null, "fs", [Tool(description: Description, schema: """{"type":"object","properties":{"u":{"default":"http://127.0.0.1/x"}}}""")])],
             []);
 
-        var json = JsonSerializer.Serialize(report, ScanJsonContext.Default.ScanReport);
+        var json = report.ToJson();
         var text = ScanReportText.Render(report);
 
         Assert.Equal(2, report.FindingCount);

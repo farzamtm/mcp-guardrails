@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using McpGuardrails.Core.Text;
 
 namespace McpGuardrails.Core.Scanners;
 
@@ -14,7 +15,8 @@ public sealed record SchemaExampleHit(string Location, string Detector);
 
 /// <summary>
 /// Runs the argument detectors over the values a tool's input schema puts in
-/// front of the model: <c>default</c>, <c>const</c> and <c>examples</c>.
+/// front of the model: <c>default</c>, <c>const</c>, <c>enum</c>, <c>examples</c>
+/// and the OpenAPI-style singular <c>example</c>.
 /// </summary>
 /// <remarks>
 /// A model that fills in arguments copies what the schema suggests. A default of
@@ -28,6 +30,11 @@ public sealed record SchemaExampleHit(string Location, string Detector);
 /// the detectors that look at an argument's name (a path-like name makes a value
 /// with spaces a path) see the same name a real call would carry. Linear in the
 /// size of the schema: each node is visited once and each value scanned once.
+///
+/// An <c>enum</c> is the strongest suggestion a schema can make - the model has
+/// to pick one of its members - so each member is scanned. Locations are built
+/// from keys the server chose and end up in a report printed to a terminal, so
+/// each key goes through <see cref="TerminalText.Printable"/> as it is joined.
 /// </remarks>
 public static class SchemaExampleScanner
 {
@@ -67,11 +74,11 @@ public static class SchemaExampleScanner
 
             switch (keyword.Name)
             {
-                case "default" or "const":
+                case "default" or "const" or "example":
                     Suggest(toolName, keyword.Value, here, argument, hits);
                     break;
 
-                case "examples" when keyword.Value.ValueKind is JsonValueKind.Array:
+                case "examples" or "enum" when keyword.Value.ValueKind is JsonValueKind.Array:
                     var index = 0;
                     foreach (var example in keyword.Value.EnumerateArray())
                     {
@@ -80,11 +87,14 @@ public static class SchemaExampleScanner
 
                     break;
 
-                case "properties" or "patternProperties" or "$defs" or "definitions"
+                case "properties" or "patternProperties" or "$defs" or "definitions" or "dependentSchemas" or "dependencies"
                     when keyword.Value.ValueKind is JsonValueKind.Object:
                     // Under properties, a key is an argument name; under $defs it
-                    // names a reusable schema whose argument name is unknown, so
-                    // the name in scope stays the one we arrived with.
+                    // names a reusable schema, and under dependentSchemas a schema
+                    // that applies to the whole object, so the argument name in
+                    // scope stays the one we arrived with. A draft-07 dependencies
+                    // entry may be an array of names rather than a schema, which
+                    // Walk ignores as not an object.
                     var named = keyword.Name is "properties" or "patternProperties";
                     foreach (var child in keyword.Value.EnumerateObject())
                     {
@@ -93,17 +103,21 @@ public static class SchemaExampleScanner
 
                     break;
 
-                case "items" or "additionalProperties" or "not" or "if" or "then" or "else" or "contains":
-                    Walk(toolName, keyword.Value, here, argument, depth + 1, hits);
-                    break;
-
-                case "anyOf" or "oneOf" or "allOf" or "prefixItems" when keyword.Value.ValueKind is JsonValueKind.Array:
+                case "anyOf" or "oneOf" or "allOf" or "prefixItems" or "items" or "additionalItems"
+                    when keyword.Value.ValueKind is JsonValueKind.Array:
+                    // items and additionalItems as arrays are the draft-04/07
+                    // tuple form: one schema per position.
                     var position = 0;
                     foreach (var branch in keyword.Value.EnumerateArray())
                     {
                         Walk(toolName, branch, $"{here}[{position++}]", argument, depth + 1, hits);
                     }
 
+                    break;
+
+                case "items" or "additionalItems" or "additionalProperties" or "unevaluatedItems" or "unevaluatedProperties"
+                    or "propertyNames" or "not" or "if" or "then" or "else" or "contains":
+                    Walk(toolName, keyword.Value, here, argument, depth + 1, hits);
                     break;
             }
         }
@@ -137,7 +151,7 @@ public static class SchemaExampleScanner
             builder.Append(location).Append('.');
         }
 
-        builder.Append(segment);
+        builder.Append(TerminalText.Printable(segment));
 
         return builder.Length <= _maxLocationLength
             ? builder.ToString()

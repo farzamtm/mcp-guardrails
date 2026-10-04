@@ -29,8 +29,8 @@ Every check reads only the tool definitions, never calls a tool.
 | Check | Finds | How |
 | --- | --- | --- |
 | `injection` | Instructions aimed at the model in a tool's name, title, description, or anywhere in its input or output schema: "ignore previous instructions", role hijacks, pointers at secrets plus somewhere to send them, "don't tell the user", invisible or bidirectional Unicode | The same heuristics the proxy runs on every tool definition at startup ([result scanning](result-scanning.md#tool-definitions-too)). A tool `scan` flags is a tool the proxy would annotate or withhold. |
-| `schema-suggestion` | A `default`, `const` or `examples` value in the input schema that the [argument detectors](argument-scanning.md) would flag if the model sent it: an internal or cloud-metadata URL, a credential file path, `..` traversal, shell metacharacters for a command tool | A model filling in arguments copies what the schema suggests, so a suggested `http://169.254.169.254/` is a request for that URL without the prose ever saying so. |
-| `read-only-mismatch` | A tool that declares `readOnlyHint: true` while its name or description uses `delete`, `remove`, `drop`, `write`, `update`, `send` or `execute` (any inflection) | Policy rules that allow `readOnlyHint: true` trust that hint, and a server can describe its delete tool as read-only. Whole words only, so `select_dropdown` is not "drop". A description saying "does not delete anything" is still reported: a person reads this report, so recall beats precision. |
+| `schema-suggestion` | A `default`, `const`, `enum` member, `example` or `examples` value in the input schema that the [argument detectors](argument-scanning.md) would flag if the model sent it: an internal or cloud-metadata URL, a credential file path, `..` traversal, shell metacharacters for a command tool | A model filling in arguments copies what the schema suggests, so a suggested `http://169.254.169.254/` is a request for that URL without the prose ever saying so. |
+| `read-only-mismatch` | A tool that declares `readOnlyHint: true` while its name uses a write verb (`delete`, `remove`, `drop`, `write`, `update`, `send`, `execute`/`exec`, `create`, `edit`, `move`, `rename`, `insert`, `modify`, `overwrite`, `truncate`, `purge`, `kill`, `set`), or its description uses one in any inflection | Policy rules that allow `readOnlyHint: true` trust that hint, and a server can describe its delete tool as read-only. Whole words only, so `select_dropdown` is not "drop". In a **name** only the base form counts - `delete_record` is reported, `get_updates`, `list_sent_messages` and `search_deleted_items` are not, because there the word is a noun or adjective - and a name match fails the scan. A **description** match is **advisory**: listed for a person to read, but it does not fail the scan, since "does not delete anything" matches as readily as a lie. `run` and `post` are left out on purpose: they name read-only tools (`run_query`, `get_post`) as often as writes. |
 
 The report also lists, per tool, which behaviour hints it declares, and counts
 the tools that declare none, which is the case policy rules matching on
@@ -41,31 +41,45 @@ annotations can't see into.
 ```text
 target  stdio  python3 scripts/fixture_server.py --hostile
   ! delete_record: declares readOnlyHint: true, but its name says 'delete'
-  ! delete_record: declares readOnlyHint: true, but its description says 'delete'
+  ? delete_record: declares readOnlyHint: true, but its description says 'delete' (advisory)
   ! lookup: prompt-injection heuristics (instruction-override, exfiltration) in its description
   ! fetch_page: a URL pointing at an internal, loopback or cloud-metadata address suggested by its input schema properties.url.default
-  5 tools, 4 findings, 2 declaring no annotations
-4 findings in 3 tools.
+  5 tools, 3 findings, 1 advisory, 2 declaring no annotations
+3 findings in 3 tools; 1 advisory note.
 ```
+
+`!` marks a finding, `?` an advisory note. Disabled servers are listed as
+"disabled, not scanned".
 
 The report names tools, checks, heuristics and schema locations. It never
 quotes a description, schema text or suggested value. Those are written by the
 server under inspection, and a report that repeats them can carry an injection
 into whatever reads it next, such as a CI log an agent is asked to summarize.
-Control characters in tool names are replaced with `?` so a name can't rewrite
-the terminal.
+The few strings a server chose that do appear - tool names, schema keys inside
+a location, the error a server answered with - have their control characters,
+bidirectional overrides and zero-width characters replaced with `?`, so a
+server can't clear the screen, forge a "Clean" line, set the window title or
+write to the clipboard of whoever scans it. The same goes for the proxy's log
+lines, which quote servers' error messages.
 
 Exit codes:
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Every server was scanned and nothing was found |
-| 1 | Something was found, a configured server could not be reached, or the servers file is invalid |
-| 2 | The command line is unusable (an unknown flag, `--command` with `--url`, ...) |
+| 0 | At least one server was scanned, every configured server was scanned, and nothing was found (advisory notes do not count) |
+| 1 | Something was found, a configured server could not be reached or did not answer in time, no server is enabled, or the servers file is invalid |
+| 2 | The command line is unusable (an unknown flag, a flag given twice, a stray word such as a file name without `--servers`, `--command` with `--url`, ...) |
 
-An unreachable server is never a clean result. An `optional: true` server that
-is down is listed as "unavailable, not scanned" and makes the exit code 1; a
-required one stops the scan with nothing scanned.
+An unreachable server is never a clean result, and neither is a scan of
+nothing: a servers file whose every server is `disabled` exits 1 with "Nothing
+was scanned". An `optional: true` server that is down is listed as
+"unavailable, not scanned" and makes the exit code 1; a required one stops the
+scan with nothing scanned.
+
+Connecting to the servers and listing their tools share one deadline,
+`--timeout <seconds>` (60 by default, at most 3600). A server that has not
+answered by then counts as not reachable, so a stalled server fails the scan
+instead of hanging the CI job that runs it.
 
 ## The JSON form
 
@@ -93,8 +107,10 @@ required one stops the scan with nothing scanned.
     }
   ],
   "unavailable": [],
+  "disabled": [],
   "tool_count": 5,
-  "finding_count": 4,
+  "finding_count": 3,
+  "advisory_count": 1,
   "clean": false
 }
 ```
@@ -107,8 +123,13 @@ required one stops the scan with nothing scanned.
 | `annotations` | The behaviour hints the tool declares, with their values. Empty means none. |
 | `findings[].names` | Heuristic names, a detector name, or the verb that suggested a write. Always from the proxy's own vocabulary. |
 | `findings[].where` | The part of the definition: `description`, `input schema`, `input schema properties.url.default`, `name`, ... |
+| `findings[].advisory` | `true` for a note that does not fail the scan (a write verb in a description). |
+| `finding_count`, `advisory_count` | Findings that fail the scan, and advisory notes, counted separately. |
+| `disabled` | Servers the servers file marks `disabled`, so not scanned. |
 
-`version` changes if a field changes meaning.
+Fields may be added without changing `version`, so a reader should ignore
+fields it doesn't know. Removing a field, or changing what one means, bumps
+`version`.
 
 ## Targets and their environment
 

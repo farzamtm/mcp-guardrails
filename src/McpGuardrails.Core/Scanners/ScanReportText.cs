@@ -1,8 +1,16 @@
 using System.Text;
+using McpGuardrails.Core.Text;
 
 namespace McpGuardrails.Core.Scanners;
 
 /// <summary>The human-readable form of a <see cref="ScanReport"/>.</summary>
+/// <remarks>
+/// Every string a server could have influenced goes through
+/// <see cref="TerminalText.Printable"/> on its way out, including the finding
+/// descriptions, whose locations are built from schema keys the server chose:
+/// the report is printed to the terminal of someone deciding whether to trust
+/// that server, and must not be something the server can rewrite.
+/// </remarks>
 public static class ScanReportText
 {
     /// <summary>Renders the report, one line per finding, ending with the verdict.</summary>
@@ -14,10 +22,10 @@ public static class ScanReportText
 
         foreach (var server in report.Servers)
         {
-            text.Append(Printable(server.Name)).Append("  ").Append(server.Transport);
+            text.Append(TerminalText.Printable(server.Name)).Append("  ").Append(server.Transport);
             if (server.Source is { } source)
             {
-                text.Append("  ").Append(Printable(source));
+                text.Append("  ").Append(TerminalText.Printable(source));
             }
 
             text.AppendLine();
@@ -26,14 +34,23 @@ public static class ScanReportText
             {
                 foreach (var finding in tool.Findings)
                 {
-                    text.Append("  ! ").Append(Printable(tool.Name)).Append(": ").AppendLine(finding.Describe());
+                    text.Append(finding.Advisory ? "  ? " : "  ! ")
+                        .Append(TerminalText.Printable(tool.Name)).Append(": ")
+                        .Append(TerminalText.Printable(finding.Describe()))
+                        .AppendLine(finding.Advisory ? " (advisory)" : string.Empty);
                 }
             }
 
-            var findings = server.Tools.Sum(tool => tool.Findings.Count);
+            var findings = server.Tools.Sum(tool => tool.Findings.Count(f => !f.Advisory));
+            var advisories = server.Tools.Sum(tool => tool.Findings.Count(f => f.Advisory));
             var unannotated = server.Tools.Count(tool => tool.Annotations.Count == 0);
             text.Append("  ").Append(Count(server.Tools.Count, "tool")).Append(", ")
                 .Append(Count(findings, "finding"));
+            if (advisories > 0)
+            {
+                text.Append(", ").Append(advisories).Append(" advisory");
+            }
+
             if (unannotated > 0)
             {
                 text.Append(", ").Append(unannotated).Append(" declaring no annotations");
@@ -44,37 +61,36 @@ public static class ScanReportText
 
         foreach (var missing in report.Unavailable)
         {
-            text.Append(Printable(missing.Name)).Append("  unavailable, not scanned: ").AppendLine(Printable(missing.Reason));
+            text.Append(TerminalText.Printable(missing.Name)).Append("  unavailable, not scanned: ")
+                .AppendLine(TerminalText.Printable(missing.Reason));
         }
 
-        var flagged = report.Servers.Sum(server => server.Tools.Count(tool => tool.Findings.Count > 0));
-        text.Append(report.IsClean
-            ? $"Clean: {Count(report.ToolCount, "tool")} scanned, nothing found."
-            : $"{Count(report.FindingCount, "finding")} in {Count(flagged, "tool")}" +
-              (report.Unavailable.Count > 0 ? $"; {Count(report.Unavailable.Count, "server")} not scanned." : "."));
-        text.AppendLine();
+        foreach (var name in report.Disabled)
+        {
+            text.Append(TerminalText.Printable(name)).AppendLine("  disabled, not scanned");
+        }
 
+        text.Append(Verdict(report)).AppendLine();
         return text.ToString();
     }
 
-    /// <summary>
-    /// Replaces control characters, so a tool name a server chose cannot move the
-    /// cursor, clear the screen or forge a line of the report in a terminal.
-    /// </summary>
-    internal static string Printable(string value)
+    private static string Verdict(ScanReport report)
     {
-        if (!value.Any(char.IsControl))
+        var advisory = report.AdvisoryCount > 0 ? $"; {Count(report.AdvisoryCount, "advisory note")}" : string.Empty;
+
+        if (report.IsClean)
         {
-            return value;
+            return $"Clean: {Count(report.ToolCount, "tool")} scanned, nothing found{advisory}.";
         }
 
-        return string.Create(value.Length, value, static (span, source) =>
+        if (report.Servers.Count == 0 && report.Unavailable.Count == 0)
         {
-            for (var i = 0; i < source.Length; i++)
-            {
-                span[i] = char.IsControl(source[i]) ? '?' : source[i];
-            }
-        });
+            return "Nothing was scanned: no server is enabled.";
+        }
+
+        var flagged = report.Servers.Sum(server => server.Tools.Count(tool => tool.Findings.Any(f => !f.Advisory)));
+        var unscanned = report.Unavailable.Count > 0 ? $"; {Count(report.Unavailable.Count, "server")} not scanned" : string.Empty;
+        return $"{Count(report.FindingCount, "finding")} in {Count(flagged, "tool")}{unscanned}{advisory}.";
     }
 
     private static string Count(int count, string noun) => count == 1 ? $"1 {noun}" : $"{count} {noun}s";

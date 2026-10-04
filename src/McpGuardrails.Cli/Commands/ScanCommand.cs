@@ -1,6 +1,5 @@
-using System.Text.Json;
 using McpGuardrails.Core.Scanners;
-using McpGuardrails.Core.Serialization;
+using McpGuardrails.Core.Text;
 using McpGuardrails.Core.Upstream;
 using Microsoft.Extensions.Logging;
 
@@ -17,7 +16,12 @@ namespace McpGuardrails.Cli.Commands;
 /// off - and leave no trace in files the proxy treats as state.
 ///
 /// Exit codes: 0 when every server was scanned and nothing was found, 1 when
-/// something was found or a server could not be scanned, 2 for a bad command line.
+/// something was found, a server could not be scanned or no server was enabled,
+/// 2 for a bad command line.
+///
+/// Connecting and listing share one deadline (<c>--timeout</c>, 60 seconds by
+/// default): a server that never answers is not clean, and must not hang the CI
+/// job that scans it.
 /// </remarks>
 internal sealed class ScanCommand : ICliCommand
 {
@@ -42,14 +46,25 @@ internal sealed class ScanCommand : ICliCommand
             log.LogWarning("{Warning}", warning);
         }
 
+        using var deadline = new CancellationTokenSource(options.Timeout);
+        var seconds = (int)options.Timeout.TotalSeconds;
+
         UpstreamRegistry upstream;
         try
         {
-            upstream = await UpstreamRegistry.ConnectAsync(servers.Servers, loggerFactory);
+            upstream = await UpstreamRegistry.ConnectAsync(servers.Servers, loggerFactory, cancellationToken: deadline.Token);
+        }
+        catch (UpstreamConnectionException ex) when (deadline.IsCancellationRequested && ex.InnerException is OperationCanceledException)
+        {
+            throw new CommandFailedException(
+                1, $"Server '{ex.Server}' did not answer within {seconds} s. Nothing was scanned.");
         }
         catch (UpstreamConnectionException ex)
         {
-            throw new CommandFailedException(1, $"{ex.Message} Nothing was scanned.");
+            // One line, sanitized here as well as at the sink: the message ends
+            // with whatever the server sent back, and the scanned server is the
+            // one thing scan never trusts.
+            throw new CommandFailedException(1, $"{TerminalText.Printable(ex.Message)} Nothing was scanned.");
         }
 
         await using (upstream)
@@ -61,17 +76,27 @@ internal sealed class ScanCommand : ICliCommand
                         connection.Config,
                         connection.Name,
                         (IReadOnlyList<ModelContextProtocol.Protocol.Tool>)[.. connection.Tools.Select(tool => tool.ProtocolTool)])),
-                upstream.Unavailable.Select(missing => new UnscannedServer { Name = missing.Name, Reason = missing.Reason }));
+                upstream.Unavailable.Select(missing => new UnscannedServer
+                {
+                    Name = missing.Name,
+                    Reason = deadline.IsCancellationRequested && IsCancellation(missing.Reason)
+                        ? $"did not answer within {seconds} s"
+                        : missing.Reason,
+                }),
+                servers.Disabled);
 
             // stdout, not stderr: scan is not an MCP server, so stdout is free,
             // and the report is the command's output - the thing to redirect.
-            Console.Write(options.Json
-                ? JsonSerializer.Serialize(report, ScanJsonContext.Default.ScanReport) + Environment.NewLine
-                : ScanReportText.Render(report));
+            Console.Write(options.Json ? report.ToJson() : ScanReportText.Render(report));
 
             return report.IsClean ? 0 : 1;
         }
     }
+
+    // What a connection cancelled by the deadline reports as its reason; anything
+    // else is a real failure and keeps its own words.
+    private static bool IsCancellation(string reason) =>
+        reason == new OperationCanceledException().Message || reason == new TaskCanceledException().Message;
 
     /// <summary>
     /// The one target named on the command line, else the servers the proxy

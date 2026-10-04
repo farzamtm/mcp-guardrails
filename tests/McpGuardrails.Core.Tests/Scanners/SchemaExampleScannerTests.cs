@@ -113,6 +113,11 @@ public sealed class SchemaExampleScannerTests
     [InlineData("then")]
     [InlineData("else")]
     [InlineData("contains")]
+    [InlineData("items")]
+    [InlineData("additionalItems")]
+    [InlineData("unevaluatedItems")]
+    [InlineData("unevaluatedProperties")]
+    [InlineData("propertyNames")]
     public void SingleSubschemaKeywords_AreWalked(string keyword) =>
         Assert.Equal(
             [new SchemaExampleHit($"properties.url.{keyword}.default", ArgumentDetector.Ssrf)],
@@ -123,10 +128,46 @@ public sealed class SchemaExampleScannerTests
     [InlineData("oneOf")]
     [InlineData("allOf")]
     [InlineData("prefixItems")]
+    [InlineData("items")] // the draft-04/07 tuple form
+    [InlineData("additionalItems")]
     public void SubschemaLists_AreWalkedAndNumbered(string keyword) =>
         Assert.Equal(
             [new SchemaExampleHit($"properties.url.{keyword}[1].default", ArgumentDetector.Ssrf)],
             Scan("""{"properties":{"url":{"KEYWORD":[{"type":"string"},{"default":"META"}]}}}""".Replace("KEYWORD", keyword, StringComparison.Ordinal)));
+
+    [Fact]
+    public void EachEnumMember_IsScannedAndNumbered() =>
+        Assert.Equal(
+            [new SchemaExampleHit("properties.url.enum[1]", ArgumentDetector.Ssrf)],
+            Scan("""{"properties":{"url":{"enum":["https://example.com/","META"]}}}"""));
+
+    [Fact]
+    public void AnEnumThatIsNotAList_IsIgnored() =>
+        Assert.Empty(Scan("""{"properties":{"url":{"enum":"META"}}}"""));
+
+    [Fact]
+    public void ASingularExample_IsScanned() =>
+        Assert.Equal(
+            [new SchemaExampleHit("properties.path.example", ArgumentDetector.SensitivePath)],
+            Scan("""{"properties":{"path":{"example":"~/.aws/credentials"}}}"""));
+
+    [Theory]
+    [InlineData("dependentSchemas")]
+    [InlineData("dependencies")]
+    public void DependentSchemas_AreWalkedWithTheArgumentInScope(string keyword) =>
+        Assert.Equal(
+            [new SchemaExampleHit($"{keyword}.flag.properties.url.default", ArgumentDetector.Ssrf)],
+            Scan("""{"KEYWORD":{"flag":{"properties":{"url":{"default":"META"}}},"other":["flag"]}}""".Replace("KEYWORD", keyword, StringComparison.Ordinal)));
+
+    [Fact]
+    public void ControlCharactersInAKey_NeverReachTheLocation()
+    {
+        // A key is the server's text, and the location ends up in a report
+        // printed to a terminal: an ESC there could clear the screen.
+        var hit = Assert.Single(Scan("""{"properties":{"\u001b[2Jx\u202e":{"default":"META"}}}"""));
+
+        Assert.Equal("properties.?[2Jx?.default", hit.Location);
+    }
 
     [Fact]
     public void SubschemaListsThatAreNotAList_AreIgnored() =>
