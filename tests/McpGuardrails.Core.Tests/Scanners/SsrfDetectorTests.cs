@@ -55,9 +55,33 @@ public sealed class SsrfDetectorTests
     [InlineData("http://[64:ff9b::a9fe:a9fe]/")]
     [InlineData("http://[2002:c0a8:0101::1]/")]
     [InlineData("http://[::1/")]
-    // Userinfo tricks: the host is after the last '@'.
+    // Userinfo tricks: the host is after the last '@', whatever the userinfo
+    // holds - URL parsers read up to the path, not up to a comma or quote.
     [InlineData("http://example.com@127.0.0.1/")]
     [InlineData("http://user:pass@10.0.0.1/")]
+    [InlineData("http://a,@169.254.169.254/latest/meta-data/")]
+    [InlineData("http://x'@127.0.0.1:6379/")]
+    [InlineData("http://x)@10.0.0.5/")]
+    [InlineData("http://a b@127.0.0.1/")]
+    [InlineData("http://a\"<>`@169.254.169.254")]
+    // Tabs and newlines, which URL parsers delete before parsing.
+    [InlineData("ht\ttp://169.254.169.254/")]
+    [InlineData("ht\ntp://169.254.169.254/")]
+    [InlineData("http://\t127.0.0.1/")]
+    [InlineData("http:/\t/127.0.0.1/")]
+    [InlineData("http://127.0.\r\n0.1/")]
+    // Full-width, enclosed and percent-encoded UTF-8 forms that IDNA folds.
+    [InlineData("http://１２７.０.０.１/")]
+    [InlineData("http://①②⑦.⓪.⓪.①/")]
+    [InlineData("http://ｌｏｃａｌｈｏｓｔ/")]
+    [InlineData("http://ⓛⓞⓒⓐⓛⓗⓞⓢⓣ:8080/")]
+    [InlineData("http://%EF%BC%91%EF%BC%92%EF%BC%97.0.0.1/")]
+    [InlineData("http://127%252e0%252e0%252e1/")]
+    // Leading zeros, which inet_aton accepts in any number.
+    [InlineData("http://0x00000000007f000001/")]
+    [InlineData("http://000000000000177.0.0.1/")]
+    [InlineData("http://0000000000000177.0.0.1/")]
+    [InlineData("http://00/")]
     // Lenient slashes, other schemes, URLs inside larger strings.
     [InlineData("http:\\\\127.0.0.1\\")]
     [InlineData("http:/127.0.0.1/")]
@@ -128,6 +152,12 @@ public sealed class SsrfDetectorTests
     [InlineData("http://%ff%fe/")]
     [InlineData("http://%zz/")]
     [InlineData("http://example.com%/")]
+    [InlineData("http://0x1000000000000/")]
+    // A '@' after the URL that leads to a public host changes nothing.
+    [InlineData("see https://example.com and email bob@corp.example.com today")]
+    [InlineData("http://a,@example.com/")]
+    [InlineData("http://１.２.３.４/")]
+    [InlineData("first line\thttps://example.com/")]
     public void StaysQuiet_OnOrdinaryValues(string value) => Assert.False(SsrfDetector.IsMatch(value));
 
     [Fact]
@@ -147,6 +177,9 @@ public sealed class SsrfDetectorTests
     [InlineData("10.1.257", 0x0A010101u)]
     [InlineData("0", 0u)]
     [InlineData("037777777777", 0xFFFFFFFFu)]
+    [InlineData("0x00000000007f000001", 0x7F000001u)]
+    [InlineData("000000000000177.0.0.1", 0x7F000001u)]
+    [InlineData("00", 0u)]
     public void ParsesIPv4_LikeInetAton(string host, uint expected)
     {
         Assert.True(SsrfDetector.TryParseIPv4(host, out var address));
@@ -170,6 +203,9 @@ public sealed class SsrfDetectorTests
         // for why the input is sized as it is.
         var adversarial = string.Concat(Enumerable.Repeat("http:x", 100_000)) +
                           string.Concat(Enumerable.Repeat("a:", 100_000)) +
+                          string.Concat(Enumerable.Repeat("http://a,b c@d ", 50_000)) +
+                          "http://" + new string(',', 200_000) + "@x" +
+                          "\t" + string.Concat(Enumerable.Repeat("%2", 100_000)) +
                           "http://" + new string('a', 200_000) + ":" + new string('1', 200_000);
 
         var started = System.Diagnostics.Stopwatch.StartNew();
