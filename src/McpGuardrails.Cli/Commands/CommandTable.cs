@@ -37,6 +37,8 @@ internal static class CommandTable
         ("wrap", () => new WrapCommand()),
         ("unwrap", () => new UnwrapCommand()),
         ("pins", () => new PinsCommand()),
+        ("init", () => new InitCommand()),
+        ("policy", () => new PolicyCommand()),
     ];
 
     /// <summary>Runs the named subcommand, or serves when none is named.</summary>

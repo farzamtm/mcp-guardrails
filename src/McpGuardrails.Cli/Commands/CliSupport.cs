@@ -89,6 +89,29 @@ internal static class CliArgs
         return args[index + 1];
     }
 
+    /// <summary>Every value given to a repeatable flag, in order.</summary>
+    /// <exception cref="CommandFailedException">An occurrence of the flag has no value after it.</exception>
+    public static IReadOnlyList<string> Values(string[] args, string flag)
+    {
+        var values = new List<string>();
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i] != flag)
+            {
+                continue;
+            }
+
+            if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            {
+                throw new CommandFailedException(2, $"{flag} needs a value.");
+            }
+
+            values.Add(args[++i]);
+        }
+
+        return values;
+    }
+
     /// <summary>The client named by <paramref name="flag"/>, which must be present.</summary>
     /// <exception cref="CommandFailedException">The flag is missing or names no supported client.</exception>
     public static ClientApp Client(string[] args, string flag)
