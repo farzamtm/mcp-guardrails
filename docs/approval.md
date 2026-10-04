@@ -75,8 +75,9 @@ request from the server back to the client, and stateless HTTP has no channel to
 send it on — the SDK disables it outright. So under `--transport http` every
 `require_approval` call is refused immediately, with a message that says why;
 it never hangs until the deadline and it never falls through to `allow`. For
-rules that need a human, use `mode: webhook` (below), which does not go through
-the client, or stdio, until the Tasks/MRTR channel lands.
+rules that need a human, use `mode: webhook` or `mode: local_ui` (both below),
+neither of which goes through the client, or stdio, until the Tasks/MRTR channel
+lands.
 
 ## Asking a webhook instead
 
@@ -173,6 +174,45 @@ rejected; the signature is the authentication.
 
 See [`examples/webhook-approval.yaml`](../examples/webhook-approval.yaml), and
 `scripts/smoke.py` for a 40-line receiver that verifies the signature.
+
+## Asking the local UI instead
+
+A webhook needs an endpoint you build and host. For an autonomous agent or a
+stateless-HTTP deployment on your own machine, `mcp-guardrails ui` gives you an
+approval inbox with nothing to stand up:
+
+```yaml
+rules:
+  - name: approve-deletes
+    match:
+      tool: "*__delete_*"
+    decision: require_approval
+    approval:
+      mode: local_ui
+```
+
+There is no `approvers:` section to write — unlike a webhook, the UI is not a
+URL you configure, it is a process found at runtime. When `mcp-guardrails ui`
+is running, it writes its loopback address and a fresh per-run secret to
+`~/.mcp-guardrails/ui.json` (override with `GUARDRAILS_UI_FILE`). Every proxy
+that needs to ask reads that file afresh, so the UI can be started after the
+proxy, or stopped and restarted while it keeps running.
+
+**The wire protocol is the webhook's**, pointed at the UI instead of a
+configured endpoint: the same signed POST, the same `{"request_id",
+"decision"}` reply, the same redaction, correlation check and fail-closed
+rules. A missing or unparsable rendezvous file — or one naming anything other
+than plain `http://` to a literal loopback address — means no UI, and the call
+is refused with a message telling the model to have the user run
+`mcp-guardrails ui` and try again. It is never a fallback to asking the
+client: a rule routed to the local UI because the client cannot ask, or the
+transport is stateless HTTP, so there is nothing to fall back to.
+
+The audit log's `approval_channel` field records which channel answered —
+`in_band`, `webhook` or `local_ui` — alongside `approval`, because "approved"
+means something different depending on who was asked.
+
+See [`examples/local-ui-approval.yaml`](../examples/local-ui-approval.yaml).
 
 **Not implemented yet:** Slack approval is planned. Until it exists, `slack` is
 not a recognised `mode`, so `mode: slack` fails at load time like any other

@@ -1,0 +1,47 @@
+# Example policy: approve risky calls in a UI on your own machine.
+#
+# webhook-approval.yaml sends the question to an HTTP endpoint you build and
+# host. This one is for when that endpoint is just you, at the same machine
+# the proxy runs on - stateless HTTP serving, or a client with no elicitation.
+# `mcp-guardrails ui` opens an approval inbox; every `mode: local_ui` rule
+# finds it automatically. See docs/approval.md's "Asking the local UI instead".
+#
+# Use it with:
+#   mcp-guardrails ui &                 # starts the inbox
+#   GUARDRAILS_POLICY=examples/local-ui-approval.yaml mcp-guardrails --transport http
+#
+# No approvers: section to write - unlike a webhook, there is no URL to
+# configure. The proxy finds the UI through ~/.mcp-guardrails/ui.json, written
+# by `mcp-guardrails ui` while it runs. If the UI is not running, a
+# `mode: local_ui` call is refused with a message telling the model to say so.
+
+rules:
+  - name: allow-reads
+    match:
+      annotations:
+        readOnlyHint: true
+    decision: allow
+
+  # The local inbox. Five minutes is enough to notice the badge and decide;
+  # silence still means no.
+  - name: approve-deletes-in-the-local-ui
+    match:
+      tool: "*__delete_*"
+    decision: require_approval
+    approval:
+      mode: local_ui
+      timeout_s: 300
+      on_timeout: deny
+      prompt: >-
+        An unattended agent wants to delete something. Check the arguments in
+        the inbox before approving.
+
+  # Covers every tool that declares itself destructive, or declares nothing.
+  - name: deny-destructive
+    match:
+      annotations:
+        destructiveHint: true
+    decision: deny
+    message: >-
+      Destructive tools are disabled for this unattended agent. Report what you
+      would have changed instead.

@@ -46,8 +46,22 @@ public sealed class ApprovalChannelRouterTests
         Assert.Equal((0, 1), (inBand.Asked, webhook.Asked));
     }
 
+    [Fact]
+    public async Task LocalUi_GoesToTheLocalUi()
+    {
+        var inBand = new Answers(ApprovalOutcome.Approved);
+        var localUi = new Answers(ApprovalOutcome.Declined);
+        var router = new ApprovalChannelRouter(inBand, localUi: localUi);
+
+        var outcome = await router.RequestAsync(Request(ApprovalMode.LocalUi), CancellationToken.None);
+
+        Assert.Equal(ApprovalOutcome.Declined, outcome);
+        Assert.Equal((0, 1), (inBand.Asked, localUi.Asked));
+    }
+
     [Theory]
     [InlineData(ApprovalMode.Webhook)]
+    [InlineData(ApprovalMode.LocalUi)]
     [InlineData((ApprovalMode)99)]
     public async Task AModeWithNoChannel_FailsInsteadOfAskingTheClient(ApprovalMode mode)
     {

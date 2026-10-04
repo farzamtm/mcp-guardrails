@@ -56,6 +56,7 @@ public sealed class GuardrailsCallPipeline
     private readonly BudgetGate _budget;
     private readonly InjectionGate _scanner;
     private readonly IApprovalChannel? _webhook;
+    private readonly IApprovalChannel? _localUi;
     private readonly bool _explain;
 
     /// <param name="upstream">Resolves names for the log, the policy and the forward.</param>
@@ -73,6 +74,7 @@ public sealed class GuardrailsCallPipeline
     /// Append the decision trail to refusals. Off by default because building the
     /// trail allocates on a path every tool call takes.
     /// </param>
+    /// <param name="localUi">The local UI's approval inbox, for <c>mode: local_ui</c> rules.</param>
     public GuardrailsCallPipeline(
         UpstreamRegistry upstream,
         IAuditSink audit,
@@ -85,7 +87,8 @@ public sealed class GuardrailsCallPipeline
         BudgetGate budget,
         InjectionGate scanner,
         IApprovalChannel? webhook = null,
-        bool explain = false)
+        bool explain = false,
+        IApprovalChannel? localUi = null)
     {
         ArgumentNullException.ThrowIfNull(upstream);
         ArgumentNullException.ThrowIfNull(audit);
@@ -109,6 +112,7 @@ public sealed class GuardrailsCallPipeline
         _budget = budget;
         _scanner = scanner;
         _webhook = webhook;
+        _localUi = localUi;
         _explain = explain;
     }
 
@@ -322,6 +326,11 @@ public sealed class GuardrailsCallPipeline
             Rule = decision?.RuleName,
             DecisionReason = decision?.Reason,
             Approval = decision?.ApprovalResult?.ToWireName(),
+            // The gate asked with the rule's settings, or the defaults when the
+            // call was escalated by a scanner rather than a rule.
+            ApprovalChannel = decision?.ApprovalResult is null
+                ? null
+                : (decision.Approval ?? ApprovalSettings.Default).EffectiveMode.ToWireName(),
             // Null unless something matched, so a clean result stays one narrow
             // line and `jq 'select(.scanner_hits)'` is the whole query for "show
             // me what the scanner caught".
@@ -421,7 +430,7 @@ public sealed class GuardrailsCallPipeline
         decision = await ApprovalGate.ApplyAsync(
             decision,
             facts,
-            new ApprovalChannelRouter(inBand, _webhook),
+            new ApprovalChannelRouter(inBand, _webhook, _localUi),
             cancellationToken);
 
         decision = _budget.Apply(decision, resolved, caller?.Principal);

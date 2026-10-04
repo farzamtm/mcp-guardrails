@@ -3,6 +3,7 @@ using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Hosting;
+using McpGuardrails.Core.LocalUi;
 using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
@@ -258,6 +259,16 @@ internal sealed class ServeCommand : ICliCommand
             ? _ => StatelessHttpApprovalChannel.Instance
             : server => new ElicitationApprovalChannel(server, document.EffectiveScanners.EffectiveSecrets);
 
+        // The local UI's inbox, for `mode: local_ui` rules. Always wired: it
+        // costs nothing until a rule uses it, and it locates the UI afresh for
+        // every question, so the UI can be started after the proxy, or restarted
+        // while it runs.
+        var uiRendezvousPath = CliPaths.ConfigPath(UiRendezvous.FileVariable, UiRendezvous.FileName);
+        var localUi = new LocalUiApprovalChannel(
+            () => File.Exists(uiRendezvousPath) ? UiRendezvous.Parse(File.ReadAllText(uiRendezvousPath)) : null,
+            document.EffectiveScanners.EffectiveSecrets,
+            WebhookApprovalChannel.CreateHandler);
+
         var pipeline = new GuardrailsCallPipeline(
             startup.Upstream,
             startup.Audit,
@@ -270,7 +281,8 @@ internal sealed class ServeCommand : ICliCommand
             budget,
             startup.Scanner,
             webhook,
-            explain);
+            explain,
+            localUi);
 
         // -------------------------------------------------------------------
         // Serve the aggregated tools.
