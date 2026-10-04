@@ -22,9 +22,14 @@ internal static class CliTokenStore
     /// <summary>The environment variable naming the file store's directory.</summary>
     public const string DirectoryVariable = "GUARDRAILS_TOKENS";
 
-    /// <summary>Builds the store, and the warning to show when it is a plain file store.</summary>
-    /// <exception cref="CommandFailedException"><see cref="TokenStoreSelection.Variable"/> names no store.</exception>
-    public static (ITokenStore Store, string? Warning) Create()
+    /// <summary>Builds the store, reporting the warning a plain file store comes with.</summary>
+    /// <param name="warn">Where the warning goes; stderr by default, the server log when serving.</param>
+    /// <remarks>
+    /// Printed here rather than by each caller, so every command that touches
+    /// tokens - logout included - says where they are kept.
+    /// </remarks>
+    /// <exception cref="CommandFailedException"><see cref="TokenStoreSelection.Variable"/> names no store, or one this platform lacks.</exception>
+    public static ITokenStore Create(Action<string>? warn = null)
     {
         (TokenStoreKind Kind, string? Warning) choice;
         try
@@ -48,12 +53,18 @@ internal static class CliTokenStore
             TokenStoreKind.SecretService => new SecretServiceTokenStore(Run),
             TokenStoreKind.Dpapi when OperatingSystem.IsWindows() =>
                 new FileTokenStore(directory, unixPermissions: false, new DpapiProtector()),
+            // Refused by Choose already; this arm only satisfies the platform analyzer.
             TokenStoreKind.Dpapi => throw new CommandFailedException(
                 2, $"{TokenStoreSelection.Variable}=dpapi is only available on Windows."),
             _ => new FileTokenStore(directory, unixPermissions: !OperatingSystem.IsWindows()),
         };
 
-        return (store, choice.Warning);
+        if (choice.Warning is not null)
+        {
+            (warn ?? (message => Console.Error.WriteLine($"warning: {message}")))(choice.Warning);
+        }
+
+        return store;
     }
 
     /// <summary>Runs a program to completion, never through a shell.</summary>

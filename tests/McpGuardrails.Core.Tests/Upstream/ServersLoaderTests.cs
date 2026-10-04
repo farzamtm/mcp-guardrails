@@ -201,6 +201,26 @@ public sealed class ServersLoaderTests
     }
 
     [Fact]
+    public void Parse_PointsAClientsOAuthKey_AtTheProxysOwnLogin()
+    {
+        // A pasted Claude Code entry with 'oauth' is told how to have the proxy
+        // log in, instead of only that OAuth is the client's business.
+        var result = Parse("""
+            version: 1
+            servers:
+              a: { type: http, url: https://mcp.example.com/mcp, oauth: { clientId: x } }
+            """);
+
+        Assert.Contains(result.Warnings, w =>
+            w.Contains("'oauth'", StringComparison.Ordinal) &&
+            w.Contains("x-guardrails: { oauth: {} }", StringComparison.Ordinal) &&
+            w.Contains("auth login", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            Parse("version: 1\nservers:\n  a: { command: npx, args: [pkg@1.0.0], timeout: 5 }\n").Warnings,
+            w => w.Contains("auth login", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Parse_AcceptsAnEmptyProxyNamespace() =>
         Assert.Equal("a", Single("""
             version: 1

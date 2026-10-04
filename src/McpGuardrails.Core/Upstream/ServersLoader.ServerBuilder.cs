@@ -54,7 +54,10 @@ public static partial class ServersLoader
 
             if (ignored.Count > 0)
             {
-                warnings.Add($"{_prefix} ignoring client-only key(s) {string.Join(", ", ignored.Select(k => $"'{k}'"))}; they configure the client, not the proxy.");
+                warnings.Add($"{_prefix} ignoring client-only key(s) {string.Join(", ", ignored.Select(k => $"'{k}'"))}; they configure the client, not the proxy." +
+                             (ignored.Contains("oauth")
+                                 ? " To have the proxy log in to this server, add 'x-guardrails: { oauth: {} }' and run 'mcp-guardrails auth login'."
+                                 : string.Empty));
             }
 
             if (HasNewErrors)
