@@ -165,11 +165,11 @@ public sealed record OAuthSettings
             throw new PolicyException("'access.oauth' needs an 'issuer': the authorization server whose tokens are accepted.");
         }
 
-        Endpoint(Issuer, "access.oauth.issuer");
+        KeySetUrl(Issuer, "access.oauth.issuer");
 
         if (JwksUri is not null)
         {
-            Endpoint(JwksUri, "access.oauth.jwks_uri");
+            KeySetUrl(JwksUri, "access.oauth.jwks_uri");
         }
 
         // Without an audience, a token the same issuer minted for any other
@@ -240,12 +240,22 @@ public sealed record OAuthSettings
         }
     }
 
-    private void Endpoint(string value, string setting) =>
+    /// <summary>
+    /// Checks a URL the signing keys are fetched through - the issuer, a
+    /// configured key set, or one named by discovery - throwing a
+    /// <see cref="PolicyException"/> naming <paramref name="setting"/> if it is
+    /// not safe.
+    /// </summary>
+    /// <remarks>
+    /// One check for all three, so the rules and the advice cannot drift
+    /// between a URL the operator wrote and one the issuer's metadata supplied.
+    /// </remarks>
+    internal Uri KeySetUrl(string value, string setting) =>
         OutboundUrl.Validate(
             value,
             setting,
             reason: "Signing keys fetched in the clear can be replaced by anyone on the path, and with them every token",
             credentialHint: "the keys are public and need no credential",
             allowLoopbackHttp: AllowInsecureLocalhost is true,
-            optInSetting: "allow_insecure_localhost");
+            optInSetting: "access.oauth.allow_insecure_localhost");
 }
