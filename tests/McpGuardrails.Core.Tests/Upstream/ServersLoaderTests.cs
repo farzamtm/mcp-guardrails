@@ -441,10 +441,10 @@ public sealed class ServersLoaderTests
         host.Variables["PATH"] = $"{first};;{second}";
         host.Files.Add(Path.Combine(second, "tool.CMD"));
 
-        Assert.Null(ServersLoader.CheckCommand("tool", host.Build()));
+        Assert.Null(CommandLocator.Check("tool", host.Build()));
 
         host.Variables["PATHEXT"] = ".EXE";
-        Assert.Equal("was not found on PATH", ServersLoader.CheckCommand("tool", host.Build()));
+        Assert.Equal("was not found on PATH", CommandLocator.Check("tool", host.Build()));
     }
 
     [Fact]
@@ -453,7 +453,7 @@ public sealed class ServersLoaderTests
         var host = new FakeHost();
         host.Variables.Remove("PATH");
 
-        Assert.Equal("was not found on PATH", ServersLoader.CheckCommand("npx", host.Build()));
+        Assert.Equal("was not found on PATH", CommandLocator.Check("npx", host.Build()));
     }
 
     [Fact]
@@ -602,7 +602,7 @@ public sealed class ServersLoaderTests
     [InlineData("K=a=b", "K", "a=b")]
     public void ParseEnvFile_ReadsDotenvLines(string line, string key, string value)
     {
-        var variables = ServersLoader.ParseEnvFile(line + "\r\n", out var error);
+        var variables = EnvFile.Parse(line + "\r\n", out var error);
 
         Assert.Null(error);
         Assert.Equal(value, variables![key]);
@@ -614,7 +614,7 @@ public sealed class ServersLoaderTests
     [InlineData("1BAD=x")]
     public void ParseEnvFile_RefusesWhatIsNotAPair(string line)
     {
-        Assert.Null(ServersLoader.ParseEnvFile(line, out var error));
+        Assert.Null(EnvFile.Parse(line, out var error));
         Assert.Equal("line 1 is not a KEY=VALUE pair", error);
     }
 
@@ -653,7 +653,7 @@ public sealed class ServersLoaderTests
     {
         using var document = JsonDocument.Parse("[1]");
 
-        Assert.False(ServersLoader.TryParseDuration(document.RootElement, out _));
+        Assert.False(Durations.TryParse(document.RootElement, out _));
     }
 
     // ----------------------------------------------------- disabled and optional
