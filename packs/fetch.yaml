@@ -1,0 +1,56 @@
+# Pack: fetch — fetch public web pages, but never internal addresses or
+# non-web schemes.
+#
+# Protects: services only reachable from this machine - localhost, private
+# networks, link-local addresses and cloud metadata endpoints.
+# Allows: http and https URLs on public hosts.
+# Threat: a fetched page or file tells the agent to request an internal URL
+# (server-side request forgery), reaching an admin panel or the cloud metadata
+# service that hands out credentials.
+# Known gaps: host names are matched as written, so DNS that resolves a public
+# name to a private address, or an IP written in decimal or hex, is not caught.
+# Data the agent puts in a public URL's query string still leaves the machine;
+# change the last rule to require_approval if that matters more than speed.
+# https://github.com/farzamtm/mcp-guardrails/blob/main/docs/threat-model.md#a1-malicious-tool-result--indirect-prompt-injection
+pack:
+  name: fetch
+  version: 1
+  description: Fetch public web pages, never internal addresses or non-web schemes.
+  recognizes:
+    - mcp-server-fetch
+    - mcp/fetch
+
+rules:
+  - name: "{{server}}-web-only"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.url
+          matches: '(?i)^(?!https?://)'
+    decision: deny
+    message: Only http and https URLs can be fetched.
+
+  # The optional user:password@ prefix is skipped before the host is read, so
+  # http://user@127.0.0.1/ is still recognised as loopback. Bracketed hosts are
+  # IPv6 literals; all of them are refused rather than parsed.
+  - name: "{{server}}-no-internal-hosts"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.url
+          matches: '(?i)^https?://([^/?#@]*@)?(\[|localhost([:/?#]|$)|metadata([.:/?#]|$)|[^/?#:]*\.(local|internal|localhost)([:/?#]|$)|(127|10|0)\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'
+    decision: deny
+    message: >-
+      That URL points at this machine or a private network, which the agent
+      may not reach. Fetch a public URL, or ask the user for the content.
+
+  - name: "{{server}}-public-web"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__fetch"
+    decision: allow
+
+  - name: "{{server}}-approve-other-tools"
+    match:
+      server: "{{server}}"
+    decision: require_approval

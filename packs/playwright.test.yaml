@@ -1,0 +1,48 @@
+policy: playwright.yaml
+server: browser
+tools:
+  browser__browser_navigate: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+  browser__browser_snapshot: { readOnlyHint: true, destructiveHint: false, openWorldHint: true }
+  browser__browser_click: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+  browser__browser_type: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+  browser__browser_evaluate: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+  browser__browser_run_code_unsafe: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+  browser__browser_file_upload: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+cases:
+  - call: browser__browser_navigate
+    args: { url: "https://example.com/login" }
+    expect: allow
+    rule: browser-browse
+  - name: local dev servers are the main use case, so they stay reachable
+    call: browser__browser_navigate
+    args: { url: "http://localhost:3000/" }
+    expect: allow
+  - call: browser__browser_navigate
+    args: { url: "file:///home/me/.ssh/id_rsa" }
+    expect: deny
+    rule: browser-no-local-urls
+  - call: browser__browser_navigate
+    args: { url: "chrome://settings" }
+    expect: deny
+  - call: browser__browser_navigate
+    args: { url: "  JavaScript:alert(1)" }
+    expect: deny
+  - call: browser__browser_snapshot
+    expect: allow
+  - call: browser__browser_click
+    args: { element: "Sign in", ref: e12 }
+    expect: allow
+  - call: browser__browser_type
+    args: { element: search, ref: e3, text: hello }
+    expect: allow
+  - call: browser__browser_evaluate
+    args: { function: "() => document.cookie" }
+    expect: require_approval
+    rule: browser-approve-scripts
+  - call: browser__browser_file_upload
+    args: { paths: [/home/me/Documents/tax-return.pdf] }
+    expect: require_approval
+    rule: browser-approve-uploads
+  - call: browser__browser_run_code_unsafe
+    expect: deny
+    rule: browser-no-unsafe-code

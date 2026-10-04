@@ -39,6 +39,7 @@ guardrails go.
 | --- | --- | --- |
 | **Audit** | Every call, including refused ones, to a JSONL log. With no policy at all it is a transparent recorder. | [audit log](docs/audit-log.md) |
 | **Policy** | YAML allow / deny / require-approval rules, first match wins, matching on tool globs, MCP annotations and JSONPath predicates over the arguments. Refusals are written as prompts the agent can act on. | [policy](docs/policy.md) |
+| **Policy packs** | Ready-made, commented policies for popular servers - filesystem, GitHub, git, Postgres, fetch, Playwright, Supabase. `init` writes one reviewable policy file from them, and `policy test` checks that a policy decides the way its test cases say. | [packs](docs/packs.md) |
 | **Budgets** | Session and daily caps on calls and on weighted cost; daily caps persist in SQLite and survive restarts. | [budgets](docs/budgets.md) |
 | **Human approval** | Holds a call until a person answers, at the client (MCP elicitation) or via an HMAC-signed webhook. Silence means no. | [approval](docs/approval.md) |
 | **Injection scanning** | Tool results and tool definitions are checked for prompt injection and fenced as untrusted data, on by default. An optional Claude classifier can act as a second opinion. | [result scanning](docs/result-scanning.md) |
@@ -117,15 +118,20 @@ export GUARDRAILS_POLICY=examples/filesystem-sandbox.yaml
 tail -f ~/.mcp-guardrails/audit.jsonl
 ```
 
-To put it in front of the servers your client already runs:
+To put it in front of the servers your client already runs, with a policy
+written for them:
 
 ```bash
 mcp-guardrails wrap --client claude-desktop --dry-run   # or claude-code, cursor, vscode
 mcp-guardrails wrap --client claude-desktop
+mcp-guardrails init                                     # a policy from the packs for your servers
 mcp-guardrails validate                                 # check the servers file and policy
 ```
 
-See [docs/servers.md](docs/servers.md) for the servers file, and
+[docs/demo.md](docs/demo.md) walks through exactly that with Claude Code and a
+planted prompt injection, in about five minutes. See
+[docs/servers.md](docs/servers.md) for the servers file,
+[docs/packs.md](docs/packs.md) for the packs, and
 [`examples/claude-desktop-config.json`](examples/claude-desktop-config.json) to
 wire the proxy into Claude Desktop by hand.
 
@@ -216,6 +222,12 @@ Run with `--explain` to append the full decision trail to each refusal. The
 complete reference, including the sharp edges, is in
 [docs/policy.md](docs/policy.md).
 
+Or start from the packs: `mcp-guardrails init --pack github=gh` writes the
+GitHub pack's rules for a server named `gh`, each with a comment saying why it
+is there. Then check the policy behaves, not just parses, with
+`mcp-guardrails policy test` and a file of example calls (see
+[testing a policy](docs/policy.md#testing-a-policy)).
+
 ## How it works
 
 The proxy is an MCP server and an MCP client at the same time, built on the
@@ -278,8 +290,6 @@ locally.
 
 ## Roadmap
 
-- **Pinning tool definitions**, so a server that changes a tool's description
-  or schema between restarts is caught
 - **OAuth to remote servers**, beyond the static headers supported today
 - **Published releases:** signed binaries, nuget.org, a container image
 - **Slack approval**, and the Tasks/MRTR approval path for clients on the

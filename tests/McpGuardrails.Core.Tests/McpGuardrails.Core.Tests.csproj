@@ -19,6 +19,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The shipped packs and their test files, so every pack is checked to
+         behave as its tests say on each dotnet test, not only in CI. -->
+    <None Include="..\..\packs\*.yaml" LinkBase="packs" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\McpGuardrails.Core\McpGuardrails.Core.csproj" />
   </ItemGroup>
 

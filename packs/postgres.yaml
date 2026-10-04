@@ -1,0 +1,79 @@
+# Pack: postgres — run single read-only statements freely, approve anything
+# that writes or changes the session, and never touch server files or other
+# connections.
+#
+# Protects: the database's data and schema, the database server's file system,
+# and other sessions.
+# Allows: one SELECT, WITH, EXPLAIN, SHOW, TABLE or VALUES statement per call,
+# and tools the server marks read-only.
+# Threat: a row the agent read carries instructions to run "COMMIT; DROP ...".
+# A second statement after a semicolon can end a read-only transaction and run
+# outside it, so multi-statement SQL is refused outright.
+# How it decides: by keywords in the SQL text, which is a heuristic. It leans
+# towards asking - a column named "comment" or a string containing "update"
+# needs approval - rather than towards allowing.
+# https://github.com/farzamtm/mcp-guardrails/blob/main/docs/threat-model.md#a1-malicious-tool-result--indirect-prompt-injection
+pack:
+  name: postgres
+  version: 1
+  description: Single read-only statements run freely; writes need approval.
+  recognizes:
+    - "@modelcontextprotocol/server-postgres"
+    - postgres-mcp
+    - mcp/postgres
+
+rules:
+  - name: "{{server}}-one-statement"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.sql
+          matches: ';\s*\S'
+    decision: deny
+    message: >-
+      Send one SQL statement per call, with no semicolon followed by more SQL.
+
+  - name: "{{server}}-no-server-access"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.sql
+          matches: '(?i)\b(copy|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|lo_import|lo_export|dblink\w*|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|set_config)\b'
+    decision: deny
+    message: >-
+      This statement reads server files, opens connections or affects other
+      sessions, which the agent may not do. Query the tables directly.
+
+  # EXPLAIN ANALYZE executes the statement it explains, hence analyze here.
+  - name: "{{server}}-approve-writes"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.sql
+          matches: '(?i)\b(insert|update|delete|merge|upsert|drop|alter|truncate|create|grant|revoke|comment|call|do|vacuum|analyze|reindex|cluster|refresh|lock|set|reset|discard|listen|notify|prepare|execute|deallocate|import|security|begin|commit|rollback|savepoint|release)\b'
+    decision: require_approval
+    message: >-
+      This statement can change data or the session, so it needs the user's
+      approval. If it is declined, show the SQL instead of running it.
+
+  - name: "{{server}}-read-queries"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.sql
+          matches: '(?i)^\s*(select|with|explain|show|table|values)\b'
+    decision: allow
+    cost: 0
+
+  - name: "{{server}}-read-tools"
+    match:
+      server: "{{server}}"
+      annotations: { readOnlyHint: true }
+    decision: allow
+    cost: 0
+
+  - name: "{{server}}-approve-rest"
+    match:
+      server: "{{server}}"
+    decision: require_approval
+    message: This needs the user's approval. If it is declined, explain what you intended.

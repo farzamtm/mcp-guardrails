@@ -1,0 +1,45 @@
+policy: git.yaml
+server: git
+tools:
+  git__git_status: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  git__git_diff: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  git__git_show: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  git__git_log: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  git__git_commit: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+  git__git_reset: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
+  git__git_checkout: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+  git__git_create_branch: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+cases:
+  - call: git__git_status
+    args: { repo_path: /work/project }
+    expect: allow
+    rule: git-reads
+  - call: git__git_diff
+    args: { repo_path: /work/project, target: main }
+    expect: allow
+  - call: git__git_diff
+    args: { repo_path: /work/project, target: "--output=/home/me/.bashrc" }
+    expect: deny
+    rule: git-no-option-target
+  - call: git__git_show
+    args: { repo_path: /work/project, revision: "--output=/tmp/x" }
+    expect: deny
+    rule: git-no-option-revision
+  - call: git__git_checkout
+    args: { repo_path: /work/project, branch_name: "--orphan" }
+    expect: deny
+    rule: git-no-option-branch
+  - call: git__git_create_branch
+    args: { repo_path: /work/project, branch_name: feature, base_branch: "--force" }
+    expect: deny
+    rule: git-no-option-base-branch
+  - call: git__git_commit
+    args: { repo_path: /work/project, message: "fix typo" }
+    expect: require_approval
+    rule: git-approve-changes
+  - call: git__git_reset
+    args: { repo_path: /work/project }
+    expect: require_approval
+  - call: git__git_checkout
+    args: { repo_path: /work/project, branch_name: main }
+    expect: require_approval

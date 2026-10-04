@@ -22,6 +22,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -288,6 +289,22 @@ PINS_BLOCK_POLICY = f"{PINS_DIR}/block.yaml"
 PINS_NO_POLICY = f"{PINS_DIR}/no-such-policy.yaml"
 PINS_AUDIT = f"{SANDBOX}/audit-pins.jsonl"
 PINS_ORIGINAL = "Echoes a message back."
+PACKS_DIR = f"{SANDBOX}/packs-phase"
+PACKS_POLICY = f"{PACKS_DIR}/policy.yaml"
+PACKS_AUDIT = f"{SANDBOX}/audit-packs.jsonl"
+PACKS_READABLE = f"{SANDBOX}/smoke-packs-readme.txt"
+PACKS_DECLINED = f"{SANDBOX}/smoke-packs-declined.txt"
+PACKS_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs")
+DEMO_POISONED = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "examples",
+    "demo",
+    "workspace",
+    "notes",
+    "vendor-email.md",
+)
+PACKS_POISONED = f"{SANDBOX}/smoke-packs-vendor-email.md"
 PINS_UPGRADED = "Echoes a message back, louder."
 WRAP_TOKEN = "ghp" + "_" + "smoketest" + "0" * 27
 WRAP_CONFIG = f"{SERVERS_DIR}/claude_desktop_config.json"
@@ -1361,6 +1378,13 @@ def main() -> int:
     pins_failures, pins_stderr = run_pins_phase()
     failures += pins_failures
     http_stderr += pins_stderr
+
+    # Phase 13: a policy generated from the built-in packs, enforced by a real
+    # proxy, and the policy test command run over every shipped pack.
+    print("\n--- policy packs ---")
+    packs_failures, packs_stderr = run_packs_phase()
+    failures += packs_failures
+    http_stderr += packs_stderr
 
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
@@ -2870,6 +2894,148 @@ def run_pins_phase() -> tuple[int, list[str]]:
         f"pins: a corrupt pins file stops the proxy (got {corrupt.returncode})",
     )
 
+    return check.failures, stderr
+
+
+def run_packs_phase() -> tuple[int, list[str]]:
+    """init writes a policy from the packs; the proxy enforces it; policy test runs."""
+    os.makedirs(PACKS_DIR, exist_ok=True)
+    for stale in (PACKS_POLICY, PACKS_AUDIT, PACKS_DECLINED, PACKS_POISONED):
+        if os.path.exists(stale):
+            os.remove(stale)
+    with open(PACKS_READABLE, "w", encoding="utf-8") as handle:
+        handle.write("readable by policy")
+    # The demo's poisoned file, read the way docs/demo.md step 4 reads it.
+    shutil.copyfile(DEMO_POISONED, PACKS_POISONED)
+
+    check = Checker()
+    stderr: list[str] = []
+
+    listing = run_cli(["init", "--list"], {})
+    check.expect(
+        listing.returncode == 0 and "github" in listing.stdout,
+        "init --list: shows the built-in packs",
+    )
+
+    # No --pack: the built-in filesystem server is recognized by its package.
+    first = run_cli(["init", "-o", PACKS_POLICY], {})
+    check.expect(
+        first.returncode == 0
+        and "pack filesystem -> server 'fs'" in first.stderr
+        and os.path.exists(PACKS_POLICY),
+        f"init: recognizes the built-in server, writes a policy ({first.returncode})",
+    )
+
+    again = run_cli(["init", "-o", PACKS_POLICY], {})
+    check.expect(
+        again.returncode == 0 and "already up to date" in again.stderr,
+        "init: running it again changes nothing",
+    )
+
+    with open(PACKS_POLICY, "a", encoding="utf-8") as handle:
+        handle.write("  # a local edit\n")
+    refused = run_cli(["init", "-o", PACKS_POLICY], {})
+    check.expect(
+        refused.returncode == 1
+        and "a local edit" in refused.stderr
+        and "--force" in refused.stderr,
+        "init: an edited policy is not replaced without --force, and the diff is shown",
+    )
+    forced = run_cli(["init", "-o", PACKS_POLICY, "--force"], {})
+    check.expect(forced.returncode == 0, "init --force: replaces it")
+
+    valid = run_cli(["validate", "--policy", PACKS_POLICY], {})
+    check.expect(
+        valid.returncode == 0 and "warning" not in valid.stdout,
+        f"validate: the generated policy is valid (got {valid.returncode})",
+    )
+
+    tests = sorted(
+        os.path.join(PACKS_SOURCE, name)
+        for name in os.listdir(PACKS_SOURCE)
+        if name.endswith(".test.yaml")
+    )
+    tested = run_cli(["policy", "test", *tests], {})
+    check.expect(
+        tested.returncode == 0 and tested.stdout.count(" passed") == len(tests),
+        f"policy test: every shipped pack passes its tests ({len(tests)} files)",
+    )
+
+    broken = f"{PACKS_DIR}/broken.test.yaml"
+    pack = os.path.abspath(os.path.join(PACKS_SOURCE, "filesystem.yaml"))
+    with open(broken, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"policy: {pack}\n"
+            "server: fs\ntools:\n  fs__write_file: {}\ncases:\n"
+            "  - call: fs__write_file\n    expect: allow\n"
+        )
+    failing = run_cli(["policy", "test", broken], {})
+    check.expect(
+        failing.returncode == 1
+        and "FAIL" in failing.stdout
+        and "fs-approve-changes" in failing.stdout,
+        "policy test: a wrong expectation fails with the decision trail",
+    )
+
+    failures, lines = run_session(
+        [
+            (
+                call(1, "fs__read_text_file", {"path": PACKS_READABLE}),
+                "packs: a read in the sandbox is allowed",
+                lambda r: "readable by policy" in result_text(r),
+            ),
+            (
+                call(2, "fs__read_text_file", {"path": f"{SANDBOX}/.env"}),
+                "packs: reading a .env file is refused",
+                lambda r: denied_with(r, "fs-no-credentials"),
+            ),
+            (
+                call(
+                    3,
+                    "fs__write_file",
+                    {"path": f"{SANDBOX}/.git/hooks/pre-commit", "content": "x"},
+                ),
+                "packs: writing a git hook is refused",
+                lambda r: denied_with(r, "fs-no-code-that-runs-later"),
+            ),
+            (
+                call(4, "fs__read_text_file", {"path": PACKS_POISONED}),
+                "packs: the demo's poisoned file is allowed, but fenced and flagged",
+                lambda r: (
+                    "begin untrusted output" in result_text(r)
+                    and "instruction-override" in result_text(r)
+                    and "exfiltration" in result_text(r)
+                ),
+            ),
+            (
+                call(5, "fs__write_file", {"path": PACKS_DECLINED, "content": "x"}),
+                "packs: an ordinary write asks the human, who declines",
+                lambda r: bool(r.get("isError")),
+            ),
+        ],
+        {"GUARDRAILS_POLICY": PACKS_POLICY, "GUARDRAILS_AUDIT": PACKS_AUDIT},
+        handshake=True,
+        elicit="decline",
+    )
+    check.failures += failures
+    stderr.extend(lines)
+
+    declined = os.path.exists(PACKS_DECLINED)
+    check.expect(not declined, "packs: the declined write never reached the disk")
+
+    lines_read = read_audit(PACKS_AUDIT, "packs audit log")
+    if lines_read is None:
+        check.failures += 1
+    else:
+        check.expect(
+            any(
+                entry.get("rule") == "fs-approve-changes"
+                and entry.get("decision") == "deny"
+                and entry.get("approval") == "declined"
+                for entry in lines_read
+            ),
+            "packs: the audit log records the pack's rule and the human's answer",
+        )
     return check.failures, stderr
 
 
