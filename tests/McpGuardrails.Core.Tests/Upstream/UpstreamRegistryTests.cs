@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
 using McpGuardrails.Core.Upstream;
+using McpGuardrails.Core.UpstreamAuth;
 using Microsoft.Extensions.Logging.Abstractions;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
@@ -277,6 +278,46 @@ public sealed class UpstreamRegistryTests
         Assert.Contains("'down'", exception.Message, StringComparison.Ordinal);
         Assert.Contains("connection refused", exception.Message, StringComparison.Ordinal);
         Assert.Contains("fs", connected);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_StartsWithoutARequiredServerThatNeedsALogin()
+    {
+        // No amount of waiting fixes a missing login; the other servers are still
+        // worth serving, and the missing one's tools say what to run.
+        await using var server = InMemoryMcpServer.Start("fixture", EchoTool());
+
+        UpstreamTransportFactory factory = (config, logging) => config.Name == "linear"
+            ? throw new UpstreamLoginRequiredException("linear", "has never been logged in")
+            : server.TransportFactory(config, logging);
+
+        await using var registry = await UpstreamRegistry.ConnectAsync(
+            [Config("fs"), Config("linear")],
+            NullLoggerFactory.Instance,
+            factory);
+
+        var missing = Assert.Single(registry.Unavailable);
+        Assert.Equal("linear", missing.Name);
+        Assert.Contains("auth login linear", missing.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TryGetUnavailable_FindsTheServerByTheToolsPrefix()
+    {
+        await using var server = InMemoryMcpServer.Start("fixture", EchoTool());
+
+        UpstreamTransportFactory factory = (config, logging) => config.Name == "linear"
+            ? throw new UpstreamLoginRequiredException("linear", "x")
+            : server.TransportFactory(config, logging);
+
+        await using var registry = await UpstreamRegistry.ConnectAsync(
+            [Config("fs"), Config("linear")], NullLoggerFactory.Instance, factory);
+
+        Assert.True(registry.TryGetUnavailable("linear__create_issue", out var found));
+        Assert.Equal("linear", found.Name);
+        Assert.False(registry.TryGetUnavailable("fs__echo", out _));
+        Assert.False(registry.TryGetUnavailable("linear", out _));
+        Assert.False(registry.TryGetUnavailable("__x", out _));
     }
 
     [Fact]

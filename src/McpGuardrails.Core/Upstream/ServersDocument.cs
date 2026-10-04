@@ -90,9 +90,39 @@ public sealed record ServerEntryDocument
     public bool? EnvIsolation { get; init; }
 
     /// <summary>
-    /// Reserved for options only the proxy understands. Accepted and unused, so a
-    /// file written for a later version still loads here.
+    /// Options only the proxy understands, in a namespace clients ignore, so one
+    /// file can still be read by both.
     /// </summary>
+    /// <remarks>
+    /// Unknown keys inside it are refused like everywhere else: a misspelt
+    /// security option here would otherwise be skipped quietly.
+    /// </remarks>
     [JsonPropertyName("x-guardrails")]
-    public JsonElement? Guardrails { get; init; }
+    public ServerExtensionsDocument? Guardrails { get; init; }
+}
+
+/// <summary>The <c>x-guardrails:</c> block of one server.</summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ServerExtensionsDocument
+{
+    /// <summary>Log in to the remote server with OAuth.</summary>
+    [JsonPropertyName("oauth")]
+    public UpstreamOAuthDocument? OAuth { get; init; }
+}
+
+/// <summary>The <c>x-guardrails.oauth:</c> block of a remote server.</summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record UpstreamOAuthDocument
+{
+    /// <summary>Scopes to ask for, beyond what the server's metadata suggests.</summary>
+    [JsonPropertyName("scopes")]
+    public IReadOnlyList<string>? Scopes { get; init; }
+
+    /// <summary>A client id registered in advance, for servers without dynamic registration.</summary>
+    [JsonPropertyName("client_id")]
+    public string? ClientId { get; init; }
+
+    /// <summary>The loopback port of the login redirect, for a client id registered with a fixed one.</summary>
+    [JsonPropertyName("redirect_port")]
+    public int? RedirectPort { get; init; }
 }

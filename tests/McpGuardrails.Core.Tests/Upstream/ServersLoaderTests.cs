@@ -201,12 +201,103 @@ public sealed class ServersLoaderTests
     }
 
     [Fact]
-    public void Parse_AcceptsTheReservedProxyNamespace() =>
+    public void Parse_AcceptsAnEmptyProxyNamespace() =>
         Assert.Equal("a", Single("""
             version: 1
             servers:
-              a: { command: npx, args: [pkg@1.0.0], x-guardrails: { future: true } }
+              a: { command: npx, args: [pkg@1.0.0], x-guardrails: {} }
             """).Name);
+
+    [Theory]
+    [InlineData("{ future: true }")]
+    [InlineData("{ oauth: { scope: [read] } }")]
+    public void Parse_RefusesUnknownKeysInTheProxyNamespace(string block)
+    {
+        // It holds security options; a misspelt one must not be skipped quietly.
+        var error = SingleError($$"""
+            version: 1
+            servers:
+              a: { type: http, url: "https://mcp.example.com/mcp", x-guardrails: {{block}} }
+            """);
+
+        Assert.Contains("is not valid", error, StringComparison.Ordinal);
+    }
+
+    // ----------------------------------------------------------------- oauth
+
+    [Fact]
+    public void Parse_ReadsTheOAuthBlock()
+    {
+        var server = Single("""
+            version: 1
+            servers:
+              linear:
+                type: http
+                url: https://mcp.linear.app/mcp
+                x-guardrails:
+                  oauth: { scopes: [read, write], client_id: guardrails, redirect_port: 8765 }
+            """);
+
+        Assert.Equal(["read", "write"], server.OAuth!.Scopes);
+        Assert.Equal("guardrails", server.OAuth.ClientId);
+        Assert.Equal(8765, server.OAuth.RedirectPort);
+    }
+
+    [Fact]
+    public void Parse_AnEmptyOAuthBlock_MeansDynamicRegistrationAndTheServersScopes()
+    {
+        var server = Single("""
+            version: 1
+            servers:
+              linear: { type: http, url: "https://mcp.linear.app/mcp", x-guardrails: { oauth: {} } }
+            """);
+
+        Assert.Empty(server.OAuth!.Scopes);
+        Assert.Null(server.OAuth.ClientId);
+        Assert.Null(server.OAuth.RedirectPort);
+    }
+
+    [Fact]
+    public void Parse_NoOAuthBlock_MeansNoOAuth()
+    {
+        Assert.Null(Single("""
+            version: 1
+            servers:
+              docs: { type: http, url: "https://mcp.example.com/mcp" }
+            """).OAuth);
+    }
+
+    [Fact]
+    public void Parse_RefusesOAuthOnAStdioServer()
+    {
+        Assert.Contains(
+            "sets 'x-guardrails.oauth', which only applies to remote servers",
+            SingleError("""
+                version: 1
+                servers:
+                  a: { command: npx, args: [pkg@1.0.0], x-guardrails: { oauth: {} } }
+                """),
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("headers: { Authorization: \"Bearer x\" }, x-guardrails: { oauth: {} }", "both an 'Authorization' header")]
+    [InlineData("headers: { authorization: \"Bearer x\" }, x-guardrails: { oauth: {} }", "both an 'Authorization' header")]
+    [InlineData("x-guardrails: { oauth: { scopes: [\"read write\"] } }", "not a single scope name")]
+    [InlineData("x-guardrails: { oauth: { scopes: [\"\"] } }", "not a single scope name")]
+    [InlineData("x-guardrails: { oauth: { client_id: \" \" } }", "empty 'x-guardrails.oauth.client_id'")]
+    [InlineData("x-guardrails: { oauth: { redirect_port: 0 } }", "redirect_port' of 0")]
+    [InlineData("x-guardrails: { oauth: { redirect_port: 70000 } }", "redirect_port' of 70000")]
+    public void Parse_RefusesABadOAuthBlock(string fields, string expected)
+    {
+        var error = SingleError($$"""
+            version: 1
+            servers:
+              a: { type: http, url: "https://mcp.example.com/mcp", {{fields}} }
+            """);
+
+        Assert.Contains(expected, error, StringComparison.Ordinal);
+    }
 
     // ----------------------------------------------------------------- version
 

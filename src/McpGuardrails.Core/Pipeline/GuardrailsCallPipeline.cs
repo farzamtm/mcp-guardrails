@@ -7,6 +7,7 @@ using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
+using McpGuardrails.Core.UpstreamAuth;
 using ModelContextProtocol.Protocol;
 
 namespace McpGuardrails.Core.Pipeline;
@@ -180,19 +181,36 @@ public sealed class GuardrailsCallPipeline
     {
         var requestedName = parameters?.Name;
 
+        if (requestedName is not null && _upstream.TryGetUnavailable(requestedName, out var unavailable))
+        {
+            return Error(
+                $"Tool '{requestedName}' belongs to server '{unavailable.Name}', which is not available in " +
+                $"this session. {unavailable.Reason} Tell the user; calling it again will not help.");
+        }
+
         if (requestedName is null ||
             !_upstream.TryResolve(requestedName, out var connection, out var downstreamName))
         {
             return Error($"Unknown tool '{requestedName}'.");
         }
 
-        return await connection.Client.CallToolAsync(
-            new CallToolRequestParams
-            {
-                Name = downstreamName,
-                Arguments = parameters?.Arguments,
-            },
-            cancellationToken);
+        try
+        {
+            return await connection.Client.CallToolAsync(
+                new CallToolRequestParams
+                {
+                    Name = downstreamName,
+                    Arguments = parameters?.Arguments,
+                },
+                cancellationToken);
+        }
+        catch (Exception ex) when (UpstreamOAuth.LoginRequired(ex) is { } login)
+        {
+            // A login that expired mid-session and could not be refreshed. A
+            // tool error rather than a protocol error, so the model reads it and
+            // stops, and the audit log records a failed call with this reason.
+            return Error($"Refused '{requestedName}': {login.Message} Tell the user; calling it again will not help.");
+        }
     }
 
     private static string ToolName(CallToolRequestParams? parameters) =>

@@ -1,5 +1,6 @@
 using McpGuardrails.Core.Upstream;
 using Microsoft.Extensions.Logging.Abstractions;
+using ModelContextProtocol.Authentication;
 using ModelContextProtocol.Client;
 
 namespace McpGuardrails.Core.Tests.Upstream;
@@ -121,6 +122,21 @@ public sealed class TransportFactoryTests
         Assert.Equal(expected, options.TransportMode);
         Assert.Equal(new Uri("https://mcp.example.com/mcp"), options.Endpoint);
         Assert.Equal("Bearer t", options.AdditionalHeaders!["authorization"]);
+    }
+
+    [Fact]
+    public void HttpOptions_CarryTheOAuthSettings()
+    {
+        var config = new UpstreamServerConfig
+        {
+            Name = "linear",
+            Transport = UpstreamTransport.Http,
+            Url = new Uri("https://mcp.linear.app/mcp"),
+        };
+        var oauth = new ClientOAuthOptions { RedirectUri = new Uri("http://127.0.0.1/callback") };
+
+        Assert.Same(oauth, UpstreamRegistry.HttpOptions(config, oauth).OAuth);
+        Assert.Null(UpstreamRegistry.HttpOptions(config).OAuth);
     }
 
     [Fact]

@@ -546,6 +546,7 @@ public static class ServersLoader
         {
             Forbid(document.Url, "url", "a stdio server");
             Forbid(document.Headers, "headers", "a stdio server");
+            Forbid(document.Guardrails?.OAuth, "x-guardrails.oauth", "a stdio server");
 
             if (string.IsNullOrWhiteSpace(document.Command))
             {
@@ -659,6 +660,8 @@ public static class ServersLoader
                 headers[key] = Expand(value, $"headers.{key}") ?? string.Empty;
             }
 
+            var oauth = ReadOAuth(document.Guardrails?.OAuth, headers);
+
             if (url is null || HasNewErrors)
             {
                 return null;
@@ -670,9 +673,51 @@ public static class ServersLoader
                 Transport = transport,
                 Url = url,
                 Headers = headers,
+                OAuth = oauth,
                 Optional = document.Optional is true,
                 DisplayTemplate = Display(document.Url),
             };
+        }
+
+        /// <remarks>
+        /// OAuth and a static Authorization header together are refused: two
+        /// credentials for one server is a question about which one is used, and
+        /// the answer would be an implementation detail of the SDK.
+        /// </remarks>
+        private UpstreamOAuthSettings? ReadOAuth(UpstreamOAuthDocument? document, Dictionary<string, string> headers)
+        {
+            if (document is null)
+            {
+                return null;
+            }
+
+            if (headers.ContainsKey("Authorization"))
+            {
+                Error("sets both an 'Authorization' header and 'x-guardrails.oauth'. Use one: OAuth logs in " +
+                      "with 'auth login', a static header sends the same credential every time.");
+            }
+
+            var scopes = document.Scopes ?? [];
+            foreach (var scope in scopes)
+            {
+                // RFC 6749 section 3.3's scope-token characters.
+                if (string.IsNullOrEmpty(scope) || scope.Any(c => c is < '!' or > '~' or '"' or '\\'))
+                {
+                    Error("has an 'x-guardrails.oauth.scopes' entry that is not a single scope name.");
+                }
+            }
+
+            if (document.ClientId is not null && string.IsNullOrWhiteSpace(document.ClientId))
+            {
+                Error("has an empty 'x-guardrails.oauth.client_id'. Omit it to register dynamically.");
+            }
+
+            if (document.RedirectPort is < 1 or > 65535)
+            {
+                Error($"has an 'x-guardrails.oauth.redirect_port' of {document.RedirectPort}; use 1 to 65535.");
+            }
+
+            return new UpstreamOAuthSettings(scopes, document.ClientId, document.RedirectPort);
         }
 
         private (bool Inherit, IReadOnlyDictionary<string, string?> Environment) Isolate(
