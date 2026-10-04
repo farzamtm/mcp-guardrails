@@ -36,7 +36,7 @@ bottom, rather than by guessing at specificity scores. See
 
 ## What a rule can match on
 
-Three kinds of condition, combined with AND. An omitted condition is skipped, so
+Four kinds of condition, combined with AND. An omitted condition is skipped, so
 a `match:` with nothing in it is a catch-all.
 
 ```yaml
@@ -58,6 +58,23 @@ rules:
 match, so older policy files mean exactly what they did before. Quote any
 pattern that *starts* with `*` — in YAML a bare leading `*` is an alias
 reference, so `tool: *__delete_*` is a parse error rather than a glob.
+
+**Server globs** match the name of the server that owns the tool, as named in
+the [servers file](servers.md): `server: github` says what `tool: github__*`
+says, but keeps reading as what it means when the rule also narrows by
+annotations or arguments. A call to a tool no server advertises has no server,
+so a `server:` condition never matches it. `validate` warns about a rule whose
+`server:` matches no configured server, because a rule that can never match is
+a guardrail that is not there.
+
+```yaml
+rules:
+  - name: approve-github-writes
+    match:
+      server: github
+      annotations: { readOnlyHint: false }
+    decision: require_approval
+```
 
 **Annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
 `openWorldHint` — match on what a tool advertises rather than what it is called,
