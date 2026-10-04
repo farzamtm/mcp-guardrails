@@ -277,6 +277,18 @@ UPSTREAM_TOKEN = "smoke-upstream-token-0123456789"
 
 # A Claude Desktop config for the wrap phase. The token is assembled at runtime
 # for the same reason as AWS_KEY above; it was never valid.
+# Every phase pins into this file rather than the developer's own
+# ~/.mcp-guardrails/pins.json, and it is removed before each run so the first
+# start of every phase is a genuine first use.
+SMOKE_PINS = f"{SANDBOX}/smoke-pins.json"
+PINS_DIR = f"{SANDBOX}/pins-phase"
+PINS_FILE = f"{PINS_DIR}/pins.json"
+PINS_SERVERS = f"{PINS_DIR}/servers.yaml"
+PINS_BLOCK_POLICY = f"{PINS_DIR}/block.yaml"
+PINS_NO_POLICY = f"{PINS_DIR}/no-such-policy.yaml"
+PINS_AUDIT = f"{SANDBOX}/audit-pins.jsonl"
+PINS_ORIGINAL = "Echoes a message back."
+PINS_UPGRADED = "Echoes a message back, louder."
 WRAP_TOKEN = "ghp" + "_" + "smoketest" + "0" * 27
 WRAP_CONFIG = f"{SERVERS_DIR}/claude_desktop_config.json"
 WRAP_SERVERS = f"{SERVERS_DIR}/wrapped-servers.yaml"
@@ -509,17 +521,22 @@ def read_audit_text(path: str, what: str) -> tuple[str, list[dict]] | None:
     return raw, lines
 
 
+def startup_event(event: str | None) -> bool:
+    """Lines a serving session writes at startup, before any call."""
+    return event == "upstream_connected" or (event or "").startswith("pin_")
+
+
 def read_audit(path: str, what: str) -> list[dict] | None:
     """The per-call records, for the checks that count them.
 
-    Leaves out the upstream_connected lines every serving session starts with:
-    they are about the servers, not the calls, and the servers phase reads them
-    through read_audit_text instead.
+    Leaves out the upstream_connected and pin_* lines a serving session starts
+    with: they are about the servers, not the calls, and the servers and pins
+    phases read them through read_audit_text instead.
     """
     audit = read_audit_text(path, what)
     if audit is None:
         return None
-    return [line for line in audit[1] if line.get("event") != "upstream_connected"]
+    return [line for line in audit[1] if not startup_event(line.get("event"))]
 
 
 CHECKS: list[Check] = [
@@ -1070,6 +1087,7 @@ def main() -> int:
     # ~/.mcp-guardrails/servers.yaml would otherwise be picked up. The servers
     # phase names its file explicitly.
     os.environ["GUARDRAILS_SERVERS"] = ""
+    os.environ["GUARDRAILS_PINS"] = SMOKE_PINS
 
     try:
         os.makedirs(SANDBOX, exist_ok=True)
@@ -1124,6 +1142,7 @@ def main() -> int:
         OTEL_AUDIT,
         OTEL_PROBE,
         ESCAPE,
+        SMOKE_PINS,
     ):
         try:
             os.remove(stale)
@@ -1335,6 +1354,13 @@ def main() -> int:
     servers_failures, servers_stderr = run_servers_phase()
     failures += servers_failures
     http_stderr += servers_stderr
+
+    # Phase 12: pinned tool definitions - pinned on first use, a changed
+    # definition noticed on the next start, and the review commands.
+    print("\n--- pins ---")
+    pins_failures, pins_stderr = run_pins_phase()
+    failures += pins_failures
+    http_stderr += pins_stderr
 
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
@@ -1690,8 +1716,8 @@ def run_http_session(
 def wait_for_lines(path: str, count: int, *, timeout: float) -> None:
     """Return once path holds at least count call records, or at the timeout.
 
-    Startup's upstream_connected lines are not counted, or the wait would end
-    one call early and race the flush of the last one.
+    Startup's upstream_connected and pin_* lines are not counted, or the wait
+    would end one call early and race the flush of the last one.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1700,7 +1726,7 @@ def wait_for_lines(path: str, count: int, *, timeout: float) -> None:
                 records = (
                     line
                     for line in handle
-                    if line.strip() and '"upstream_connected"' not in line
+                    if line.strip() and not startup_event(json.loads(line).get("event"))
                 )
                 if sum(1 for _ in records) >= count:
                     return
@@ -2659,6 +2685,192 @@ def check_servers_commands() -> int:
             print(result.stdout[-600:], result.stderr[-600:], file=sys.stderr)
 
     return check.failures
+
+
+def tool_description(result: dict, name: str) -> str | None:
+    """The description tools/list gave one tool, or None when it was not listed."""
+    for tool in result.get("tools", []):
+        if tool["name"] == name:
+            return tool.get("description", "")
+    return None
+
+
+def run_pins_phase() -> tuple[int, list[str]]:
+    """Pin on first use, notice a changed definition, review and accept it."""
+    os.makedirs(PINS_DIR, exist_ok=True)
+    for stale in (PINS_FILE, PINS_AUDIT):
+        if os.path.exists(stale):
+            os.remove(stale)
+
+    # The upgrade is an environment value of the servers file, which is not part
+    # of the server's identity: the same program, serving a changed tool.
+    with open(PINS_SERVERS, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"version: 1\nservers:\n  fixture:\n    command: '{sys.executable}'\n"
+            f"    args: ['{FIXTURE}']\n    env_isolation: false\n    env:\n"
+            f'      FIXTURE_ECHO_DESCRIPTION: "${{SMOKE_ECHO:-{PINS_ORIGINAL}}}"\n'
+        )
+    with open(PINS_BLOCK_POLICY, "w", encoding="utf-8") as handle:
+        handle.write("scanners:\n  pins:\n    mode: block\n")
+
+    base = {
+        "GUARDRAILS_SERVERS": PINS_SERVERS,
+        "GUARDRAILS_PINS": PINS_FILE,
+        "GUARDRAILS_AUDIT": PINS_AUDIT,
+        "GUARDRAILS_POLICY": PINS_NO_POLICY,
+    }
+    upgraded = {**base, "SMOKE_ECHO": PINS_UPGRADED}
+    blocking = {**upgraded, "GUARDRAILS_POLICY": PINS_BLOCK_POLICY}
+    check = Checker()
+    stderr: list[str] = []
+
+    def session(checks: list[Check], env: dict[str, str]) -> None:
+        failures, lines = run_session(checks, env)
+        check.failures += failures
+        stderr.extend(lines)
+
+    session(
+        [
+            (
+                request(1, "tools/list"),
+                "pins: the first start advertises the tool untouched",
+                lambda r: tool_description(r, "fixture__echo") == PINS_ORIGINAL,
+            )
+        ],
+        base,
+    )
+    pinned = ""
+    if os.path.exists(PINS_FILE):
+        with open(PINS_FILE, encoding="utf-8") as handle:
+            pinned = handle.read()
+    check.expect(
+        '"fixture"' in pinned and '"echo"' in pinned and "sha256:" in pinned,
+        "pins: the first start pins every tool in the pins file",
+    )
+
+    session(
+        [
+            (
+                request(1, "tools/list"),
+                "pins: under warn, a changed tool is advertised with a warning",
+                lambda r: (
+                    (tool_description(r, "fixture__echo") or "").startswith(
+                        "[guardrails] WARNING: its definition changed"
+                    )
+                    and PINS_UPGRADED in (tool_description(r, "fixture__echo") or "")
+                ),
+            ),
+            (
+                call(2, "fixture__echo", {"message": "warned"}),
+                "pins: ...and still works",
+                lambda r: "echo: warned" in result_text(r),
+            ),
+        ],
+        upgraded,
+    )
+
+    session(
+        [
+            (
+                request(1, "tools/list"),
+                "pins: under block, a changed tool is withheld from tools/list",
+                lambda r: (
+                    "fixture__echo" not in tool_names(r)
+                    and "fixture__env_names" in tool_names(r)
+                ),
+            ),
+            (
+                call(2, "fixture__echo", {"message": "blocked"}),
+                "pins: ...and a call to it is refused, naming the review command",
+                lambda r: (
+                    denied_with(r, "pins.changed")
+                    and denied_with(r, "pins diff fixture echo")
+                ),
+            ),
+        ],
+        blocking,
+    )
+
+    status = run_cli(["pins", "status"], upgraded)
+    check.expect(
+        status.returncode == 1 and "changed  echo" in status.stdout,
+        f"pins status: reports the change and exits 1 (got {status.returncode})",
+    )
+
+    diff = run_cli(["pins", "diff", "fixture", "echo"], upgraded)
+    check.expect(
+        diff.returncode == 0
+        and f'-   "description": "{PINS_ORIGINAL}"' in diff.stdout
+        and f'+   "description": "{PINS_UPGRADED}"' in diff.stdout,
+        f"pins diff: shows the old and new description (got {diff.returncode})",
+    )
+
+    accept = run_cli(["pins", "accept", "fixture", "echo"], upgraded)
+    clean = run_cli(["pins", "status"], upgraded)
+    check.expect(
+        accept.returncode == 0
+        and clean.returncode == 0
+        and "pins match" in clean.stdout,
+        "pins accept: the accepted change is clean "
+        f"(accept {accept.returncode}, status {clean.returncode})",
+    )
+
+    session(
+        [
+            (
+                call(1, "fixture__echo", {"message": "accepted"}),
+                "pins: after accept, the tool works again under block",
+                lambda r: "echo: accepted" in result_text(r),
+            )
+        ],
+        blocking,
+    )
+
+    read = read_audit_text(PINS_AUDIT, "pins audit log")
+    if read is None:
+        check.failures += 1
+    else:
+        audit = read[1]
+        events = [(line["event"], line.get("scanner_action")) for line in audit]
+        check.expect(
+            ("pin_created", None) in events, "pins: the audit log records pin_created"
+        )
+        check.expect(
+            ("pin_changed", "annotated") in events
+            and ("pin_changed", "blocked") in events,
+            "pins: the audit log records pin_changed, annotated then blocked",
+        )
+        check.expect(
+            any(
+                line["event"] == "pin_accepted" and line.get("tool") == "fixture__echo"
+                for line in audit
+            ),
+            "pins: the audit log records pin_accepted",
+        )
+        check.expect(
+            not any(PINS_UPGRADED in json.dumps(line) for line in audit),
+            "pins: no definition text reaches the audit log",
+        )
+
+    reset = run_cli(["pins", "reset", "fixture"], base)
+    unpinned = run_cli(["pins", "status"], base)
+    check.expect(
+        reset.returncode == 0
+        and unpinned.returncode == 1
+        and "not pinned yet" in unpinned.stdout,
+        "pins reset: the server is forgotten "
+        f"(reset {reset.returncode}, status {unpinned.returncode})",
+    )
+
+    with open(PINS_FILE, "w", encoding="utf-8") as handle:
+        handle.write("{ not json")
+    corrupt = run_cli(["list-upstream"], base)
+    check.expect(
+        corrupt.returncode == 1 and "not valid" in corrupt.stderr,
+        f"pins: a corrupt pins file stops the proxy (got {corrupt.returncode})",
+    )
+
+    return check.failures, stderr
 
 
 if __name__ == "__main__":
