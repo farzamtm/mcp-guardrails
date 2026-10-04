@@ -78,4 +78,36 @@ public sealed class HttpAccessGuardTests
     {
         Assert.Equal(HttpAccessVerdict.Allowed, _open.Check("Bearer anything", null));
     }
+
+    // ------------------------------------------------------------- contract
+
+    private static HttpAccessRequest Request(string? authorization) =>
+        new("POST", "/mcp", "http", "127.0.0.1:7300", "/mcp", authorization, Origin: null);
+
+    [Fact]
+    public async Task ARefusedToken_IsChallengedWithBareBearer()
+    {
+        // No metadata to point at: the token is a shared secret, not something
+        // a client can go and get.
+        var refused = await _locked.CheckAsync(Request("Bearer wrong"));
+
+        Assert.Equal(HttpAccessVerdict.Unauthorized, refused.Verdict);
+        Assert.Equal("Bearer", refused.Challenge);
+    }
+
+    [Fact]
+    public async Task AnAllowedRequest_CarriesNoChallengeAndNoCaller()
+    {
+        var allowed = await _locked.CheckAsync(Request($"Bearer {_token}"));
+
+        Assert.Equal(HttpAccessVerdict.Allowed, allowed.Verdict);
+        Assert.Null(allowed.Challenge);
+        Assert.Null(allowed.Caller);
+    }
+
+    [Fact]
+    public async Task TheContract_RejectsANullRequest()
+    {
+        await Assert.ThrowsAsync<ArgumentNullException>(() => _open.CheckAsync(null!).AsTask());
+    }
 }
