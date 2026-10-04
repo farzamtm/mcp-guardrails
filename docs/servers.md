@@ -238,7 +238,9 @@ write.
 `list-upstream` goes one step further. It connects to every server and prints
 the tools they advertise, qualified as the client will see them. It also says
 which servers have no [pins](pins.md) yet and which tools changed since they
-were pinned, without pinning anything itself.
+were pinned, without pinning anything itself. [`scan`](scan.md) checks the same
+tool definitions for injection-shaped text, suspicious schema defaults and
+dishonest read-only hints, and exits non-zero on a finding, for CI.
 
 ## Security notes
 

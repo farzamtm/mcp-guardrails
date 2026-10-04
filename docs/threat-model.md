@@ -138,6 +138,9 @@ hash checking what npm serves for it.
   ([`ToolAnnotationFacts`](../src/McpGuardrails.Core/Policy/ToolCallFacts.cs)).
   That helps against a *lazy* server. A *hostile* one simply declares
   `readOnlyHint: true`, and a read-only tool is never counted as destructive.
+  [`scan`](scan.md) flags a "read-only" tool named or described like a write,
+  before the server is put behind the proxy. That's a heuristic over English
+  verbs, not a check the proxy enforces at runtime.
 - **The result scanner** applies to its output exactly as in A1.
 - **The metadata scanner** applies the same heuristics to the tool definitions
   it advertises
@@ -494,7 +497,9 @@ The proxy gates calls *to* a server; it does nothing about the server itself.
   isolation, a server sees only the allowlist, what `env_passthrough` names and
   its own `env`.
 - **Lie in annotations** — declare a delete tool read-only and slip past
-  annotation rules. Name the tools you care about explicitly.
+  annotation rules. Name the tools you care about explicitly. `scan` reports
+  the obvious cases (a read-only `delete_row`), not a tool with an innocent
+  name that writes anyway.
 - **Poison tool descriptions in ways the heuristics miss** — see above.
 - **Return injections crafted around the heuristics** — see above.
 - **Return very large results.** There is no size cap; the scanner is linear but

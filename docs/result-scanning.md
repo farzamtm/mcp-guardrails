@@ -159,6 +159,10 @@ advertises depend on a third-party API at startup, and send every definition off
 the machine on every start. Secrets are not redacted from definitions either; a
 server author's own text is not where credentials flow.
 
+To run the same heuristics without starting the proxy - over a server you are
+still deciding whether to use, or in CI - use [`scan`](scan.md), which also
+checks schema defaults and examples and read-only annotations.
+
 The scanner only catches a definition that *looks* like an injection.
 [Pinning](pins.md) catches one that changed at all since you trusted it, across
 restarts.
