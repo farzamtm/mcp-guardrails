@@ -388,6 +388,10 @@ public sealed class SigningKeyCacheTests
         var refreshing = cache.GetKeysAsync("rsa-1").AsTask();
         var startedAt = issuer.Clock.Now;
 
+        // The refresh runs off the caller's stack, so wait for it to reach the
+        // authorization server before looking.
+        await issuer.Handler.WaitForAsync(TestIssuer.JwksPath, count: 2);
+
         // Past the cooldown, so this request would refresh too if it could.
         issuer.Clock.Advance(SigningKeyCache.RetryCooldown);
         var meanwhile = await cache.GetKeysAsync("rsa-1");

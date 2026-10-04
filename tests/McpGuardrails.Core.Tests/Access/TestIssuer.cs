@@ -158,7 +158,24 @@ internal sealed class IssuerHandler : HttpMessageHandler
     public void Serve(string path, string body, HttpStatusCode status = HttpStatusCode.OK) =>
         _routes[path] = (status, body);
 
-    public int Count(string path) => Requests.GetValueOrDefault(path);
+    public int Count(string path)
+    {
+        lock (Requests)
+        {
+            return Requests.GetValueOrDefault(path);
+        }
+    }
+
+    /// <summary>Waits until <paramref name="path"/> has been requested <paramref name="count"/> times.</summary>
+    public async Task WaitForAsync(string path, int count)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        while (Count(path) < count)
+        {
+            await Task.Delay(5, timeout.Token);
+        }
+    }
 
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request,
@@ -168,7 +185,7 @@ internal sealed class IssuerHandler : HttpMessageHandler
 
         lock (Requests)
         {
-            Requests[path] = Count(path) + 1;
+            Requests[path] = Requests.GetValueOrDefault(path) + 1;
         }
 
         if (Gate is { } gate)
