@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
+using McpGuardrails.Core.Packs;
 using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
@@ -81,4 +82,10 @@ namespace McpGuardrails.Core.Serialization;
 // skipped quietly.
 [JsonSerializable(typeof(ServerDefaultsDocument))]
 [JsonSerializable(typeof(ServerEntryDocument))]
+// Packs and policy test files, refusing unknown keys for the same reason: a
+// misspelt 'expect:' would leave a test case asserting nothing.
+[JsonSerializable(typeof(PackHeader))]
+[JsonSerializable(typeof(PolicyTestDocument))]
+[JsonSerializable(typeof(PolicyTestTool))]
+[JsonSerializable(typeof(PolicyTestCase))]
 internal sealed partial class GuardrailsJsonContext : JsonSerializerContext;

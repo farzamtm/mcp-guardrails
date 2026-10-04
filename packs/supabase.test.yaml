@@ -1,0 +1,47 @@
+policy: supabase.yaml
+server: supa
+tools:
+  supa__list_tables: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  supa__get_advisors: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  supa__execute_sql: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  supa__apply_migration: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  supa__deploy_edge_function: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+  supa__create_project: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+  supa__reset_branch: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+cases:
+  - call: supa__list_tables
+    args: { project_id: p, schemas: [public] }
+    expect: allow
+    rule: supa-reads
+  - call: supa__execute_sql
+    args: { project_id: p, query: "select * from tickets order by created_at desc limit 20" }
+    expect: allow
+    rule: supa-read-sql
+  - name: the exfiltration step writes, so a human sees it
+    call: supa__execute_sql
+    args: { project_id: p, query: "insert into messages (body) select token from integration_tokens" }
+    expect: require_approval
+    rule: supa-approve-sql-writes
+  - call: supa__execute_sql
+    args: { project_id: p, query: "select 1; select 2" }
+    expect: require_approval
+    rule: supa-approve-multiple-statements
+  - call: supa__execute_sql
+    args: { project_id: p, query: "select pg_read_file('pg_hba.conf')" }
+    expect: deny
+    rule: supa-no-server-access
+  - call: supa__apply_migration
+    args: { project_id: p, name: add_index, query: "create index on tickets (created_at)" }
+    expect: require_approval
+  - name: a migration that only selects is still a migration
+    call: supa__apply_migration
+    args: { project_id: p, name: noop, query: "select 1" }
+    expect: require_approval
+    rule: supa-approve-changes
+  - call: supa__deploy_edge_function
+    expect: require_approval
+    rule: supa-approve-changes
+  - call: supa__create_project
+    expect: require_approval
+  - call: supa__reset_branch
+    expect: require_approval

@@ -1,0 +1,59 @@
+policy: fetch.yaml
+server: web
+tools:
+  web__fetch: {}
+cases:
+  - call: web__fetch
+    args: { url: "https://modelcontextprotocol.io/docs" }
+    expect: allow
+    rule: web-public-web
+  - call: web__fetch
+    args: { url: "HTTP://example.com/" }
+    expect: allow
+  - call: web__fetch
+    args: { url: "file:///etc/passwd" }
+    expect: deny
+    rule: web-web-only
+  - call: web__fetch
+    args: { url: "gopher://example.com/" }
+    expect: deny
+    rule: web-web-only
+  - call: web__fetch
+    args: { url: "http://169.254.169.254/latest/meta-data/iam/" }
+    expect: deny
+    rule: web-no-internal-hosts
+  - call: web__fetch
+    args: { url: "http://metadata.google.internal/computeMetadata/v1/" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "http://localhost:8080/admin" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "http://127.0.0.1/" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "http://user:pw@127.0.0.1/" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "http://[::1]:3000/" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "https://10.0.0.5/" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "https://172.20.1.1/" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "https://192.168.1.1/" }
+    expect: deny
+  - call: web__fetch
+    args: { url: "http://printer.local/" }
+    expect: deny
+  - name: a public host that merely starts with a private-looking label is allowed
+    call: web__fetch
+    args: { url: "https://localhost-tools.example.com/" }
+    expect: allow
+  - name: 172.32 is outside the private range
+    call: web__fetch
+    args: { url: "https://172.32.0.1/" }
+    expect: allow

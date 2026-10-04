@@ -1,0 +1,68 @@
+# Pack: github — read freely, approve anything that writes, and never touch
+# secret-scanning alerts or repository settings.
+#
+# Protects: private repository contents leaving through a public channel, the
+# leaked credentials secret scanning has collected, and rulesets and custom
+# properties that govern the repository.
+# Allows: every tool the server marks read-only.
+# Threat: prompt injection in an issue or pull request body steers the agent
+# into copying a private repository somewhere public - a comment, a gist, a
+# fork, a new repository. Every one of those is a write, so a human sees it.
+# https://github.com/farzamtm/mcp-guardrails/blob/main/docs/threat-model.md#a1-malicious-tool-result--indirect-prompt-injection
+pack:
+  name: github
+  version: 1
+  description: Read freely, approve every write, never touch secrets or repository settings.
+  recognizes:
+    - github-mcp-server
+    - "@modelcontextprotocol/server-github"
+    - https://api.githubcopilot.com/mcp
+
+rules:
+  # Secret-scanning alerts are read-only tools whose output is the leaked
+  # secret itself, so the read-only allow below must not reach them.
+  - name: "{{server}}-no-secrets"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__*secret*"
+    decision: deny
+    message: >-
+      Secret-scanning alerts contain live credentials and are off-limits to
+      the agent. Ask the user to review them in GitHub.
+
+  - name: "{{server}}-no-rulesets"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__*ruleset*"
+      annotations: { readOnlyHint: false }
+    decision: deny
+    message: >-
+      Repository rulesets are settings, and the agent may not change them.
+      Describe the change for the user to make.
+
+  - name: "{{server}}-no-custom-properties"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__custom_properties*"
+      annotations: { readOnlyHint: false }
+    decision: deny
+    message: >-
+      Custom properties are repository settings, and the agent may not change
+      them. Describe the change for the user to make.
+
+  - name: "{{server}}-reads"
+    match:
+      server: "{{server}}"
+      annotations: { readOnlyHint: true }
+    decision: allow
+    cost: 0
+
+  # Issues, comments, branches, files, pull requests, merges, workflow runs,
+  # forks, gists: anything that is not a read.
+  - name: "{{server}}-approve-writes"
+    match:
+      server: "{{server}}"
+    decision: require_approval
+    message: >-
+      Changes on GitHub need the user's approval. If it is declined, describe
+      what you intended to do instead of retrying.

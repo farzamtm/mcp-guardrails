@@ -1,0 +1,83 @@
+# Pack: supabase — read the project freely, run read-only SQL, approve every
+# migration, deployment, branch operation and project change.
+#
+# Protects: the project's data, schema, edge functions, branches and billing.
+# Allows: tools the server marks read-only, and execute_sql with a single
+# SELECT, WITH, EXPLAIN, SHOW, TABLE or VALUES statement.
+# Threat: a row written by an outsider - a support ticket, a comment - tells
+# the agent to read a privileged table and write it somewhere the outsider can
+# see. The agent's access key bypasses row-level security, so the database
+# will not stop it; writes need a human instead.
+# How it decides: by keywords in the SQL text, which is a heuristic that leans
+# towards asking. Running the server with --read-only is stronger still.
+# https://github.com/farzamtm/mcp-guardrails/blob/main/docs/threat-model.md#a1-malicious-tool-result--indirect-prompt-injection
+pack:
+  name: supabase
+  version: 1
+  description: Read freely, run read-only SQL, approve migrations, deployments and project changes.
+  recognizes:
+    - "@supabase/mcp-server-supabase"
+    - https://mcp.supabase.com/mcp
+
+rules:
+  - name: "{{server}}-no-server-access"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.query
+          matches: '(?i)\b(copy|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|lo_import|lo_export|dblink\w*|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|set_config)\b'
+    decision: deny
+    message: >-
+      This statement reads server files, opens connections or affects other
+      sessions, which the agent may not do. Query the tables directly.
+
+  # Several statements in one call are legitimate here (a migration script),
+  # so they are asked about rather than refused.
+  - name: "{{server}}-approve-multiple-statements"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.query
+          matches: ';\s*\S'
+    decision: require_approval
+    message: >-
+      Several statements in one call need the user's approval. If it is
+      declined, run them one at a time.
+
+  - name: "{{server}}-approve-sql-writes"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.query
+          matches: '(?i)\b(insert|update|delete|merge|upsert|drop|alter|truncate|create|grant|revoke|comment|call|do|vacuum|analyze|reindex|cluster|refresh|lock|set|reset|discard|listen|notify|prepare|execute|deallocate|import|security|begin|commit|rollback|savepoint|release)\b'
+    decision: require_approval
+    message: >-
+      This statement can change data, so it needs the user's approval. If it
+      is declined, show the SQL instead of running it.
+
+  - name: "{{server}}-read-sql"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__execute_sql"
+      args:
+        - path: $.query
+          matches: '(?i)^\s*(select|with|explain|show|table|values)\b'
+    decision: allow
+    cost: 0
+
+  - name: "{{server}}-reads"
+    match:
+      server: "{{server}}"
+      annotations: { readOnlyHint: true }
+    decision: allow
+    cost: 0
+
+  # Migrations, edge function deployments, branch merges and resets, and
+  # creating, pausing or restoring projects (which can cost money).
+  - name: "{{server}}-approve-changes"
+    match:
+      server: "{{server}}"
+    decision: require_approval
+    message: >-
+      Changes to the Supabase project need the user's approval. If it is
+      declined, describe what you intended instead of retrying.

@@ -1,0 +1,83 @@
+# Pack: git — read history freely, approve anything that changes the working
+# tree, the index or the branches, and refuse refs that git would read as
+# options.
+#
+# Protects: the local repository and the files git can be tricked into writing.
+# Allows: status, diffs, log, show and branch listing.
+# Threat: a value the model passes as a ref - copied from a poisoned file or
+# commit message - starts with "-", and git parses it as an option (for example
+# --output=<file>, which writes anywhere the user can). A real ref never starts
+# with "-".
+# https://github.com/farzamtm/mcp-guardrails/blob/main/docs/threat-model.md#a1-malicious-tool-result--indirect-prompt-injection
+pack:
+  name: git
+  version: 1
+  description: Read history freely, approve changes, refuse option-shaped refs.
+  recognizes:
+    - mcp-server-git
+    - mcp/git
+
+rules:
+  # One rule per argument, because the server names its refs differently per
+  # tool. Each is denied before the read allow below, since git_diff and
+  # git_show are read-only tools.
+  - name: "{{server}}-no-option-target"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.target
+          prefix: "-"
+    decision: deny
+    message: >-
+      A git ref cannot start with "-"; git would read it as an option. Use the
+      branch name, tag or commit hash itself.
+
+  - name: "{{server}}-no-option-revision"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.revision
+          prefix: "-"
+    decision: deny
+    message: >-
+      A git ref cannot start with "-"; git would read it as an option. Use the
+      branch name, tag or commit hash itself.
+
+  - name: "{{server}}-no-option-branch"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.branch_name
+          prefix: "-"
+    decision: deny
+    message: >-
+      A git ref cannot start with "-"; git would read it as an option. Use the
+      branch name, tag or commit hash itself.
+
+  - name: "{{server}}-no-option-base-branch"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.base_branch
+          prefix: "-"
+    decision: deny
+    message: >-
+      A git ref cannot start with "-"; git would read it as an option. Use the
+      branch name, tag or commit hash itself.
+
+  - name: "{{server}}-reads"
+    match:
+      server: "{{server}}"
+      annotations: { readOnlyHint: true }
+    decision: allow
+    cost: 0
+
+  # Commits, staging, resets, checkouts, new branches, and any tool a later
+  # server version adds.
+  - name: "{{server}}-approve-changes"
+    match:
+      server: "{{server}}"
+    decision: require_approval
+    message: >-
+      Changes to the repository need the user's approval. If it is declined,
+      describe the change you intended instead of retrying.

@@ -1,0 +1,99 @@
+# Pack: filesystem — read the sandbox freely, approve every change, and never
+# touch credentials or the files that run code later.
+#
+# Protects: SSH and cloud keys, .env files, git hooks, CI workflows, shell
+# startup files and agent/editor settings.
+# Allows: every read-only tool except read_multiple_files, whose paths are an
+# array no rule can inspect one by one.
+# Threat: a file the agent reads carries planted instructions (indirect prompt
+# injection) that steer it into reading a key or planting code that runs on the
+# next commit, shell or CI job.
+# https://github.com/farzamtm/mcp-guardrails/blob/main/docs/threat-model.md#a1-malicious-tool-result--indirect-prompt-injection
+pack:
+  name: filesystem
+  version: 1
+  description: Read freely, approve changes, never touch credentials or files that run code.
+  recognizes:
+    - "@modelcontextprotocol/server-filesystem"
+    - mcp/filesystem
+
+rules:
+  # Credentials, whichever direction: reading one is the exfiltration, writing
+  # one (authorized_keys) is the persistence.
+  - name: "{{server}}-no-credentials"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.path
+          matches: '(^|[\\/])(\.ssh|\.aws|\.gnupg|\.kube|\.docker)([\\/]|$)|(^|[\\/])(\.env(\.[^\\/]*)?|\.netrc|\.npmrc|\.pypirc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519))$'
+    decision: deny
+    message: >-
+      This path holds credentials, and the agent may not read or change it.
+      Ask the user for the specific value you need instead.
+
+  # move_file names its paths source and destination, not path.
+  - name: "{{server}}-no-credential-moves"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.source
+          matches: '(^|[\\/])(\.ssh|\.aws|\.gnupg|\.kube|\.docker)([\\/]|$)|(^|[\\/])(\.env(\.[^\\/]*)?|\.netrc|\.npmrc|\.pypirc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519))$'
+    decision: deny
+    message: >-
+      This path holds credentials, and the agent may not move it. Ask the user
+      to handle credential files themselves.
+
+  # Files that something else executes later: a planted hook or workflow runs
+  # with the user's rights long after the session that wrote it.
+  - name: "{{server}}-no-code-that-runs-later"
+    match:
+      server: "{{server}}"
+      annotations: { readOnlyHint: false }
+      args:
+        - path: $.path
+          matches: '(^|[\\/])\.git[\\/](hooks|config)([\\/]|$)|(^|[\\/])\.github[\\/]workflows([\\/]|$)|(^|[\\/])\.(vscode|claude|cursor)[\\/]|(^|[\\/])\.(bashrc|bash_profile|zshrc|zprofile|profile)$'
+    decision: deny
+    message: >-
+      Git hooks, CI workflows, shell startup files and editor or agent settings
+      run code later, so the agent may not change them. Describe the change and
+      let the user make it.
+
+  - name: "{{server}}-no-code-that-runs-later-moves"
+    match:
+      server: "{{server}}"
+      args:
+        - path: $.destination
+          matches: '(^|[\\/])\.git[\\/](hooks|config)([\\/]|$)|(^|[\\/])\.github[\\/]workflows([\\/]|$)|(^|[\\/])\.(vscode|claude|cursor)[\\/]|(^|[\\/])\.(bashrc|bash_profile|zshrc|zprofile|profile)$'
+    decision: deny
+    message: >-
+      Git hooks, CI workflows, shell startup files and editor or agent settings
+      run code later, so the agent may not move files there. Describe the
+      change and let the user make it.
+
+  # Its paths are an array, and a predicate can only check one element, so a
+  # credential could hide at index 1. Reading one file per call loses nothing.
+  - name: "{{server}}-one-file-at-a-time"
+    match:
+      server: "{{server}}"
+      tool: "{{server}}__read_multiple_files"
+    decision: deny
+    message: >-
+      Read the files one at a time with read_text_file, so each path can be
+      checked.
+
+  - name: "{{server}}-reads"
+    match:
+      server: "{{server}}"
+      annotations: { readOnlyHint: true }
+    decision: allow
+    cost: 0
+
+  # Everything else changes the disk: writes, edits, moves, new directories,
+  # and any tool a later server version adds.
+  - name: "{{server}}-approve-changes"
+    match:
+      server: "{{server}}"
+    decision: require_approval
+    message: >-
+      Changes to files need the user's approval. If it is declined, show the
+      change you intended instead of retrying.

