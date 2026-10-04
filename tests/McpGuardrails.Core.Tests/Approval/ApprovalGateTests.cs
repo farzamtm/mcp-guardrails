@@ -247,6 +247,23 @@ public sealed class ApprovalGateTests
     }
 
     [Fact]
+    public async Task AGatesNote_IsAppendedToTheQuestion_HoweverItWasWorded()
+    {
+        const string note = "Guardrails flagged its arguments.";
+        var generated = new FakeChannel();
+        var custom = new FakeChannel();
+
+        await ApprovalGate.ApplyAsync(NeedsApproval() with { ApprovalNote = note }, _call, generated);
+        await ApprovalGate.ApplyAsync(
+            NeedsApproval(settings: new ApprovalSettings { Prompt = "Delete it?" }) with { ApprovalNote = note },
+            _call,
+            custom);
+
+        Assert.EndsWith("requires your approval. " + note, generated.Asked?.Question);
+        Assert.Equal("Delete it? " + note, custom.Asked?.Question);
+    }
+
+    [Fact]
     public async Task AnUnnamedRule_StillProducesAnAnswerableQuestion()
     {
         var channel = new FakeChannel();

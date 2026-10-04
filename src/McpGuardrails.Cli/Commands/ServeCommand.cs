@@ -5,6 +5,7 @@ using McpGuardrails.Core.Hosting;
 using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Pipeline;
 using McpGuardrails.Core.Policy;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Data.Sqlite;
@@ -225,6 +226,7 @@ internal sealed class ServeCommand : ICliCommand
             toolMetadata,
             toolPins,
             startup.Secrets,
+            new ArgumentGate(document.EffectiveScanners.EffectiveArguments),
             budget,
             startup.Scanner,
             webhook,

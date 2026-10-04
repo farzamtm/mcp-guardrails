@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using McpGuardrails.Core.Packs;
+using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Serialization;
 using McpGuardrails.Core.Upstream;
 
@@ -31,8 +32,11 @@ public sealed record PolicyTestReport(IReadOnlyList<PolicyTestCaseResult> Cases)
 /// its server and hints, an unknown one has neither. No server is spawned, so
 /// a test runs in CI with no network, keys or Node.
 ///
-/// Only the policy decision is tested. Budgets, scanners and approval act on a
-/// running session and are out of scope for a file of static cases.
+/// The policy decision is tested, followed by the two scanners that can change
+/// it and judge nothing but the call itself, in the order the proxy runs them:
+/// <c>scanners.secrets.arguments: block</c>, then <c>scanners.arguments</c>.
+/// Budgets, result scanners and approval act on a running session and are out
+/// of scope for a file of static cases.
 /// </remarks>
 public static class PolicyTestRunner
 {
@@ -84,11 +88,15 @@ public static class PolicyTestRunner
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(policyText);
 
-        var evaluator = new PolicyEvaluator(LoadPolicy(document, policyText));
+        var policy = LoadPolicy(document, policyText);
+        var gates = new Gates(
+            new PolicyEvaluator(policy),
+            new SecretGate(policy.EffectiveScanners.EffectiveSecrets),
+            new ArgumentGate(policy.EffectiveScanners.EffectiveArguments));
         var tools = document.Tools ?? new Dictionary<string, PolicyTestTool>();
         var cases = document.Cases ?? [];
 
-        return new PolicyTestReport([.. cases.Select((c, index) => RunCase(evaluator, tools, c, index + 1))]);
+        return new PolicyTestReport([.. cases.Select((c, index) => RunCase(gates, tools, c, index + 1))]);
     }
 
     private static PolicyDocument LoadPolicy(PolicyTestDocument document, string policyText)
@@ -114,8 +122,11 @@ public static class PolicyTestRunner
         }
     }
 
+    /// <summary>What decides a case, in the order the proxy applies it.</summary>
+    private sealed record Gates(PolicyEvaluator Evaluator, SecretGate Secrets, ArgumentGate Arguments);
+
     private static PolicyTestCaseResult RunCase(
-        PolicyEvaluator evaluator,
+        Gates gates,
         IReadOnlyDictionary<string, PolicyTestTool> tools,
         PolicyTestCase testCase,
         int number)
@@ -133,7 +144,11 @@ public static class PolicyTestRunner
         }
 
         var facts = Facts(tools, testCase, label);
-        var decision = evaluator.Evaluate(facts, explain: true);
+        var decision = gates.Secrets.Apply(
+            gates.Evaluator.Evaluate(facts, explain: true),
+            facts.Arguments is null ? null : new Dictionary<string, JsonElement>(facts.Arguments, StringComparer.Ordinal));
+        var outcome = gates.Arguments.Apply(decision, facts.ToolName, facts.Arguments);
+        decision = outcome.Decision;
 
         string? failure = null;
         if (decision.Verdict != expected)
@@ -144,6 +159,12 @@ public static class PolicyTestRunner
         else if (testCase.Rule is { } rule && !string.Equals(rule, decision.RuleName, StringComparison.Ordinal))
         {
             failure = $"expected rule '{rule}' to decide, but {Describe(decision.RuleName)} did";
+        }
+        else if (testCase.ArgumentHits is { } hits &&
+                 !hits.Order(StringComparer.Ordinal).SequenceEqual(outcome.Findings.Detectors.Order(StringComparer.Ordinal)))
+        {
+            failure = $"expected argument hits [{string.Join(", ", hits)}], got " +
+                      $"[{string.Join(", ", outcome.Findings.Detectors)}]";
         }
 
         return new PolicyTestCaseResult(

@@ -49,8 +49,8 @@ public enum DecisionSource
     Approval,
 
     /// <summary>
-    /// A content scanner: a secret in the arguments, or a tool whose definition
-    /// was withheld for looking like an injection.
+    /// A content scanner: a secret or an attack shape in the arguments, or a tool
+    /// whose definition was withheld for looking like an injection.
     /// </summary>
     Scanner,
 }
@@ -122,6 +122,17 @@ public sealed record Decision(
     /// different lines to find in an audit log six weeks later.
     /// </remarks>
     public ApprovalOutcome? ApprovalResult { get; init; }
+
+    /// <summary>
+    /// A sentence appended to the question an approver is asked, when a gate
+    /// found something they should know before answering.
+    /// </summary>
+    /// <remarks>
+    /// Set by the argument detectors under <c>action: approve</c>. Appended
+    /// rather than replacing the question, so a rule's own <c>prompt:</c> is
+    /// still what the human reads first.
+    /// </remarks>
+    public string? ApprovalNote { get; init; }
 
     /// <summary>
     /// This decision, overturned into a refusal by a later gate.

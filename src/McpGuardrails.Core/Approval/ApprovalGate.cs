@@ -62,7 +62,7 @@ public static class ApprovalGate
         var request = new ApprovalRequest(
             facts.ToolName,
             decision.RuleName ?? "(unnamed rule)",
-            settings.Prompt ?? Question(decision, facts))
+            Prompt(decision, facts, settings))
         {
             Mode = settings.EffectiveMode,
             Deadline = DateTimeOffset.UtcNow + settings.EffectiveTimeout,
@@ -171,6 +171,18 @@ public static class ApprovalGate
         {
             ApprovalResult = outcome,
         };
+
+    /// <remarks>
+    /// The rule's own prompt or the generated question, then whatever a gate
+    /// noted about the call - the argument detectors' findings, say - so the
+    /// warning reaches the human however the rule worded its question.
+    /// </remarks>
+    private static string Prompt(Decision decision, ToolCallFacts facts, ApprovalSettings settings)
+    {
+        var question = settings.Prompt ?? Question(decision, facts);
+
+        return decision.ApprovalNote is { } note ? $"{question} {note}" : question;
+    }
 
     /// <remarks>
     /// What the human reads when the rule does not supply its own prompt. It

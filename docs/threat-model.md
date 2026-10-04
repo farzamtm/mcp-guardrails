@@ -56,9 +56,11 @@ This is the long version.
 
 Wiring for all of this is in
 [`src/McpGuardrails.Cli/Commands/ServeCommand.cs`](../src/McpGuardrails.Cli/Commands/ServeCommand.cs). The
-filter order — audit outermost, then policy/approval/budget, then the scanner
-innermost — is the security design, and the comments there explain each
-position.
+filter order — audit outermost, then policy, the tool metadata and pin gates,
+the secret and argument scanners, approval and budget, then the result scanner
+innermost — is the security design, and the comments in
+[`GuardrailsCallPipeline`](../src/McpGuardrails.Core/Pipeline/GuardrailsCallPipeline.cs)
+explain each position.
 
 ## Attackers
 
@@ -95,8 +97,10 @@ send it somewhere, call a destructive tool, hide what it did from the user.
   acts on it, and acting means another `tools/call`. That call still goes
   through policy, approval and budget like any other. A policy that denies the
   egress tool, or requires approval for anything destructive, holds even when
-  the model has been fully talked round. This is the stronger defence of the
-  two; the scanner is the early warning.
+  the model has been fully talked round. The [argument detectors](argument-scanning.md)
+  look at that next call too, for the shapes an injection usually asks for: a
+  fetch of the cloud metadata address, a read of `~/.ssh/id_rsa`. This is the
+  stronger defence of the two; the scanner is the early warning.
 
 **What still gets through:** most things a careful attacker writes. See
 [scanner gaps](#the-scanner-is-a-label-not-a-filter).
@@ -222,6 +226,23 @@ the fastest route to "clean up the repo" is `rm`.
   so no rule can refund budget, and `cost: 0` calls still count against
   `max_calls` so a free tool is not an unbounded loop. The refusal tells the
   model to stop rather than try another route.
+- **Argument detectors** —
+  [`ArgumentGate`](../src/McpGuardrails.Core/Scanners/ArgumentGate.cs),
+  [`ArgumentScanner`](../src/McpGuardrails.Core/Scanners/ArgumentScanner.cs).
+  Built-in checks for the attack shapes a policy author may not think to write
+  a rule for: internal addresses (`ssrf`, decoding decimal, octal, hex,
+  zero-padded and IPv6-embedded forms, and applying the clean-up a URL parser
+  does first: deleting tabs and newlines, folding full-width and enclosed
+  characters, reading userinfo up to the last `@`), credential files
+  (`sensitive-path`, resolving `.` and `..` segments and Windows trailing dots),
+  `..` in any encoding (`path-traversal`), and shell metacharacters in command
+  arguments (`shell-metachar`). Hits name argument keys only when they are
+  plain identifiers, so a key the model wrote cannot put words into an
+  approval question or the audit log. Linear-time, no regex. They run after the policy and
+  before approval, and an explicit policy `allow` does not silence them; only
+  an override in `scanners.arguments` exempts a tool. Arguments too large or
+  too deep to read in full are a finding (`argument-too-large`), not a skipped
+  check. The default is `audit`: hits are logged, nothing is refused.
 - **Model-readable refusals** — every denial is a tool error written as an
   instruction, so the agent changes approach rather than retrying
   ([`Decision.ToModelMessage`](../src/McpGuardrails.Core/Policy/Decision.cs)).
@@ -230,6 +251,8 @@ the fastest route to "clean up the repo" is `rm`.
 `allow fs__write_file` means the agent may write the wrong thing to the right
 place. Prefix rules compare the literal string — `/workspace/../etc/passwd`
 starts with `/workspace/` — so path containment has to stay the server's job.
+The `path-traversal` detector flags that path, but under the default `audit` it
+only says so in the log.
 
 ### A4. Local attacker with file access
 
@@ -401,7 +424,8 @@ own:
 - **Text heuristics.** The SQL rules match keywords and the fetch rules match
   host names as written. They lean towards asking or refusing, but a public name
   resolving to a private address, an IP in decimal, or SQL that hides a write
-  from a keyword list gets past them.
+  from a keyword list gets past them. The `ssrf` [argument detector](argument-scanning.md)
+  decodes the IP forms; nothing here resolves names.
 - **One element per array.** A predicate checks one path in a JSON value, so a
   tool taking an array of paths cannot be checked element by element. The
   filesystem pack refuses `read_multiple_files` for that reason.
@@ -409,6 +433,39 @@ own:
   do. That is deliberate - nothing changes behaviour without a file changing -
   but it means a fix to a pack reaches you only when you run `init` again and
   review the diff.
+
+### Argument detectors classify, they do not contain
+
+The [argument detectors](argument-scanning.md) judge the literal arguments. They
+cannot know what a server will do with them:
+
+- **No DNS resolution.** `ssrf` sees `http://attacker.example/`, not the
+  private address it resolves to, and DNS rebinding — a name that resolves to a
+  public address when checked and a private one when used — is out of reach of
+  any check that does not proxy the connection itself.
+- **`shell-metachar` is scoped by name.** It reads arguments named like
+  commands (`command`, `cmd`, `script`, `args`...) and every argument of a tool
+  whose name has the word `exec` or `shell`, or `run`/`execute` then
+  `command`/`cmd`. A shell tool with an innocuous name and an argument called
+  `input` is not covered unless an override says so.
+- **Prose is not read as paths.** A value with whitespace is split into words,
+  and only words with a separator are checked, so "add .env to .gitignore" does
+  not fire. In a command a quoted word is kept whole, but a credential path
+  with spaces in prose, outside quotes, in an argument whose name does not say
+  "path" is missed.
+- **Shell quoting and globs are not undone.** `cat ~/.s""sh/id_rsa` and
+  `cat /etc/sha?ow` reach the file through the shell but match no name.
+- **Values, not keys.** Object keys count against the size cap but are not
+  scanned; a server that reads a URL out of a key is not covered.
+- **Known encodings only.** The path detectors decode percent-escapes up to
+  three levels deep, overlong UTF-8 and `%u` forms, plus a few Unicode
+  look-alikes of `.`, `/` and `\`. A server with its own decoding quirks can be fooled
+  by forms not on the list.
+- **`audit` is the default.** Nothing is refused until an operator chooses
+  `approve` or `block`, for the whole section or per tool with `overrides`.
+- **An override is an exemption.** `action: off` for a tool switches every
+  detector off for it, and a broad glob exempts more than intended. Overrides
+  sit in `scanners.arguments`, where a reviewer can see them.
 
 ### Approval has limits of its own
 
