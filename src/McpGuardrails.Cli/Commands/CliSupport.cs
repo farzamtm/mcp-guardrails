@@ -62,7 +62,52 @@ internal static class CliHost
         HomeDirectory = System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile),
         IsWindows = OperatingSystem.IsWindows(),
         IsMacOS = OperatingSystem.IsMacOS(),
+        UserAndGroup = ReadUserAndGroup,
     };
+
+    /// <summary>The proxy's <c>uid:gid</c>, from <c>id</c>; null on Windows or when it cannot be read.</summary>
+    /// <remarks>
+    /// .NET has no API for the numeric user id, and a P/Invoke into libc would
+    /// have to name a different library on each Unix. <c>id</c> is POSIX, and it
+    /// only runs when a servers file isolates a server without naming a user.
+    /// An absolute path, so a PATH entry cannot substitute its own.
+    /// </remarks>
+    private static string? ReadUserAndGroup()
+    {
+        if (OperatingSystem.IsWindows() || !File.Exists("/usr/bin/id"))
+        {
+            return null;
+        }
+
+        var user = RunId("-u");
+        var group = RunId("-g");
+        return user is null || group is null ? null : $"{user}:{group}";
+    }
+
+    private static string? RunId(string flag)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("/usr/bin/id", flag)
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            });
+
+            if (process is null)
+            {
+                return null;
+            }
+
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+            return process.ExitCode == 0 && output.Length > 0 && output.All(char.IsAsciiDigit) ? output : null;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return null;
+        }
+    }
 }
 
 /// <summary>Reads flags out of the command line.</summary>

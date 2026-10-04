@@ -101,6 +101,18 @@ public sealed partial record UpstreamServerConfig
     public UpstreamOAuthSettings? OAuth { get; init; }
 
     /// <summary>
+    /// The container this stdio server runs in, or null when it runs directly on
+    /// the host.
+    /// </summary>
+    /// <remarks>
+    /// Descriptive only: by the time a config exists, <see cref="Command"/> and
+    /// <see cref="Arguments"/> already are the generated <c>docker run</c> line, so
+    /// the transport launches the container without knowing it is one. Kept so
+    /// <c>validate</c> can say what the server can reach.
+    /// </remarks>
+    public ContainerIsolation? Isolation { get; init; }
+
+    /// <summary>
     /// Whether the proxy may start without this server when it cannot be reached.
     /// </summary>
     /// <remarks>
@@ -120,6 +132,20 @@ public sealed partial record UpstreamServerConfig
     /// Null for servers defined in code.
     /// </remarks>
     public string? DisplayTemplate { get; init; }
+
+    /// <summary>
+    /// What a stdio server can reach on this machine, in one line; null for a
+    /// remote server, which reaches nothing here but the proxy.
+    /// </summary>
+    /// <remarks>
+    /// For <c>validate</c>: the question a reviewer of a servers file actually
+    /// has is not "what command is this" but "what can it touch".
+    /// </remarks>
+    public string? Reach() => Transport is not UpstreamTransport.Stdio
+        ? null
+        : Isolation?.Describe() ??
+          "everything you can: it runs directly on the host as you, with your files and network " +
+          "(add 'x-guardrails.isolation' to run it in a container)";
 
     /// <summary>
     /// Server names must be letters, digits and hyphens only.
@@ -191,6 +217,12 @@ public sealed partial record UpstreamServerConfig
         {
             throw new ArgumentException(
                 $"Upstream server '{Name}' is a remote server but has a command.", nameof(Command));
+        }
+
+        if (Isolation is not null)
+        {
+            throw new ArgumentException(
+                $"Upstream server '{Name}' is a remote server but has container isolation.", nameof(Isolation));
         }
     }
 }

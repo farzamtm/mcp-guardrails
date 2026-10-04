@@ -38,6 +38,11 @@ internal sealed class ValidateCommand : ICliCommand
             foreach (var server in result.Servers)
             {
                 Console.WriteLine($"  {server.Name,-20} {server.Transport.ToWireName(),-5}  {server.DisplayTemplate}");
+                if (server.Reach() is { } reach)
+                {
+                    Console.WriteLine($"  {"",-20}        can reach: {reach}");
+                }
+
                 serverNames.Add(server.Name);
             }
 
