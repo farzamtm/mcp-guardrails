@@ -136,8 +136,16 @@ budgets:
   daily: { max_calls: 5000 }      # everyone together, per UTC day
 ```
 
-`principal:` is a glob, like `tool:`. `groups:` matches when the caller is in
-any of the listed groups, by exact, case-sensitive name.
+`principal:` is a glob, like `tool:`, but matched **case-insensitively**.
+Principals are often email addresses or UPNs, and identity providers emit them
+in whatever case the account was created with, so a deny rule for
+`*@contractor.example` has to catch `bob@Contractor.Example` too. For rules that
+must not depend on a mutable, human-chosen name at all, use an immutable claim
+such as `sub` or Entra's `oid` as `principal_claim`.
+
+`groups:` matches when the caller is in any of the listed groups, by exact,
+case-sensitive name: group claims are identifiers (Entra sends object IDs), and
+copying the value from a token into the policy is the reliable way to write one.
 
 A call without a principal matches no identity condition, the same way a call to
 an unknown tool matches no `server:`. Because no call has a principal without

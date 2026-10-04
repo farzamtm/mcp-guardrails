@@ -85,8 +85,12 @@ internal static class RuleMatcher
 
         // No caller - stdio, or HTTP without access.oauth - matches no identity
         // condition, for the same reason no server matches no server pattern.
+        // Case-insensitive, unlike tool names: principals are often email
+        // addresses or UPNs, which identity providers emit in whatever case the
+        // account was created with, and a deny rule for "*@contractor.example"
+        // that missed "bob@Contractor.Example" would fail open.
         if (match.Principal is { } principalPattern &&
-            (facts.Principal is not { } principal || !GlobMatcher.IsMatch(principalPattern, principal)))
+            (facts.Principal is not { } principal || !GlobMatcher.IsMatch(principalPattern, principal, ignoreCase: true)))
         {
             return MatchOutcome.Failed(PrincipalCondition);
         }

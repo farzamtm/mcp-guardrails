@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Packs;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Serialization;
@@ -188,7 +189,7 @@ public static class PolicyTestRunner
         {
             // What the proxy sees for a name no server advertises: no server
             // and no hints, so server: conditions never match.
-            return new ToolCallFacts(call, testCase.Arguments, Principal: testCase.Principal, Groups: testCase.Groups);
+            return new ToolCallFacts(call, testCase.Arguments, Caller: Caller(testCase, label));
         }
 
         if (!advertised)
@@ -213,7 +214,26 @@ public static class PolicyTestRunner
             testCase.Arguments,
             new ToolAnnotationFacts(hints.ReadOnlyHint, hints.DestructiveHint, hints.IdempotentHint, hints.OpenWorldHint),
             call[..separator],
-            testCase.Principal,
-            testCase.Groups);
+            Caller(testCase, label));
+    }
+
+    /// <summary>The caller the case describes, or null for none.</summary>
+    /// <remarks>
+    /// Groups without a principal are refused rather than tested: a validated
+    /// token always names a principal, so such a case would pass or fail for a
+    /// caller the proxy can never see.
+    /// </remarks>
+    private static CallerIdentity? Caller(PolicyTestCase testCase, string label)
+    {
+        if (testCase.Principal is { } principal)
+        {
+            return new CallerIdentity(principal, testCase.Groups ?? []);
+        }
+
+        return testCase.Groups is null
+            ? null
+            : throw new PolicyException(
+                $"{label}: sets 'groups:' without 'principal:'. Every validated caller has a principal; " +
+                "add one, or drop 'groups:' to test a call with no caller.");
     }
 }
