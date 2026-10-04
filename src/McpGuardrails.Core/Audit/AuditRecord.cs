@@ -147,6 +147,24 @@ public sealed record AuditRecord
     [JsonPropertyName("argument_secrets_action")]
     public string? ArgumentSecretsAction { get; init; }
 
+    /// <summary>
+    /// Argument detectors that fired, e.g. <c>ssrf</c> or <c>path-traversal</c>.
+    /// </summary>
+    /// <remarks>
+    /// Names only, like the other scanner fields: the matched value is the part
+    /// of the call an attacker chose. Recorded on refused calls too.
+    /// </remarks>
+    [JsonPropertyName("argument_hits")]
+    public IReadOnlyList<string>? ArgumentHits { get; init; }
+
+    /// <summary>What the argument gate did about them: audited, approval or blocked.</summary>
+    /// <remarks>
+    /// Absent when there were hits but an earlier gate had already refused the
+    /// call, so there was nothing left for this one to do.
+    /// </remarks>
+    [JsonPropertyName("argument_hits_action")]
+    public string? ArgumentHitsAction { get; init; }
+
     /// <summary>Detectors that found a secret in the result.</summary>
     [JsonPropertyName("result_secrets")]
     public IReadOnlyList<string>? ResultSecrets { get; init; }

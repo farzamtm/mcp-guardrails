@@ -51,6 +51,7 @@ public sealed class GuardrailsCallPipeline
     private readonly ToolMetadataGate _toolMetadata;
     private readonly ToolPinGate _toolPins;
     private readonly SecretGate _secrets;
+    private readonly ArgumentGate _arguments;
     private readonly BudgetGate _budget;
     private readonly InjectionGate _scanner;
     private readonly IApprovalChannel? _webhook;
@@ -63,6 +64,7 @@ public sealed class GuardrailsCallPipeline
     /// <param name="toolMetadata">Refuses tools withheld from tools/list for looking poisoned.</param>
     /// <param name="toolPins">Refuses tools withheld from tools/list for differing from their pins.</param>
     /// <param name="secrets">Argument blocking and redaction, result redaction.</param>
+    /// <param name="arguments">The argument attack detectors.</param>
     /// <param name="budget">Caps on what an approved call may spend.</param>
     /// <param name="scanner">The prompt-injection result scanner.</param>
     /// <param name="webhook">The out-of-band approver, when the policy configures one.</param>
@@ -78,6 +80,7 @@ public sealed class GuardrailsCallPipeline
         ToolMetadataGate toolMetadata,
         ToolPinGate toolPins,
         SecretGate secrets,
+        ArgumentGate arguments,
         BudgetGate budget,
         InjectionGate scanner,
         IApprovalChannel? webhook = null,
@@ -90,6 +93,7 @@ public sealed class GuardrailsCallPipeline
         ArgumentNullException.ThrowIfNull(toolMetadata);
         ArgumentNullException.ThrowIfNull(toolPins);
         ArgumentNullException.ThrowIfNull(secrets);
+        ArgumentNullException.ThrowIfNull(arguments);
         ArgumentNullException.ThrowIfNull(budget);
         ArgumentNullException.ThrowIfNull(scanner);
 
@@ -100,6 +104,7 @@ public sealed class GuardrailsCallPipeline
         _toolMetadata = toolMetadata;
         _toolPins = toolPins;
         _secrets = secrets;
+        _arguments = arguments;
         _budget = budget;
         _scanner = scanner;
         _webhook = webhook;
@@ -300,6 +305,8 @@ public sealed class GuardrailsCallPipeline
             ClassifierError = scan?.Classifier?.Error,
             ArgumentSecrets = arguments.Report.IsClean ? null : arguments.Report.Detectors,
             ArgumentSecretsAction = _secrets.DescribeArguments(arguments, decision),
+            ArgumentHits = scope.Arguments is { Findings.IsClean: false } found ? found.Findings.Detectors : null,
+            ArgumentHitsAction = scope.Arguments?.Describe(),
             ResultSecrets = scope.Redaction is { Effect: not RedactionEffect.None } redaction
                 ? redaction.Report.Detectors
                 : null,
@@ -312,7 +319,8 @@ public sealed class GuardrailsCallPipeline
     }
 
     /// <summary>
-    /// Policy, tool metadata, tool pins, argument secrets, approval and budget - in that order.
+    /// Policy, tool metadata, tool pins, argument secrets, argument detectors,
+    /// approval and budget - in that order.
     /// </summary>
     /// <remarks>
     /// Inside audit, so when this refuses a call by not invoking <c>next</c>,
@@ -345,7 +353,7 @@ public sealed class GuardrailsCallPipeline
 
         var facts = PolicyFacts.ForCall(toolName, parameters, tool, server);
 
-        // Six gates, in this order, and the order is the design.
+        // Seven gates, in this order, and the order is the design.
         //
         // The policy decides whether the call is permitted at all. The metadata
         // scanner refuses a tool it withheld from tools/list - refused, not merely
@@ -356,7 +364,10 @@ public sealed class GuardrailsCallPipeline
         // `arguments: block`, refuses a call carrying a credential - before
         // approval, so nobody is asked to approve a call that will be refused,
         // and so a human who approves a harmless-looking write is not also
-        // approving the key buried in its content. Approval turns a
+        // approving the key buried in its content. The argument detectors come
+        // next, for the same reason and one more: under `action: approve` they
+        // turn an allowed call into a question, which only works before the
+        // question is asked. Approval turns a
         // 'require_approval' verdict into a real answer from a real human - which
         // can only happen before the budget runs, because a call waiting on a
         // person has not been forwarded and must not be charged. Budget then
@@ -366,6 +377,10 @@ public sealed class GuardrailsCallPipeline
         decision = _toolMetadata.Apply(decision, toolName);
         decision = _toolPins.Apply(decision, toolName);
         decision = _secrets.Apply(decision, parameters?.Arguments);
+
+        var arguments = _arguments.Apply(decision, toolName, parameters?.Arguments);
+        GuardrailsCallScope.RecordArguments(arguments);
+        decision = arguments.Decision;
 
         // Recorded now as well as at the end, because the approval wait can end
         // in cancellation - the client hanging up - which propagates as an

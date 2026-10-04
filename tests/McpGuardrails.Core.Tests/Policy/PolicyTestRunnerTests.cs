@@ -89,6 +89,58 @@ public sealed class PolicyTestRunnerTests
     }
 
     [Fact]
+    public void ArgumentDetectors_FromThePolicy_ApplyToTheDecision()
+    {
+        const string policy = """
+            scanners:
+              arguments:
+                overrides:
+                  - { tool: "web__*", action: block }
+            """;
+
+        var report = Run("""
+            policy: p.yaml
+            tools: { web__fetch: {}, fs__read: {} }
+            cases:
+              - call: web__fetch
+                args: { url: "http://169.254.169.254/" }
+                expect: deny
+                rule: arguments.ssrf
+                argument_hits: [ssrf]
+              - name: audited elsewhere, so the verdict is unchanged
+                call: fs__read
+                args: { path: "../../etc/hosts", note: "http://localhost" }
+                expect: allow
+                argument_hits: [ssrf, path-traversal]
+              - name: an empty list asserts that nothing fires
+                call: fs__read
+                args: { path: "src/main.cs" }
+                expect: allow
+                argument_hits: []
+            """, policy);
+
+        Assert.Empty(report.Failures);
+    }
+
+    [Fact]
+    public void WrongArgumentHits_Fail()
+    {
+        var report = Run("""
+            policy: p.yaml
+            tools: { fs__write: {} }
+            cases:
+              - call: fs__write
+                args: { path: "/tmp/../x" }
+                expect: allow
+                argument_hits: [ssrf]
+            """);
+
+        var failure = Assert.Single(report.Failures);
+        Assert.Equal("expected argument hits [ssrf], got [path-traversal]", failure.Failure);
+        Assert.Contains(failure.Trail, step => step.Contains("scanner 'arguments'"));
+    }
+
+    [Fact]
     public void ToolListedWithNoValue_AdvertisesNoHints()
     {
         // Undeclared hints are not read-only, so the reads rule does not apply.

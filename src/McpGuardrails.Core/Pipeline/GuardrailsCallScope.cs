@@ -57,6 +57,14 @@ public sealed class GuardrailsCallScope : IDisposable
     /// </remarks>
     public RedactionOutcome? Redaction { get; private set; }
 
+    /// <summary>What the argument detectors found and did, once the gates have run.</summary>
+    /// <remarks>
+    /// Recorded for refused calls too, unlike <see cref="Scan"/>: arguments
+    /// exist whether or not the call goes out, and what a refused call carried
+    /// is part of its story.
+    /// </remarks>
+    public ArgumentOutcome? Arguments { get; private set; }
+
     /// <summary>Opens a scope for one tool call. Dispose at the end of the call.</summary>
     public static GuardrailsCallScope Begin()
     {
@@ -112,6 +120,22 @@ public sealed class GuardrailsCallScope : IDisposable
         if (_currentScope.Value is { } scope)
         {
             scope.Redaction = outcome;
+        }
+    }
+
+    /// <summary>
+    /// Records the argument gate's outcome for the call in progress.
+    /// </summary>
+    /// <remarks>
+    /// A no-op without an active scope, like the other recorders.
+    /// </remarks>
+    public static void RecordArguments(ArgumentOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+
+        if (_currentScope.Value is { } scope)
+        {
+            scope.Arguments = outcome;
         }
     }
 

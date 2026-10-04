@@ -62,6 +62,10 @@ public sealed record ScannerPolicy
     [JsonPropertyName("secrets")]
     public SecretScannerSettings? Secrets { get; init; }
 
+    /// <summary>Built-in detection of attack shapes in tool-call arguments.</summary>
+    [JsonPropertyName("arguments")]
+    public ArgumentScannerSettings? Arguments { get; init; }
+
     /// <summary>Pinning of tool definitions across restarts.</summary>
     [JsonPropertyName("pins")]
     public PinSettings? Pins { get; init; }
@@ -85,6 +89,10 @@ public sealed record ScannerPolicy
     [JsonIgnore]
     public SecretScannerSettings EffectiveSecrets => Secrets ?? SecretScannerSettings.Default;
 
+    /// <summary>The argument detector settings, or the defaults when the file omits them.</summary>
+    [JsonIgnore]
+    public ArgumentScannerSettings EffectiveArguments => Arguments ?? ArgumentScannerSettings.Default;
+
     /// <summary>The pin settings, or the defaults when the file omits them.</summary>
     [JsonIgnore]
     public PinSettings EffectivePins => Pins ?? PinSettings.Default;
@@ -94,6 +102,7 @@ public sealed record ScannerPolicy
     {
         EffectiveInjection.Validate();
         EffectiveSecrets.Validate();
+        EffectiveArguments.Validate();
         EffectivePins.Validate();
     }
 }

@@ -128,6 +128,32 @@ public sealed class GuardrailsCallScopeTests
     }
 
     [Fact]
+    public void RecordArguments_IsVisibleOnTheScope()
+    {
+        using var scope = GuardrailsCallScope.Begin();
+        var outcome = new ArgumentOutcome(Decision.DefaultAllow, ArgumentFindings.Clean, ArgumentEffect.None);
+
+        GuardrailsCallScope.RecordArguments(outcome);
+
+        Assert.Same(outcome, scope.Arguments);
+    }
+
+    [Fact]
+    public void RecordArguments_WithoutAScope_IsANoOp()
+    {
+        GuardrailsCallScope.RecordArguments(
+            new ArgumentOutcome(Decision.DefaultAllow, ArgumentFindings.Clean, ArgumentEffect.None));
+
+        Assert.Null(GuardrailsCallScope.Current);
+    }
+
+    [Fact]
+    public void RecordArguments_RejectsNull()
+    {
+        Assert.Throws<ArgumentNullException>(() => GuardrailsCallScope.RecordArguments(null!));
+    }
+
+    [Fact]
     public void ScanIsNullOnACallThatNeverReturnedAResult()
     {
         // The distinction the audit log depends on: no scanner field means

@@ -19,6 +19,7 @@ namespace McpGuardrails.Core.Policy;
 ///     args: { title: hi }
 ///     expect: require_approval
 ///     rule: gh-approve-writes   # optional: which rule should decide it
+///     argument_hits: []          # optional: which argument detectors should fire
 /// </code>
 ///
 /// Unknown keys are refused at every level. In a test file a misspelt
@@ -89,6 +90,17 @@ public sealed record PolicyTestCase
     /// <summary>The rule expected to decide, when the case cares which.</summary>
     [JsonPropertyName("rule")]
     public string? Rule { get; init; }
+
+    /// <summary>
+    /// The argument detectors expected to fire, in any order; <c>[]</c> asserts
+    /// that none do. Absent means the case does not care.
+    /// </summary>
+    /// <remarks>
+    /// The verdict alone cannot test the detectors under the default
+    /// <c>action: audit</c>, which never changes it.
+    /// </remarks>
+    [JsonPropertyName("argument_hits")]
+    public IReadOnlyList<string>? ArgumentHits { get; init; }
 
     /// <summary>
     /// True to call a tool no server advertises, which the proxy still runs

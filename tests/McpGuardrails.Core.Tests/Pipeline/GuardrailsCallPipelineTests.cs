@@ -54,11 +54,14 @@ public sealed class GuardrailsCallPipelineTests
     {
         public int Asked { get; private set; }
 
+        public string? Question { get; private set; }
+
         public async ValueTask<ApprovalOutcome> RequestAsync(
             ApprovalRequest request,
             CancellationToken cancellationToken)
         {
             Asked++;
+            Question = request.Question;
 
             // A cancelled token reaches a waiting channel, as it would a real one.
             await Task.Delay(TimeSpan.Zero, cancellationToken);
@@ -117,6 +120,7 @@ public sealed class GuardrailsCallPipelineTests
                 metadata,
                 Pins,
                 new SecretGate(document.EffectiveScanners.EffectiveSecrets),
+                new ArgumentGate(document.EffectiveScanners.EffectiveArguments),
                 Budget,
                 new InjectionGate(injection),
                 Webhook,
@@ -213,7 +217,7 @@ public sealed class GuardrailsCallPipelineTests
 
     private static GuardrailsCallPipeline Bare(UpstreamRegistry registry, IAuditSink sink, ToolCallTelemetry telemetry) =>
         new(registry, sink, telemetry, PolicyEvaluator.Empty, ToolMetadataGate.Build(ScannerSettings.Disabled, []),
-            ToolPinGate.Build(PinSettings.Disabled, [], []), SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off);
+            ToolPinGate.Build(PinSettings.Disabled, [], []), SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off);
 
     private const string _approveEcho = """
         rules:
@@ -422,6 +426,128 @@ public sealed class GuardrailsCallPipelineTests
             SecretSamples.AwsAccessKey,
             record.Arguments!["message"].GetString(),
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ArgumentHits_AreAuditedByDefault_AndTheCallForwarded()
+    {
+        await using var h = await Harness.StartAsync();
+
+        var result = await h.CallAsync("fs__echo", "../../etc/hosts");
+
+        Assert.NotEqual(true, result.IsError);
+        Assert.Equal(1, h.Forwarded);
+
+        var record = h.Record;
+        Assert.Equal(["path-traversal"], record.ArgumentHits);
+        Assert.Equal("audited", record.ArgumentHitsAction);
+        Assert.Equal("allow", record.Decision);
+    }
+
+    [Fact]
+    public async Task ABlockedArgument_IsRefusedBeforeAnyoneIsAskedToApproveIt()
+    {
+        await using var h = await Harness.StartAsync(_approveEcho + """
+
+            scanners:
+              arguments:
+                action: block
+            """);
+
+        var result = await h.CallAsync("fs__echo", "http://169.254.169.254/latest/meta-data/");
+
+        Assert.True(result.IsError);
+        Assert.StartsWith("Blocked by guardrails scanner 'arguments.ssrf'", Text(result));
+        Assert.Equal(0, h.InBand.Asked);
+        Assert.Equal(0, h.Forwarded);
+        Assert.Equal(0, h.Budget.Store.Calls);
+
+        var record = h.Record;
+        Assert.Equal("arguments.ssrf", record.Rule);
+        Assert.Equal(["ssrf"], record.ArgumentHits);
+        Assert.Equal("blocked", record.ArgumentHitsAction);
+    }
+
+    [Fact]
+    public async Task AnExplicitAllow_DoesNotSilenceTheDetectors()
+    {
+        await using var h = await Harness.StartAsync("""
+            rules:
+              - name: allow-echo
+                match: { tool: fs__echo }
+                decision: allow
+            scanners:
+              arguments:
+                action: block
+            """);
+
+        var result = await h.CallAsync("fs__echo", "cat ~/.ssh/id_rsa");
+
+        Assert.True(result.IsError);
+        Assert.Equal(0, h.Forwarded);
+        Assert.Equal("arguments.sensitive-path", h.Record.Rule);
+    }
+
+    [Fact]
+    public async Task UnderApprove_AnAllowedCallIsPutToAHuman_WhoIsToldWhatWasFound()
+    {
+        await using var h = await Harness.StartAsync("""
+            scanners:
+              arguments:
+                action: approve
+            """);
+
+        var result = await h.CallAsync("fs__echo", "http://localhost:8080/admin");
+
+        Assert.NotEqual(true, result.IsError);
+        Assert.Equal(1, h.InBand.Asked);
+        Assert.Equal(1, h.Forwarded);
+        Assert.Equal(1, h.Budget.Store.Calls);
+        Assert.Contains("Guardrails rule 'arguments.ssrf' requires your approval.", h.InBand.Question);
+        Assert.Contains("(ssrf in 'message')", h.InBand.Question);
+
+        var record = h.Record;
+        Assert.Equal("arguments.ssrf", record.Rule);
+        Assert.Equal("approved", record.Approval);
+        Assert.Equal("approval", record.ArgumentHitsAction);
+    }
+
+    [Fact]
+    public async Task UnderApprove_ADeclinedCallIsRefusedAsAnApproval()
+    {
+        await using var h = await Harness.StartAsync("""
+            scanners:
+              arguments:
+                action: approve
+            """);
+        h.InBand = new FakeChannel(ApprovalOutcome.Declined);
+
+        var result = await h.CallAsync("fs__echo", "http://localhost:8080/admin");
+
+        Assert.True(result.IsError);
+        Assert.StartsWith("Blocked by guardrails approval for rule 'arguments.ssrf'", Text(result));
+        Assert.Equal(0, h.Forwarded);
+    }
+
+    [Fact]
+    public async Task ACallThePolicyRefused_StillRecordsWhatItsArgumentsCarried()
+    {
+        await using var h = await Harness.StartAsync("""
+            rules:
+              - name: no-echo
+                match: { tool: fs__echo }
+                decision: deny
+            scanners:
+              arguments:
+                action: block
+            """);
+
+        await h.CallAsync("fs__echo", "http://10.0.0.1/");
+
+        var record = h.Record;
+        Assert.Equal("no-echo", record.Rule);
+        Assert.Equal(["ssrf"], record.ArgumentHits);
+        Assert.Null(record.ArgumentHitsAction);
     }
 
     [Fact]
@@ -736,6 +862,8 @@ public sealed class GuardrailsCallPipelineTests
         Assert.Null(record.ClassifierError);
         Assert.Null(record.ResultSecrets);
         Assert.Null(record.ResultSecretsAction);
+        Assert.Null(record.ArgumentHits);
+        Assert.Null(record.ArgumentHitsAction);
     }
 
     [Fact]
@@ -766,23 +894,25 @@ public sealed class GuardrailsCallPipelineTests
         var pins = ToolPinGate.Build(PinSettings.Disabled, [], []);
 
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            null!, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            null!, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, null!, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, null!, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, null!, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, null!, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, null!, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, telemetry, null!, metadata, pins, SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, null!, pins, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, telemetry, PolicyEvaluator.Empty, null!, pins, SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, null!, SecretGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, null!, SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, null!, BudgetGate.Unlimited, InjectionGate.Off));
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, null!, ArgumentGate.Off, BudgetGate.Unlimited, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, null!, InjectionGate.Off));
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, ArgumentGate.Off, null!, InjectionGate.Off));
         Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
-            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, BudgetGate.Unlimited, null!));
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, null!, BudgetGate.Unlimited, InjectionGate.Off));
+        Assert.Throws<ArgumentNullException>(() => new GuardrailsCallPipeline(
+            registry, sink, telemetry, PolicyEvaluator.Empty, metadata, pins, SecretGate.Off, ArgumentGate.Off, BudgetGate.Unlimited, null!));
 
         var pipeline = Bare(registry, sink, telemetry);
         Assert.Throws<ArgumentNullException>(() =>
