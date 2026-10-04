@@ -140,6 +140,6 @@ public sealed class UpstreamLoginForwardTests
 
         var thrown = await Assert.ThrowsAnyAsync<Exception>(() => Pipeline(registry).ForwardAsync(Call("linear__echo")).AsTask());
 
-        Assert.Null(UpstreamOAuth.LoginRequired(thrown));
+        Assert.Null(UpstreamNeedsOperatorException.Find(thrown));
     }
 }

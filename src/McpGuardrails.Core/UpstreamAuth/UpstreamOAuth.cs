@@ -11,11 +11,7 @@ namespace McpGuardrails.Core.UpstreamAuth;
 /// <param name="server">The server's name.</param>
 /// <param name="why">What happened, as a clause: "has never been logged in".</param>
 public sealed class UpstreamLoginRequiredException(string server, string why)
-    : Exception($"Server '{server}' {why}: run 'mcp-guardrails auth login {server}'.")
-{
-    /// <summary>The server's name.</summary>
-    public string Server { get; } = server;
-}
+    : UpstreamNeedsOperatorException(server, $"Server '{server}' {why}: run 'mcp-guardrails auth login {server}'.");
 
 /// <summary>
 /// The SDK's OAuth client settings for a remote server, for the two ways the
@@ -114,28 +110,5 @@ public static class UpstreamOAuth
         return (config, loggerFactory) => config.OAuth is null
             ? UpstreamRegistry.CreateTransport(config, loggerFactory)
             : UpstreamRegistry.CreateTransport(config, loggerFactory, ForServing(config, store));
-    }
-
-    /// <summary>The login-required failure somewhere in <paramref name="error"/>, if there is one.</summary>
-    /// <remarks>
-    /// Searched through inner exceptions because the SDK wraps what a callback
-    /// throws on its way out of a request.
-    /// </remarks>
-    public static UpstreamLoginRequiredException? LoginRequired(Exception? error)
-    {
-        for (var current = error; current is not null; current = current.InnerException)
-        {
-            if (current is UpstreamLoginRequiredException login)
-            {
-                return login;
-            }
-
-            if (current is AggregateException aggregate)
-            {
-                return aggregate.InnerExceptions.Select(LoginRequired).FirstOrDefault(found => found is not null);
-            }
-        }
-
-        return null;
     }
 }

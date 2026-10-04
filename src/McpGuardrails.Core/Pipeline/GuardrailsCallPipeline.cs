@@ -7,7 +7,6 @@ using McpGuardrails.Core.Pins;
 using McpGuardrails.Core.Policy;
 using McpGuardrails.Core.Scanners;
 using McpGuardrails.Core.Upstream;
-using McpGuardrails.Core.UpstreamAuth;
 using ModelContextProtocol.Protocol;
 
 namespace McpGuardrails.Core.Pipeline;
@@ -204,12 +203,12 @@ public sealed class GuardrailsCallPipeline
                 },
                 cancellationToken);
         }
-        catch (Exception ex) when (UpstreamOAuth.LoginRequired(ex) is { } login)
+        catch (Exception ex) when (UpstreamNeedsOperatorException.Find(ex) is { } needed)
         {
-            // A login that expired mid-session and could not be refreshed. A
+            // E.g. a login that expired mid-session and could not be refreshed. A
             // tool error rather than a protocol error, so the model reads it and
             // stops, and the audit log records a failed call with this reason.
-            return Error($"Refused '{requestedName}': {login.Message} Tell the user; calling it again will not help.");
+            return Error($"Refused '{requestedName}': {needed.Message} Tell the user; calling it again will not help.");
         }
     }
 

@@ -1,5 +1,4 @@
 using System.Diagnostics.CodeAnalysis;
-using McpGuardrails.Core.UpstreamAuth;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Authentication;
 using ModelContextProtocol.Client;
@@ -167,13 +166,13 @@ public sealed class UpstreamRegistry : IAsyncDisposable
             {
                 connections.Add(connection);
             }
-            else if (UpstreamOAuth.LoginRequired(error) is { } login)
+            else if (UpstreamNeedsOperatorException.Find(error) is { } needed)
             {
                 // Not fatal even when the server is required: no amount of
-                // waiting fixes a missing login, a person has to run auth login,
+                // waiting fixes a missing login or credential; a person has to act,
                 // and the rest of the configured servers are still worth serving.
                 // Its tools are absent, and calls to them say what to do.
-                unavailable.Add(new UnavailableUpstream(config.Name, login.Message));
+                unavailable.Add(new UnavailableUpstream(config.Name, needed.Message));
             }
             else if (config.Optional)
             {
