@@ -217,6 +217,10 @@ rules:
 
 See [policy.md](policy.md#what-a-rule-can-match-on).
 
+`mcp-guardrails init` writes rules like these for you: it recognizes popular
+servers in this file by their package, image or URL and generates a policy from
+the matching [packs](packs.md).
+
 ## Checking a file: `validate`
 
 ```bash

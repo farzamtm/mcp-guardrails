@@ -122,3 +122,58 @@ could trigger: the model chooses the argument, so it could pad a value until the
 rule gave up and the call fell through to default-allow. A denial of this kind
 names the rule in both the refusal and the audit log, so it is visible rather
 than silent.
+
+## Starting from a pack
+
+You do not have to begin with a blank file. `mcp-guardrails init` writes a
+policy from the built-in [policy packs](packs.md), one per popular server, with
+every rule commented. The generated file is yours to edit.
+
+## Testing a policy
+
+A policy is code, so it can have tests. A test file names the policy, the tools
+it is tested against, and calls with the decision each should get:
+
+```yaml
+# policy.test.yaml
+policy: policy.yaml                 # relative to this file
+tools:                              # what the servers advertise, with their hints
+  fs__read_text_file: { readOnlyHint: true }
+  fs__write_file: {}
+cases:
+  - call: fs__read_text_file
+    args: { path: /workspace/README.md }
+    expect: allow
+  - name: writes outside the workspace are refused
+    call: fs__write_file
+    args: { path: /etc/hosts }
+    expect: deny
+    rule: keep-writes-in-workspace  # optional: which rule should decide it
+```
+
+```bash
+mcp-guardrails policy test policy.test.yaml
+```
+
+Each case runs through the proxy's real policy evaluator, with the facts the
+proxy would build for that call: an advertised tool has its server (the part of
+the name before `__`) and its hints. No server is spawned, so it runs in CI with
+no network or keys. A failing case prints the full decision trail, the same text
+`--explain` adds to a refusal. The exit code is 1 when anything fails.
+
+A few rules keep a test from silently testing nothing:
+
+- **Unknown keys are errors**, at every level. A misspelt `expected:` would
+  otherwise leave a case asserting nothing.
+- **Every `call:` must be listed under `tools:`**, so a typo in a tool name
+  fails instead of quietly becoming a call to an unknown tool. To test what
+  happens to a tool no server advertises, say so with `unknown: true`; that call
+  has no server and no hints, as in the proxy.
+- An entry under `tools:` with no hints (`fs__write_file: {}`) declares none,
+  and the MCP defaults apply: not read-only, destructive.
+
+`policy:` may also name a pack file, with `server:` giving the name to fill in.
+That is how the shipped packs are tested.
+
+Only the policy decision is tested. Budgets, scanners and approval act on a live
+session; the smoke test covers those.

@@ -386,6 +386,30 @@ difference on a later start. Its limits:
   so a server that re-encodes accents raises a false alarm rather than a missed
   change.
 
+### Packs are opinions, not proofs
+
+The [policy packs](packs.md) turn the threats above into rules for specific
+servers: credential paths and files that run code later for the filesystem
+server, the exfiltration step of an issue-borne injection for GitHub, internal
+addresses for fetch, option-shaped refs for git, multi-statement SQL for
+Postgres. They inherit every limit of the policy engine, and add some of their
+own:
+
+- **Annotations decide "read".** A pack's "reads allowed" rule trusts the
+  server's `readOnlyHint`, which a hostile server can set on anything. The tools
+  that matter are named explicitly; the annotation rule is the net beneath them.
+- **Text heuristics.** The SQL rules match keywords and the fetch rules match
+  host names as written. They lean towards asking or refusing, but a public name
+  resolving to a private address, an IP in decimal, or SQL that hides a write
+  from a keyword list gets past them.
+- **One element per array.** A predicate checks one path in a JSON value, so a
+  tool taking an array of paths cannot be checked element by element. The
+  filesystem pack refuses `read_multiple_files` for that reason.
+- **Generated once.** A policy written by `init` does not change when the packs
+  do. That is deliberate - nothing changes behaviour without a file changing -
+  but it means a fix to a pack reaches you only when you run `init` again and
+  review the diff.
+
 ### Approval has limits of its own
 
 - **The approver sees a summary of the arguments, not all of them.** Both
