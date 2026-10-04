@@ -402,4 +402,19 @@ public sealed class PolicyLoaderTests : IDisposable
 
         Assert.Contains("YAML syntax error", exception.Message, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void Parse_ReadsAServerCondition()
+    {
+        var policy = PolicyLoader.Parse("""
+            rules:
+              - name: approve-github-writes
+                match:
+                  server: github
+                  annotations: { readOnlyHint: false }
+                decision: require_approval
+            """);
+
+        Assert.Equal("github", Assert.Single(policy.EffectiveRules).EffectiveMatch.Server);
+    }
 }

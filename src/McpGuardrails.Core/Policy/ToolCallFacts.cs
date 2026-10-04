@@ -13,8 +13,8 @@ namespace McpGuardrails.Core.Policy;
 /// </param>
 /// <param name="Server">
 /// The downstream server that owns the tool, or null when the name resolved to
-/// none. Not matched on - the tool glob already covers a server - but carried so
-/// an out-of-band approver can say which system the call would touch.
+/// none. Matched by a rule's <c>server:</c> condition, and carried so an
+/// out-of-band approver can say which system the call would touch.
 /// </param>
 /// <remarks>
 /// Deliberately a plain data snapshot rather than the live MCP request: it keeps

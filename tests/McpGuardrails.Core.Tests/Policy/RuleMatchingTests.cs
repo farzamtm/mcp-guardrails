@@ -296,4 +296,52 @@ public sealed class RuleMatchingTests
                 line,
                 StringComparison.Ordinal));
     }
+
+    // ------------------------------------------------------------------ server
+
+    [Fact]
+    public void AServerConditionMatchesTheOwningServerByGlob()
+    {
+        var evaluator = Evaluator(Deny("no-github", new PolicyMatch { Server = "git*" }));
+
+        Assert.Equal(
+            Verdict.Deny,
+            evaluator.Evaluate(new ToolCallFacts("github__create_issue", Server: "github")).Verdict);
+        Assert.Equal(
+            Verdict.Allow,
+            evaluator.Evaluate(new ToolCallFacts("fs__read_file", Server: "fs")).Verdict);
+    }
+
+    [Fact]
+    public void AServerConditionNeverMatchesAToolNoServerOwns()
+    {
+        // An unknown tool has no server. "*" would otherwise be the one server
+        // pattern that reaches calls nobody serves.
+        var evaluator = Evaluator(Deny("any-server", new PolicyMatch { Server = "*" }));
+
+        var decision = evaluator.Evaluate(new ToolCallFacts("nobody__tool"), explain: true);
+
+        Assert.Equal(Verdict.Allow, decision.Verdict);
+        Assert.NotNull(decision.Trail);
+        Assert.Contains(decision.Trail, l => l.Contains("no match (server)", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void AServerConditionCombinesWithAnnotations()
+    {
+        var evaluator = Evaluator(Deny("github-writes", new PolicyMatch
+        {
+            Server = "github",
+            Annotations = new AnnotationMatch { ReadOnlyHint = false },
+        }));
+
+        var write = new ToolCallFacts("github__push", Server: "github");
+        var read = new ToolCallFacts(
+            "github__get_file", Server: "github", Annotations: new ToolAnnotationFacts(ReadOnlyHint: true));
+        var otherWrite = new ToolCallFacts("fs__write_file", Server: "fs");
+
+        Assert.Equal(Verdict.Deny, evaluator.Evaluate(write).Verdict);
+        Assert.Equal(Verdict.Allow, evaluator.Evaluate(read).Verdict);
+        Assert.Equal(Verdict.Allow, evaluator.Evaluate(otherWrite).Verdict);
+    }
 }

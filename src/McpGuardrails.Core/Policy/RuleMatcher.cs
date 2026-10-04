@@ -22,7 +22,7 @@ internal enum MatchState
 /// so <c>--explain</c> can name it.
 /// </summary>
 /// <param name="State">Matched, not matched, or undecidable.</param>
-/// <param name="Condition">The deciding condition: tool, annotations or argument.</param>
+/// <param name="Condition">The deciding condition: tool, server, annotations or argument.</param>
 /// <param name="Detail">
 /// The argument path, when the deciding condition was a predicate. A reference to
 /// the rule's own string, never a newly built one.
@@ -62,6 +62,7 @@ internal readonly record struct MatchOutcome(MatchState State, string? Condition
 internal static class RuleMatcher
 {
     internal const string ToolCondition = "tool";
+    internal const string ServerCondition = "server";
     internal const string AnnotationsCondition = "annotations";
     internal const string ArgumentCondition = "argument";
 
@@ -70,6 +71,14 @@ internal static class RuleMatcher
         if (match.Tool is { } pattern && !GlobMatcher.IsMatch(pattern, facts.ToolName))
         {
             return MatchOutcome.Failed(ToolCondition);
+        }
+
+        // An unresolved tool has no server, and "no server" matches no pattern:
+        // a rule scoped to one server must not reach calls nobody serves.
+        if (match.Server is { } serverPattern &&
+            (facts.Server is not { } server || !GlobMatcher.IsMatch(serverPattern, server)))
+        {
+            return MatchOutcome.Failed(ServerCondition);
         }
 
         if (match.Annotations is { } annotations &&

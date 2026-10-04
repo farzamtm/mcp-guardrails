@@ -80,6 +80,28 @@ public sealed record PolicyDocument
 
     /// <summary>An empty policy: everything allowed, nothing configured.</summary>
     public static PolicyDocument Empty { get; } = new();
+
+    /// <summary>
+    /// Rules whose <c>server:</c> pattern matches none of
+    /// <paramref name="serverNames"/>, by name.
+    /// </summary>
+    /// <remarks>
+    /// For <c>validate</c>: a rule scoped to a server that is not configured -
+    /// renamed by <c>import</c>, say, or simply misspelt - never matches, and a
+    /// guardrail that never matches is a guardrail that is not there.
+    /// </remarks>
+    public IReadOnlyList<string> RulesMatchingNoServer(IReadOnlyCollection<string> serverNames)
+    {
+        ArgumentNullException.ThrowIfNull(serverNames);
+
+        return
+        [
+            .. EffectiveRules
+                .Where(rule => rule.EffectiveMatch.Server is { } pattern &&
+                               !serverNames.Any(name => GlobMatcher.IsMatch(pattern, name)))
+                .Select(rule => rule.Name),
+        ];
+    }
 }
 
 /// <summary>
@@ -212,10 +234,10 @@ public sealed record PolicyRule
 /// The conditions of a rule. All specified conditions must hold (logical AND).
 /// </summary>
 /// <remarks>
-/// Three kinds of condition, deliberately ordered cheapest-first in
-/// <see cref="RuleMatcher"/>: a tool-name glob, the tool's advertised behaviour
-/// hints, and predicates over the arguments the model supplied. Most rules never
-/// get past the name.
+/// Four kinds of condition, deliberately ordered cheapest-first in
+/// <see cref="RuleMatcher"/>: a tool-name glob, a server-name glob, the tool's
+/// advertised behaviour hints, and predicates over the arguments the model
+/// supplied. Most rules never get past the name.
 /// </remarks>
 public sealed record PolicyMatch
 {
@@ -238,6 +260,22 @@ public sealed record PolicyMatch
     [JsonPropertyName("tool")]
     public string? Tool { get; init; }
 
+    /// <summary>
+    /// Name of the downstream server that owns the tool, as named in the servers
+    /// file (e.g. <c>github</c>).
+    /// </summary>
+    /// <remarks>
+    /// A glob, like <see cref="Tool"/>. It says the same thing as a
+    /// <c>tool: github__*</c> pattern, but reads as what it means, and it keeps
+    /// meaning it when a rule also narrows by annotations or arguments.
+    ///
+    /// A call to a tool no server advertises has no server, so a <c>server:</c>
+    /// condition never matches it - the same way a predicate on a missing
+    /// argument does not. The catch-all at the bottom of the file decides those.
+    /// </remarks>
+    [JsonPropertyName("server")]
+    public string? Server { get; init; }
+
     /// <summary>Behaviour hints the tool must advertise, if any.</summary>
     [JsonPropertyName("annotations")]
     public AnnotationMatch? Annotations { get; init; }
@@ -259,7 +297,8 @@ public sealed record PolicyMatch
     /// the bottom of the file), but it is worth being able to detect.
     /// </remarks>
     [JsonIgnore]
-    public bool IsCatchAll => Tool is null && Annotations is null && Arguments is null;
+    public bool IsCatchAll =>
+        Tool is null && Server is null && Annotations is null && Arguments is null;
 
     internal void Validate(string ruleName)
     {
@@ -268,6 +307,13 @@ public sealed record PolicyMatch
             throw new PolicyException(
                 $"Rule '{ruleName}' has an empty 'tool'. " +
                 "Omit the field entirely to match every tool.");
+        }
+
+        if (Server is not null && string.IsNullOrWhiteSpace(Server))
+        {
+            throw new PolicyException(
+                $"Rule '{ruleName}' has an empty 'server'. " +
+                "Omit the field entirely to match tools from every server.");
         }
 
         Annotations?.Validate(ruleName);
