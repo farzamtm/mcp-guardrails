@@ -18,6 +18,7 @@ import json
 import secrets
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # DER prefix of a SHA-256 DigestInfo (RFC 8017 section 9.2, note 1).
@@ -106,23 +107,105 @@ class RsaKey:
 
 
 class FixtureIssuer:
-    """Discovery metadata and keys on a loopback port, and tokens to match."""
+    """An authorization server on a loopback port, and tokens to match.
 
-    def __init__(self) -> None:
+    Serves discovery metadata and keys for a proxy validating tokens, and the
+    endpoints an OAuth client needs to log in: dynamic client registration
+    (RFC 7591), an authorization endpoint that approves at once and redirects
+    back with a code, and a token endpoint that checks PKCE (RFC 7636) and
+    honours refresh tokens until they are revoked.
+    """
+
+    #: The subject of every token the authorization endpoint issues.
+    LOGIN_SUBJECT = "smoke-user"
+
+    def __init__(self, *, audience: str = "", access_token_lifetime: int = 300) -> None:
         self.key = RsaKey("smoke-1")
+        self.audience = audience
+        self.access_token_lifetime = access_token_lifetime
+        self.clients: dict[str, list[str]] = {}
+        self.codes: dict[str, dict] = {}
+        self.refresh_tokens: set[str] = set()
+        #: False answers a refresh without a new refresh_token, as servers that
+        #: do not rotate them may (RFC 6749 section 6).
+        self.rotate_refresh_tokens = True
+        self.token_requests: dict[str, int] = {
+            "authorization_code": 0,
+            "refresh_token": 0,
+        }
         issuer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if self.path == "/.well-known/openid-configuration":
-                    body = {"issuer": issuer.url, "jwks_uri": f"{issuer.url}/jwks"}
-                elif self.path == "/jwks":
-                    body = {"keys": [issuer.key.jwk()]}
+                path, _, query = self.path.partition("?")
+                if path in (
+                    "/.well-known/openid-configuration",
+                    "/.well-known/oauth-authorization-server",
+                ):
+                    self.reply(200, issuer.metadata())
+                elif path == "/jwks":
+                    self.reply(200, {"keys": [issuer.key.jwk()]})
+                elif path == "/authorize":
+                    self.authorize(urllib.parse.parse_qs(query))
                 else:
                     self.send_error(404)
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                if self.path == "/register":
+                    request = json.loads(body)
+                    client_id = f"client-{secrets.token_hex(8)}"
+                    issuer.clients[client_id] = request.get("redirect_uris", [])
+                    self.reply(
+                        201,
+                        {
+                            "client_id": client_id,
+                            "redirect_uris": issuer.clients[client_id],
+                            "token_endpoint_auth_method": "none",
+                            "grant_types": ["authorization_code", "refresh_token"],
+                            "response_types": ["code"],
+                        },
+                    )
+                elif self.path == "/token":
+                    form = {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
+                    status, reply = issuer.exchange(form)
+                    self.reply(status, reply)
+                else:
+                    self.send_error(404)
+
+            def authorize(self, query: dict[str, list[str]]) -> None:
+                def one(name: str) -> str:
+                    return query.get(name, [""])[0]
+
+                client_id, redirect_uri = one("client_id"), one("redirect_uri")
+                if (
+                    redirect_uri not in issuer.clients.get(client_id, [])
+                    or one("code_challenge_method") != "S256"
+                    or not one("code_challenge")
+                ):
+                    self.reply(400, {"error": "invalid_request"})
                     return
+                code = secrets.token_urlsafe(16)
+                issuer.codes[code] = {
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "challenge": one("code_challenge"),
+                    "scope": one("scope"),
+                }
+                location = (
+                    f"{redirect_uri}?code={code}"
+                    f"&state={urllib.parse.quote(one('state'))}"
+                    f"&iss={urllib.parse.quote(issuer.url)}"
+                )
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def reply(self, status: int, body: dict) -> None:
                 data = json.dumps(body).encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -134,6 +217,62 @@ class FixtureIssuer:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def metadata(self) -> dict:
+        return {
+            "issuer": self.url,
+            "jwks_uri": f"{self.url}/jwks",
+            "authorization_endpoint": f"{self.url}/authorize",
+            "token_endpoint": f"{self.url}/token",
+            "registration_endpoint": f"{self.url}/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+        }
+
+    def exchange(self, form: dict[str, str]) -> tuple[int, dict]:
+        """The token endpoint: a code for tokens, or a refresh token for new ones."""
+        grant = form.get("grant_type", "")
+        if grant == "authorization_code":
+            self.token_requests[grant] += 1
+            code = self.codes.pop(form.get("code", ""), None)
+            verifier = form.get("code_verifier", "")
+            challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+            if (
+                code is None
+                or code["client_id"] != form.get("client_id")
+                or code["redirect_uri"] != form.get("redirect_uri")
+                or code["challenge"] != challenge
+            ):
+                return 400, {"error": "invalid_grant"}
+        elif grant == "refresh_token":
+            self.token_requests[grant] += 1
+            if form.get("refresh_token") not in self.refresh_tokens:
+                return 400, {"error": "invalid_grant"}
+        else:
+            return 400, {"error": "unsupported_grant_type"}
+
+        access = self.token(
+            self.LOGIN_SUBJECT,
+            audience=self.audience,
+            scope="mcp.tools",
+            expires_in=self.access_token_lifetime,
+        )
+        response = {
+            "access_token": access,
+            "token_type": "Bearer",
+            "expires_in": self.access_token_lifetime,
+            "scope": "mcp.tools",
+        }
+        if grant == "authorization_code" or self.rotate_refresh_tokens:
+            refresh = secrets.token_urlsafe(24)
+            self.refresh_tokens.add(refresh)
+            response["refresh_token"] = refresh
+        return 200, response
+
+    def revoke_refresh_tokens(self) -> None:
+        self.refresh_tokens.clear()
 
     def token(
         self,

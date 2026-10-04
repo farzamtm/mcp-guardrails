@@ -36,4 +36,24 @@ public sealed class UpstreamServerConfigTests
 
         Assert.Throws<ArgumentException>(config.Validate);
     }
+
+    [Fact]
+    public void Validate_RejectsOAuthOnAStdioServer()
+    {
+        var config = Valid("fs") with { OAuth = new UpstreamOAuthSettings([]) };
+
+        Assert.Contains("stdio but has OAuth settings", Assert.Throws<ArgumentException>(config.Validate).Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_AcceptsOAuthOnARemoteServer()
+    {
+        new UpstreamServerConfig
+        {
+            Name = "linear",
+            Transport = UpstreamTransport.Http,
+            Url = new Uri("https://mcp.linear.app/mcp"),
+            OAuth = new UpstreamOAuthSettings(["read"]),
+        }.Validate(); // must not throw
+    }
 }

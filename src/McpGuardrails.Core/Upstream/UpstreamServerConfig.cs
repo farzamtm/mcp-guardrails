@@ -91,6 +91,16 @@ public sealed partial record UpstreamServerConfig
     public IReadOnlyDictionary<string, string>? Headers { get; init; }
 
     /// <summary>
+    /// Log in with OAuth rather than send a static header. Http and Sse only.
+    /// </summary>
+    /// <remarks>
+    /// The tokens never live here or in the servers file: <c>auth login</c>
+    /// stores them in the OS credential store, and the proxy reads them from
+    /// there at startup.
+    /// </remarks>
+    public UpstreamOAuthSettings? OAuth { get; init; }
+
+    /// <summary>
     /// Whether the proxy may start without this server when it cannot be reached.
     /// </summary>
     /// <remarks>
@@ -154,6 +164,12 @@ public sealed partial record UpstreamServerConfig
             {
                 throw new ArgumentException(
                     $"Upstream server '{Name}' is stdio but has a URL.", nameof(Url));
+            }
+
+            if (OAuth is not null)
+            {
+                throw new ArgumentException(
+                    $"Upstream server '{Name}' is stdio but has OAuth settings.", nameof(OAuth));
             }
 
             return;
