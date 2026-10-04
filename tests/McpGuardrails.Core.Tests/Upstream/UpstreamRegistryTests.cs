@@ -106,7 +106,7 @@ public sealed class UpstreamRegistryTests
 
         // IsError is bool? - absent means success on the wire, so it arrives as
         // null rather than false. Assert.False(null) fails, hence the explicit
-        // comparison. Program.cs relies on the same nullability (`is true`).
+        // comparison. The pipeline relies on the same nullability (`is true`).
         Assert.NotEqual(true, result.IsError);
         var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content));
         Assert.Equal("echo: hi", text.Text);

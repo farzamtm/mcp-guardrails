@@ -209,7 +209,7 @@ complete reference, including the sharp edges, is in
 The proxy is an MCP server and an MCP client at the same time, built on the
 official [C# SDK](https://github.com/modelcontextprotocol/csharp-sdk).
 
-- **Server half.** [`Program.cs`](src/McpGuardrails.Cli/Program.cs) registers
+- **Server half.** [`ServeCommand.cs`](src/McpGuardrails.Cli/Commands/ServeCommand.cs) registers
   list and call handlers instead of tools of its own, then attaches the stdio
   transport or, through [`HttpHost.cs`](src/McpGuardrails.Cli/HttpHost.cs),
   Kestrel and `MapMcp()`.

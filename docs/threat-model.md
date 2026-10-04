@@ -52,7 +52,7 @@ This is the long version.
 | **Environment** | `GUARDRAILS_*` variables; inherited by every spawned server | Trusted. |
 
 Wiring for all of this is in
-[`src/McpGuardrails.Cli/Program.cs`](../src/McpGuardrails.Cli/Program.cs). The
+[`src/McpGuardrails.Cli/Commands/ServeCommand.cs`](../src/McpGuardrails.Cli/Commands/ServeCommand.cs). The
 filter order — audit outermost, then policy/approval/budget, then the scanner
 innermost — is the security design, and the comments there explain each
 position.

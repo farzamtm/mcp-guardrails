@@ -31,7 +31,7 @@ marked **(unverified)**.
 The proxy does not forward the handshake, because there is nothing to forward:
 it is a complete MCP server to the client and a complete MCP client to each
 upstream, and each connection negotiates on its own
-([`Program.cs`](../src/McpGuardrails.Cli/Program.cs),
+([`ServeCommand.cs`](../src/McpGuardrails.Cli/Commands/ServeCommand.cs),
 [`UpstreamRegistry.cs`](../src/McpGuardrails.Core/Upstream/UpstreamRegistry.cs)).
 That is "discovery-first, no handshake proxying" in practice, and it
 is what lets a 2026-07-28 client use a 2025-06-18 server through the proxy: no
