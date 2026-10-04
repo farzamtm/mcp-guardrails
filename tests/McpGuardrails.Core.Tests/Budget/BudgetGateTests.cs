@@ -664,7 +664,8 @@ public sealed class BudgetGateTests
     [Fact]
     public void TheGate_RejectsANullStore()
     {
-        Assert.Throws<ArgumentNullException>(() => new BudgetGate(null!));
+        Assert.Throws<ArgumentNullException>(() => new BudgetGate((IBudgetStore)null!));
+        Assert.Throws<ArgumentNullException>(() => new BudgetGate((PrincipalBudgetStore)null!));
     }
 
     [Theory]

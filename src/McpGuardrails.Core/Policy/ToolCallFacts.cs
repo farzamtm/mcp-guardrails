@@ -16,6 +16,11 @@ namespace McpGuardrails.Core.Policy;
 /// none. Matched by a rule's <c>server:</c> condition, and carried so an
 /// out-of-band approver can say which system the call would touch.
 /// </param>
+/// <param name="Principal">
+/// Who made the call, from a validated access token; null over stdio and over
+/// HTTP without <c>access.oauth</c>. Matched by a rule's <c>principal:</c>.
+/// </param>
+/// <param name="Groups">The caller's groups, matched by a rule's <c>groups:</c>.</param>
 /// <remarks>
 /// Deliberately a plain data snapshot rather than the live MCP request: it keeps
 /// the evaluator free of any protocol types, which is what makes it trivially
@@ -26,10 +31,15 @@ public sealed record ToolCallFacts(
     string ToolName,
     IReadOnlyDictionary<string, JsonElement>? Arguments = null,
     ToolAnnotationFacts? Annotations = null,
-    string? Server = null)
+    string? Server = null,
+    string? Principal = null,
+    IReadOnlyList<string>? Groups = null)
 {
     /// <summary>The tool's hints, or the defaults when it declared none.</summary>
     public ToolAnnotationFacts EffectiveAnnotations => Annotations ?? ToolAnnotationFacts.Undeclared;
+
+    /// <summary>The caller's groups, or none.</summary>
+    public IReadOnlyList<string> EffectiveGroups => Groups ?? [];
 }
 
 /// <summary>

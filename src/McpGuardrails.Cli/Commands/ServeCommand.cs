@@ -1,3 +1,4 @@
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
@@ -114,6 +115,39 @@ internal sealed class ServeCommand : ICliCommand
                     .AddMeter(ToolCallTelemetry.SourceName, McpSdkSource)
                     .AddOtlpExporter());
         }
+
+        // -------------------------------------------------------------------
+        // OAuth access tokens, if the policy configures 'access.oauth'.
+        //
+        // The issuer's signing keys are fetched now, before the listener opens:
+        // a proxy that cannot validate any token would refuse every request, and
+        // the operator should hear that the issuer is unreachable from the
+        // startup error, not from a client's 401.
+        // -------------------------------------------------------------------
+        SigningKeyCache? signingKeys = null;
+        OAuthAccessGuard? oauthGuard = null;
+
+        if (serve.OAuth is { } oauth)
+        {
+            signingKeys = new SigningKeyCache(
+                oauth,
+                SigningKeyCache.CreateHandler(),
+                logger: startup.LoggerFactory.CreateLogger<SigningKeyCache>());
+
+            try
+            {
+                await signingKeys.InitializeAsync();
+            }
+            catch (OAuthException ex)
+            {
+                signingKeys.Dispose();
+                throw new CommandFailedException(1, $"Policy file '{startup.PolicyPath}': {ex.Message}");
+            }
+
+            oauthGuard = new OAuthAccessGuard(oauth, new AccessTokenValidator(oauth, signingKeys));
+        }
+
+        using var signingKeysLifetime = signingKeys;
 
         // Where daily budget counters persist. An environment variable like the
         // audit and policy paths, not a policy key: the policy says what the
@@ -246,11 +280,15 @@ internal sealed class ServeCommand : ICliCommand
             {
                 options.ServerInfo = new Implementation { Name = "mcp-guardrails", Version = proxyVersion };
 
+                // The caller is what HttpHost validated and attached to the HTTP
+                // request, carried here by the SDK as the message's user; null
+                // over stdio and without access.oauth.
                 options.Filters.Request.CallToolFilters.Add(next => (request, cancellationToken) =>
                     pipeline.InvokeAsync(
                         request.Params,
                         approvalChannel(request.Server),
                         forwardToken => next(request, forwardToken),
+                        CallerIdentity.FromClaimsPrincipal(request.User),
                         cancellationToken));
             })
             .WithListToolsHandler((_, _) =>
@@ -275,7 +313,7 @@ internal sealed class ServeCommand : ICliCommand
             // out because the approval behaviour above depends on it.
             mcp.WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless);
 
-            await HttpHost.RunAsync(web.Build(), serve);
+            await HttpHost.RunAsync(web.Build(), serve, oauthGuard);
         }
         else
         {

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Serialization;
 
 namespace McpGuardrails.Core.Policy;
@@ -107,7 +108,42 @@ public static class PolicyLoader
         document.EffectiveBudgets.Validate();
         document.EffectiveApprovers.Validate(document.EffectiveRules);
         document.EffectiveScanners.Validate();
+        document.EffectiveAccess.Validate();
+        RequireIdentitySource(document);
 
         return document;
+    }
+
+    /// <summary>
+    /// Refuses identity conditions and per-principal budgets in a policy that
+    /// has nowhere to get an identity from.
+    /// </summary>
+    /// <remarks>
+    /// Without <c>access.oauth</c> no call has a principal, so a
+    /// <c>principal:</c> rule would never match and a <c>budgets.principal</c>
+    /// cap would never be charged. A deny rule or a cap that silently does
+    /// nothing is the fail-open this check exists to prevent.
+    /// </remarks>
+    private static void RequireIdentitySource(PolicyDocument document)
+    {
+        if (document.EffectiveAccess.OAuth is not null)
+        {
+            return;
+        }
+
+        if (document.EffectiveRules.FirstOrDefault(rule => rule.EffectiveMatch.UsesIdentity) is { } rule)
+        {
+            throw new PolicyException(
+                $"Rule '{rule.Name}' matches on 'principal' or 'groups', but the policy has no " +
+                "'access.oauth' section, so no call would ever carry an identity and the rule would " +
+                "never match. Configure 'access.oauth', or remove the condition.");
+        }
+
+        if (document.EffectiveBudgets.Principal is not null)
+        {
+            throw new PolicyException(
+                $"'budgets.{BudgetGate.PrincipalScope}' needs 'access.oauth': without it no call has a " +
+                "principal to charge, so the cap would never apply.");
+        }
     }
 }

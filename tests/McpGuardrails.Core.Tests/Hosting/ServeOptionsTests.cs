@@ -1,4 +1,5 @@
 using System.Net;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Budget;
 using McpGuardrails.Core.Hosting;
 using McpGuardrails.Core.Policy;
@@ -249,5 +250,69 @@ public sealed class ServeOptionsTests
     public void NullBudgets_Throw()
     {
         Assert.Throws<ArgumentNullException>(() => ServeOptions.Default.EnsureEnforceable(null!));
+    }
+
+    // ----------------------------------------------------------------- oauth
+
+    private static readonly OAuthSettings _oauth = PolicyLoader.Parse("""
+        access:
+          oauth:
+            issuer: https://login.example.com
+            audience: api://mcp-guardrails
+        """).EffectiveAccess.OAuth!;
+
+    private static ServeOptions ParseWithOAuth(string commandLine, string? token = null) =>
+        ServeOptions.Parse(commandLine.Split(' ', StringSplitOptions.RemoveEmptyEntries), token, _oauth);
+
+    [Fact]
+    public void OAuth_IsCarriedOnTheOptions()
+    {
+        var options = ParseWithOAuth("--transport http");
+
+        Assert.Same(_oauth, options.OAuth);
+        Assert.False(options.RequiresToken);
+        Assert.Equal("OAuth access tokens", options.AuthenticationName);
+    }
+
+    [Fact]
+    public void OAuth_CountsAsAuthentication_ForANonLoopbackBind()
+    {
+        var options = ParseWithOAuth("--transport http --bind 0.0.0.0");
+
+        Assert.Equal(IPAddress.Any, options.BindAddress);
+    }
+
+    [Fact]
+    public void OAuth_AndTheStaticToken_TogetherAreRefused()
+    {
+        // Two policies about who may call, and whichever one the operator forgot
+        // about is the one an attacker uses.
+        var message = Assert.Throws<ServeOptionsException>(() => ParseWithOAuth("--transport http", _token)).Message;
+
+        Assert.Contains("Choose one", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OAuth_OverStdio_IsRefused()
+    {
+        var message = Assert.Throws<ServeOptionsException>(() => ParseWithOAuth("")).Message;
+
+        Assert.Contains("only applies to '--transport http'", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheAuthenticationName_DescribesEachMode()
+    {
+        Assert.Equal("bearer token", Parse("--transport http", _token).AuthenticationName);
+        Assert.Equal("none (loopback only)", Parse("--transport http").AuthenticationName);
+    }
+
+    [Fact]
+    public void ASessionBudgetOverHttp_SuggestsThePrincipalBudget()
+    {
+        var message = Assert.Throws<ServeOptionsException>(
+            () => Parse("--transport http").EnsureEnforceable(new BudgetPolicy { Session = new BudgetLimits { MaxCalls = 1 } })).Message;
+
+        Assert.Contains("'budgets.principal' with 'access.oauth'", message, StringComparison.Ordinal);
     }
 }
