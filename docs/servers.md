@@ -137,7 +137,7 @@ servers:                        # "mcpServers" is accepted as an alias
 | `headers` | http, sse | Static, sent with every request. |
 | `optional` | all | Start without this server if it can't be reached. Its tools are then absent for the session. |
 | `disabled` | all | Skipped entirely: not validated, not connected. |
-| `x-guardrails` | all | Options only the proxy reads. Today: `oauth` (remote servers), see [Logging in with OAuth](#logging-in-with-oauth). Unknown keys inside it are errors too. |
+| `x-guardrails` | all | Options only the proxy reads: `oauth` (remote servers), see [Logging in with OAuth](#logging-in-with-oauth), and `isolation` (stdio servers), see [Container isolation](#container-isolation). Unknown keys inside it are errors too. |
 
 **Unknown keys are errors.** Silently ignoring a misspelt security option is the
 fail-open this project exists to avoid. Keys that only configure a client
@@ -260,6 +260,29 @@ To silence the warning, choose now:
 
 The built-in filesystem server used when there is no servers file is not
 affected.
+
+## Container isolation
+
+Environment isolation keeps the proxy's secrets away from a server. It does
+nothing about the server's own access to your files and network. For that, run
+it in a container:
+
+```yaml
+servers:
+  fetch:
+    command: uvx
+    args: ["mcp-server-fetch==2025.4.7"]
+    x-guardrails:
+      isolation:
+        image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:...
+        network: bridge
+```
+
+The proxy launches it through `docker run` (or `podman run`) with no network,
+a read-only root, all capabilities dropped and only the folders you mount.
+Its variables are passed by name, never on the command line. If the runtime
+is missing, the proxy refuses to start rather than run the server without its
+container. See [isolation.md](isolation.md).
 
 ## Per-server policy
 

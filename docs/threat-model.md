@@ -172,6 +172,15 @@ hash checking what npm serves for it.
   never sees the classifier's API key, the HTTP bearer token or another server's
   token. Opt-in for this release, with a startup warning listing the variable
   names a server would lose; it becomes the default later.
+- **Container isolation**
+  ([`ContainerIsolation`](../src/McpGuardrails.Core/Upstream/ContainerIsolation.cs),
+  [isolation.md](isolation.md)). With `x-guardrails.isolation` a stdio server
+  runs inside a container: only the folders the servers file mounts, no network
+  unless it says `bridge`, a read-only root, no capabilities, no new privileges,
+  a non-root user, and memory, CPU and process limits. Its variables are passed
+  by name (`-e NAME`), so no secret is on a command line `ps` can show. A missing
+  runtime is a startup error; the proxy never runs an isolated server directly
+  on the host. Opt-in per server.
 - **The audit log** records every call it received and how long it took, an
   `upstream_connected` line per server at startup naming what was launched (the
   unexpanded template), so a later edit to the servers file shows up, and a
@@ -498,8 +507,12 @@ cannot know what a server will do with them:
 
 The proxy gates calls *to* a server; it does nothing about the server itself.
 
-- **Anything its process can do.** It runs as the user, with the user's files
-  and network. It does not need a tool call to read `~/.ssh` and post it.
+- **Anything its process can do, unless it runs in a container.** It runs as
+  the user, with the user's files and network. It does not need a tool call to
+  read `~/.ssh` and post it. With `x-guardrails.isolation` it is limited to its
+  container: the folders mounted into it, the network only under `bridge`, and
+  the host kernel, which it shares. A container escape is out of scope; see
+  [isolation.md](isolation.md#what-isolation-does-not-protect-against).
 - **Read the proxy's environment, unless isolated.** A stdio server inherits
   the proxy's full environment unless the servers file sets
   `env_isolation: true`, and the built-in filesystem server always does. Then
@@ -532,6 +545,18 @@ LLM completion. The proxy connects to upstreams with no client handlers
 registered, so it offers no sampling, elicitation or roots to them
 ([`UpstreamRegistry.ConnectOneAsync`](../src/McpGuardrails.Core/Upstream/UpstreamRegistry.cs)).
 Resources and prompts are not proxied at all.
+
+### Containers narrow a server, they do not make it trusted
+
+Isolation limits what a server's *process* can reach. It does not limit what
+the server can say back through the proxy, so results still go through the
+scanners like anyone else's. Every `rw` mount is fully writable by the server
+and every `ro` mount fully readable. `network: bridge` reaches everything the
+host can, local network included, until a per-host allowlist exists. The
+container shares the host kernel, and an escape through the kernel or the
+runtime is out of scope. Rootful Docker's daemon runs as root, so a rootless
+runtime is the better host. An image pinned by digest is the same code on every
+start, not reviewed code.
 
 ### The audit log is evidence, not proof
 
@@ -606,5 +631,7 @@ loader **rejects** it rather than accepting a setting that does nothing.
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
 | Environment isolation by default | Opt-in with `env_isolation: true`; a startup warning names what each server would lose |
 | Policy or servers reload without restart | Both read once at startup |
+| Container network allowlist (`isolation.network: allowlist`) | Rejected at load; `none` (default) or `bridge` |
+| Isolation without a container runtime (bubblewrap, `sandbox-exec`) | A runtime (Docker or Podman) is required; a missing one is a startup error |
 
 When one of these lands, this page should change in the same pull request.

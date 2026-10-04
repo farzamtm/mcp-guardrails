@@ -25,8 +25,10 @@ jq -r 'select(.event == "tool_call") | [.principal, .tool, .decision] | @tsv' au
 Each downstream server is recorded once at startup, when serving begins, with
 what it was launched from. `identity` is the command line or URL as written in
 the [servers file](servers.md), with `${VAR}` references unexpanded and
-anything secret-shaped masked; `tool` is absent because the line is about a
-server:
+anything secret-shaped masked. For a server in a
+[container](isolation.md) it is the generated `docker run` (or `podman run`)
+command, built from the same templates. `tool` is absent because the line is
+about a server:
 
 ```json
 {"ts":"2026-10-04T10:00:00.120000+00:00","event":"upstream_connected","server":"github",
