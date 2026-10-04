@@ -309,6 +309,22 @@ PINS_UPGRADED = "Echoes a message back, louder."
 WRAP_TOKEN = "ghp" + "_" + "smoketest" + "0" * 27
 WRAP_CONFIG = f"{SERVERS_DIR}/claude_desktop_config.json"
 WRAP_SERVERS = f"{SERVERS_DIR}/wrapped-servers.yaml"
+ARGS_DIR = f"{SANDBOX}/arguments-phase"
+ARGS_POLICY = f"{ARGS_DIR}/policy.yaml"
+ARGS_AUDIT = f"{SANDBOX}/audit-arguments.jsonl"
+# One override per action besides the default: reads are blocked on credential
+# paths, file info goes to a human, everything else is only audited.
+ARGS_POLICY_TEXT = """
+scanners:
+  arguments:
+    action: audit
+    overrides:
+      - tool: fs__read_text_file
+        detectors: [sensitive-path]
+        action: block
+      - tool: fs__get_file_info
+        action: approve
+"""
 
 
 class FakeAnthropic:
@@ -1385,6 +1401,12 @@ def main() -> int:
     packs_failures, packs_stderr = run_packs_phase()
     failures += packs_failures
     http_stderr += packs_stderr
+
+    # Phase 14: the argument attack detectors, one call per action.
+    print("\n--- argument detectors ---")
+    arguments_failures, arguments_stderr = run_arguments_phase()
+    failures += arguments_failures
+    http_stderr += arguments_stderr
 
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
@@ -3036,6 +3058,86 @@ def run_packs_phase() -> tuple[int, list[str]]:
             ),
             "packs: the audit log records the pack's rule and the human's answer",
         )
+    return check.failures, stderr
+
+
+def run_arguments_phase() -> tuple[int, list[str]]:
+    """The argument detectors audit, block and escalate, and the log says which."""
+    os.makedirs(f"{ARGS_DIR}/sub", exist_ok=True)
+    if os.path.exists(ARGS_AUDIT):
+        os.remove(ARGS_AUDIT)
+    with open(ARGS_POLICY, "w", encoding="utf-8") as handle:
+        handle.write(ARGS_POLICY_TEXT)
+
+    questions: list[str] = []
+    failures, stderr = run_session(
+        [
+            (
+                call(1, "fs__list_directory", {"path": f"{ARGS_DIR}/sub/.."}),
+                "arguments: a traversal is audited and the call still goes through",
+                lambda r: not r.get("isError") and "policy.yaml" in result_text(r),
+            ),
+            (
+                call(2, "fs__read_text_file", {"path": f"{SANDBOX}/.ssh/id_rsa"}),
+                "arguments: a read of a private key is blocked under its override",
+                lambda r: denied_with(r, "arguments.sensitive-path"),
+            ),
+            (
+                call(
+                    3,
+                    "fs__get_file_info",
+                    {"path": f"{ARGS_DIR}/sub/../policy.yaml"},
+                ),
+                "arguments: under approve the call is put to the human, who allows it",
+                lambda r: not r.get("isError"),
+            ),
+        ],
+        {"GUARDRAILS_POLICY": ARGS_POLICY, "GUARDRAILS_AUDIT": ARGS_AUDIT},
+        handshake=True,
+        elicit="approve",
+        questions=questions,
+    )
+    check = Checker(failures)
+
+    check.expect(
+        len(questions) == 1
+        and "Guardrails rule 'arguments.path-traversal' requires your approval."
+        in questions[0]
+        and "path-traversal in 'path'" in questions[0],
+        "arguments: the approver is told which detector fired, and where",
+    )
+
+    entries = read_audit(ARGS_AUDIT, "arguments audit log")
+    if entries is None:
+        check.failures += 1
+        return check.failures, stderr
+
+    calls = {entry.get("tool"): entry for entry in entries}
+    listed = calls.get("fs__list_directory", {})
+    read = calls.get("fs__read_text_file", {})
+    info = calls.get("fs__get_file_info", {})
+    check.expect(
+        listed.get("argument_hits") == ["path-traversal"]
+        and listed.get("argument_hits_action") == "audited"
+        and listed.get("decision") == "allow",
+        "arguments: the audit log records the audited hit by name",
+    )
+    check.expect(
+        read.get("argument_hits") == ["sensitive-path"]
+        and read.get("argument_hits_action") == "blocked"
+        and read.get("rule") == "arguments.sensitive-path",
+        "arguments: the audit log records the block and its rule",
+    )
+    check.expect(
+        info.get("argument_hits_action") == "approval"
+        and info.get("approval") == "approved"
+        and info.get("rule") == "arguments.path-traversal",
+        "arguments: the audit log records the escalation and the human's answer",
+    )
+    check.expect(
+        "id_rsa" not in json.dumps([entry.get("argument_hits") for entry in entries]),
+        "arguments: hits are detector names, never argument values",
+    )
     return check.failures, stderr
 
 
