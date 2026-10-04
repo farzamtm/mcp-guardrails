@@ -194,5 +194,5 @@ jobs:
           BIN=src/McpGuardrails.Cli/bin/Release/net10.0/McpGuardrails.Cli
           for policy in examples/*.yaml; do
             echo "checking $policy"
-            GUARDRAILS_POLICY="$policy" "$BIN" list-upstream > /dev/null
+            GUARDRAILS_SERVERS="" GUARDRAILS_POLICY="$policy" "$BIN" list-upstream > /dev/null
           done

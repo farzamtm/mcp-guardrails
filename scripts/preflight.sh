@@ -92,7 +92,8 @@ python3 scripts/smoke.py "$BIN"
 step "validate example policies"
 for policy in examples/*.yaml; do
   echo "checking $policy"
-  GUARDRAILS_POLICY="$policy" "$BIN" list-upstream >/dev/null
+  # Empty: the built-in server, not whatever servers file this machine has.
+  GUARDRAILS_SERVERS="" GUARDRAILS_POLICY="$policy" "$BIN" list-upstream >/dev/null
 done
 
 bold $'\nPreflight passed in '"$((SECONDS - START))"$'s - CI should agree.'
