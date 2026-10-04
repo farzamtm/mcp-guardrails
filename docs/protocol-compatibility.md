@@ -132,7 +132,7 @@ operator writes on purpose.
 | Declares elicitation with **URL mode only** (2025-11-25) | The proxy sends a form-mode request; the SDK refuses to send form mode to a client that did not declare it and throws, and the gate turns that into a refusal. | `failed` **(unverified)** | No |
 | Client gives up first (its own request timeout, or the user cancels) | The cancellation propagates; nothing is forwarded. The audit line records the error and **no decision**, because none was reached. | *(absent)* | By reading the code |
 | 2026-07-28 client, over stdio | See below. | **(unverified)** | No |
-| Any client, over Streamable HTTP | Stateless HTTP has no channel for a server-to-client request, so the proxy does not try: refused immediately, whatever the client declared. A `mode: webhook` or `mode: local_ui` rule is unaffected. | `unavailable` | Yes — smoke test |
+| Any client, over Streamable HTTP | Stateless HTTP has no channel for a server-to-client request, so the proxy does not try: refused immediately, whatever the client declared. A `mode: webhook` rule is unaffected, and so will `mode: local_ui` be once the local dashboard ships. | `unavailable` | Yes — smoke test |
 | Tasks-capable client | Tasks are not implemented or advertised; the call is handled exactly as for its protocol revision. A task-augmented `tools/call` is **(unverified)**. | — | No |
 
 ### Why "held open" is the down-level path, and what it costs

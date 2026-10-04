@@ -75,9 +75,9 @@ request from the server back to the client, and stateless HTTP has no channel to
 send it on — the SDK disables it outright. So under `--transport http` every
 `require_approval` call is refused immediately, with a message that says why;
 it never hangs until the deadline and it never falls through to `allow`. For
-rules that need a human, use `mode: webhook` or `mode: local_ui` (both below),
-neither of which goes through the client, or stdio, until the Tasks/MRTR channel
-lands.
+rules that need a human, use `mode: webhook` (below), which does not go through
+the client, or stdio, until the Tasks/MRTR channel lands. `mode: local_ui` will
+be a second option once the local dashboard ships.
 
 ## Asking a webhook instead
 
@@ -177,9 +177,16 @@ See [`examples/webhook-approval.yaml`](../examples/webhook-approval.yaml), and
 
 ## Asking the local UI instead
 
+> **Not usable yet.** The proxy side of this mode is in place, but the local
+> dashboard that answers it - `mcp-guardrails ui` - has not shipped. Until it
+> does, nothing writes the rendezvous file described below, so every
+> `mode: local_ui` call is refused, the same way it would be with the UI
+> stopped. It is documented now so the contract is reviewable before the
+> dashboard is built on it.
+
 A webhook needs an endpoint you build and host. For an autonomous agent or a
-stateless-HTTP deployment on your own machine, `mcp-guardrails ui` gives you an
-approval inbox with nothing to stand up:
+stateless-HTTP deployment on your own machine, `mcp-guardrails ui` will give you
+an approval inbox with nothing to stand up:
 
 ```yaml
 rules:

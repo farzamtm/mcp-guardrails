@@ -6,7 +6,10 @@
 # `mcp-guardrails ui` opens an approval inbox; every `mode: local_ui` rule
 # finds it automatically. See docs/approval.md's "Asking the local UI instead".
 #
-# Use it with:
+# NOT USABLE YET: `mcp-guardrails ui` has not shipped. The policy loads and
+# validates, but until the dashboard exists every local_ui call is refused.
+#
+# Use it, once the dashboard ships, with:
 #   mcp-guardrails ui &                 # starts the inbox
 #   GUARDRAILS_POLICY=examples/local-ui-approval.yaml mcp-guardrails --transport http
 #
