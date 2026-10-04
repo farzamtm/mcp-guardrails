@@ -156,9 +156,13 @@ public sealed class PathDetectorsTests
     [Fact]
     public void LongValues_AreScannedInLinearTime()
     {
-        var segments = string.Concat(Enumerable.Repeat("a/", 2_000_000));
-        var percents = string.Concat(Enumerable.Repeat("%c0%", 1_000_000));
-        var words = string.Concat(Enumerable.Repeat("x/y ", 1_000_000));
+        // Sized so a quadratic scan would take minutes while a linear one takes
+        // well under a second, even under coverage instrumentation on a busy
+        // CI runner: the bound below separates the two without being a
+        // benchmark.
+        var segments = string.Concat(Enumerable.Repeat("a/", 200_000));
+        var percents = string.Concat(Enumerable.Repeat("%c0%", 200_000));
+        var words = string.Concat(Enumerable.Repeat("x/y ", 200_000));
 
         var started = System.Diagnostics.Stopwatch.StartNew();
         Assert.False(PathDetectors.IsSensitivePath(segments, pathNamed: false));

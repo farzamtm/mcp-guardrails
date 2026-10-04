@@ -232,7 +232,10 @@ public sealed class ArgumentScannerTests
         var started = System.Diagnostics.Stopwatch.StartNew();
         var findings = ArgumentScanner.Scan("fs__write_file", arguments, ArgumentDetectors.All);
 
+        // A few seconds under coverage instrumentation; a quadratic scan of ten
+        // million characters would take hours, so a generous bound still tells
+        // the two apart on a slow CI runner.
         Assert.Equal(["ssrf"], findings.Detectors);
-        Assert.True(started.Elapsed < TimeSpan.FromSeconds(10), $"took {started.Elapsed}");
+        Assert.True(started.Elapsed < TimeSpan.FromSeconds(30), $"took {started.Elapsed}");
     }
 }

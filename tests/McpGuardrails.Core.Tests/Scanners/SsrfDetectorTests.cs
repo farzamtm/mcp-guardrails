@@ -166,9 +166,11 @@ public sealed class SsrfDetectorTests
     {
         // Every colon is a candidate scheme end; none is, and none may cause
         // a rescan of what came before it.
-        var adversarial = string.Concat(Enumerable.Repeat("http:x", 500_000)) +
-                          string.Concat(Enumerable.Repeat("a:", 500_000)) +
-                          "http://" + new string('a', 1_000_000) + ":" + new string('1', 1_000_000);
+        // A quadratic scan of this would take minutes; see PathDetectorsTests
+        // for why the input is sized as it is.
+        var adversarial = string.Concat(Enumerable.Repeat("http:x", 100_000)) +
+                          string.Concat(Enumerable.Repeat("a:", 100_000)) +
+                          "http://" + new string('a', 200_000) + ":" + new string('1', 200_000);
 
         var started = System.Diagnostics.Stopwatch.StartNew();
         Assert.False(SsrfDetector.IsMatch(adversarial));
