@@ -180,7 +180,11 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release
 
+      # The Linux runner has Docker, so the container isolation phase must run
+      # here: with this set, a missing Docker is a failure instead of a SKIP.
       - name: Smoke test through a real downstream server
+        env:
+          SMOKE_REQUIRE_DOCKER: "1"
         run: |
           python3 scripts/smoke.py \
             src/McpGuardrails.Cli/bin/Release/net10.0/McpGuardrails.Cli

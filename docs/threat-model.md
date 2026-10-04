@@ -43,12 +43,14 @@ This is the long version.
 
 | Boundary | What crosses it | Trust |
 | --- | --- | --- |
-| **Client ↔ proxy** | `tools/list`, `tools/call`, and (proxy → client) `elicitation/create` for approvals | Over stdio the client process is trusted — it spawned the proxy and owns its stdio. Over Streamable HTTP the client is whoever can reach the port and, if one is set, holds the shared bearer token; see [gaps](#nothing-is-authenticated). The **model** driving it is not trusted to stay on task: the whole premise is that it can be talked into calling the wrong tool. The **human** at the client is trusted to answer approvals honestly. |
+| **Client ↔ proxy** | `tools/list`, `tools/call`, and (proxy → client) `elicitation/create` for approvals | Over stdio the client process is trusted — it spawned the proxy and owns its stdio. Over Streamable HTTP the client is whoever can reach the port and either holds the shared bearer token, or presents an access token the configured issuer signed for this proxy ([OAuth](oauth.md)); see [gaps](#authentication-is-coarse). The **model** driving it is not trusted to stay on task: the whole premise is that it can be talked into calling the wrong tool. The **human** at the client is trusted to answer approvals honestly. |
 | **Proxy ↔ downstream server** | `tools/list` once at startup, `tools/call` per call, results back | Semi-trusted. The proxy spawns the server, so it starts it, but does not sandbox it; it gates what is *asked* of the server and labels what comes back. |
 | **Tool results** | Text, structured content, embedded resources | **Untrusted.** Anything a server returns may have been written by a third party — a README, a database row, a fetched page. This is the primary attack the project targets. |
 | **Tool metadata** | Names, descriptions, input schemas, annotations from `tools/list` | **Untrusted.** Scanned once at startup with the result heuristics; a flagged tool is advertised with a warning in its description or, under `block`, withheld and refused. Annotations are still taken at face value. See [tool metadata](#tool-metadata-is-scanned-not-verified). |
-| **Proxy ↔ remote server** | The same, over Streamable HTTP or SSE, with the static headers from the servers file | Semi-trusted, like a stdio server, and reached over the network: https is required except to loopback, redirects are not followed (a 3xx would carry the `Authorization` header elsewhere), and the transport is never auto-detected, so nothing silently downgrades to SSE. |
+| **Proxy ↔ remote server** | The same, over Streamable HTTP or SSE, with the static headers from the servers file or an OAuth login from the token store | Semi-trusted, like a stdio server, and reached over the network: https is required except to loopback, redirects are not followed (a 3xx would carry the `Authorization` header elsewhere), and the transport is never auto-detected, so nothing silently downgrades to SSE. |
 | **Servers file** | Read once at startup from `--servers`, `GUARDRAILS_SERVERS` or `~/.mcp-guardrails/servers.yaml` ([servers.md](servers.md)) | Trusted, and **it is code execution**: whoever can write it chooses what the proxy launches and where it sends headers. Unknown keys are errors, unset variables stop the start, and on Unix the proxy warns when the file is group- or world-writable. |
+| **Authorization server** | Under `access.oauth`: discovery metadata and signing keys, fetched at startup and refreshed; the tokens it signs arrive from clients | Trusted for identity: whoever controls its keys can be anyone. Fetched over https only (loopback http behind an explicit opt-in), without redirects, size-capped; the metadata must name the configured issuer. Keys that cannot be refreshed are used for at most `jwks_max_age_s`, then every request is refused. |
+| **Token store** | OAuth tokens for remote servers: written by `auth login` and by refreshes, read when serving. The macOS Keychain, the Secret Service, DPAPI-encrypted files on Windows, or `0600` files ([servers.md](servers.md#logging-in-with-oauth)) | Trusted: whoever can read it can act as the logged-in user at those servers until the tokens are revoked. Never the servers file or the audit log. Tokens are bound to the server URL they were issued for, so re-pointing a server name in the servers file does not send them elsewhere. Serving never opens a browser; a missing or expired login makes the server's tools unavailable, with the command to run. |
 | **Policy file** | Read once at startup from `GUARDRAILS_POLICY` or `~/.mcp-guardrails/policy.yaml` | Trusted. Anyone who can write it has already won. |
 | **Pins file** | Read at startup, written on a server's first use and by `pins accept` / `pins reset`, at `GUARDRAILS_PINS`, `scanners.pins.file` or `~/.mcp-guardrails/pins.json` ([pins.md](pins.md)) | Trusted: whoever can write it can accept any tool change. A file that exists but cannot be parsed stops the proxy rather than being re-pinned from what the servers serve now. |
 | **Audit log** | Appended to `GUARDRAILS_AUDIT` or `~/.mcp-guardrails/audit.jsonl` | Trusted by whoever reads it, protected only by filesystem permissions. |
@@ -138,6 +140,9 @@ hash checking what npm serves for it.
   ([`ToolAnnotationFacts`](../src/McpGuardrails.Core/Policy/ToolCallFacts.cs)).
   That helps against a *lazy* server. A *hostile* one simply declares
   `readOnlyHint: true`, and a read-only tool is never counted as destructive.
+  [`scan`](scan.md) flags a "read-only" tool named or described like a write,
+  before the server is put behind the proxy. That's a heuristic over English
+  verbs, not a check the proxy enforces at runtime.
 - **The result scanner** applies to its output exactly as in A1.
 - **The metadata scanner** applies the same heuristics to the tool definitions
   it advertises
@@ -167,6 +172,15 @@ hash checking what npm serves for it.
   never sees the classifier's API key, the HTTP bearer token or another server's
   token. Opt-in for this release, with a startup warning listing the variable
   names a server would lose; it becomes the default later.
+- **Container isolation**
+  ([`ContainerIsolation`](../src/McpGuardrails.Core/Upstream/ContainerIsolation.cs),
+  [isolation.md](isolation.md)). With `x-guardrails.isolation` a stdio server
+  runs inside a container: only the folders the servers file mounts, no network
+  unless it says `bridge`, a read-only root, no capabilities, no new privileges,
+  a non-root user, and memory, CPU and process limits. Its variables are passed
+  by name (`-e NAME`), so no secret is on a command line `ps` can show. A missing
+  runtime is a startup error; the proxy never runs an isolated server directly
+  on the host. Opt-in per server.
 - **The audit log** records every call it received and how long it took, an
   `upstream_connected` line per server at startup naming what was launched (the
   unexpanded template), so a later edit to the servers file shows up, and a
@@ -285,22 +299,30 @@ question, and it is the operator's.
 
 ## Not defended / known gaps
 
-### Nothing is authenticated
+### Authentication is coarse
 
 - Over stdio, whoever spawns the process *is* the client; there is no identity,
   token or user attribution in the protocol path or the log.
-- Over Streamable HTTP (`--transport http`) there is at most one shared bearer
-  token (`GUARDRAILS_HTTP_TOKEN`), no per-client identity, and no TLS. It binds
-  loopback by default and refuses a wider bind without a token; a non-loopback
-  `Origin` is refused so a web page cannot drive it through the user's browser.
-  Anything that gets past those calls every tool the policy allows. Elicitation
-  has no channel back over stateless HTTP, so in-band approval fails closed
-  (`unavailable`). For the same reason there is no per-client budget: a
+- Over Streamable HTTP (`--transport http`) without [OAuth](oauth.md) there is
+  at most one shared bearer token (`GUARDRAILS_HTTP_TOKEN`), no per-client
+  identity, and no TLS. It binds loopback by default and refuses a wider bind
+  without authentication; a non-loopback `Origin` is refused so a web page
+  cannot drive it through the user's browser. Anything that gets past those
+  calls every tool the policy allows. Elicitation has no channel back over
+  stateless HTTP, so in-band approval fails closed (`unavailable`). A
   `budgets.session` cap would silently be one pool shared by every client, so
-  the proxy refuses to start with one over HTTP (exit code 2). The only cap
-  available is `budgets.daily`, which every client — and every proxy on the
-  same `GUARDRAILS_BUDGET_DB` — draws from together; one noisy client can spend
+  the proxy refuses to start with one over HTTP (exit code 2); without OAuth the
+  only cap is `budgets.daily`, which every client — and every proxy on the same
+  `GUARDRAILS_BUDGET_DB` — draws from together, so one noisy client can spend
   the others' day.
+- With `access.oauth`, each call has a principal, and `principal:` rules and
+  `budgets.principal` key on it. But tokens are **validated, not introspected**:
+  a token revoked at the authorization server keeps working here until its
+  `exp`. They are bearer tokens with no DPoP or mTLS binding, so a stolen one is
+  as good as the original until then. The principal and groups are whatever the
+  issuer signed; the proxy cannot know whether its group assignments are right.
+  Per-principal counters live in memory and reset with the process. Still no
+  TLS: put a terminating proxy in front.
 - The proxy does not authenticate the servers it spawns either, and the approval
   prompt carries no proof of where it came from beyond the client's own UI.
 
@@ -493,8 +515,12 @@ cannot know what a server will do with them:
 
 The proxy gates calls *to* a server; it does nothing about the server itself.
 
-- **Anything its process can do.** It runs as the user, with the user's files
-  and network. It does not need a tool call to read `~/.ssh` and post it.
+- **Anything its process can do, unless it runs in a container.** It runs as
+  the user, with the user's files and network. It does not need a tool call to
+  read `~/.ssh` and post it. With `x-guardrails.isolation` it is limited to its
+  container: the folders mounted into it, the network only under `bridge`, and
+  the host kernel, which it shares. A container escape is out of scope; see
+  [isolation.md](isolation.md#what-isolation-does-not-protect-against).
 - **Read the proxy's environment, unless isolated.** A stdio server inherits
   the proxy's full environment unless the servers file sets
   `env_isolation: true`, and the built-in filesystem server always does. Then
@@ -502,7 +528,9 @@ The proxy gates calls *to* a server; it does nothing about the server itself.
   isolation, a server sees only the allowlist, what `env_passthrough` names and
   its own `env`.
 - **Lie in annotations** — declare a delete tool read-only and slip past
-  annotation rules. Name the tools you care about explicitly.
+  annotation rules. Name the tools you care about explicitly. `scan` reports
+  the obvious cases (a read-only `delete_row`), not a tool with an innocent
+  name that writes anyway.
 - **Poison tool descriptions in ways the heuristics miss** — see above.
 - **Return injections crafted around the heuristics** — see above.
 - **Return very large results.** There is no size cap; the scanner is linear but
@@ -525,6 +553,18 @@ LLM completion. The proxy connects to upstreams with no client handlers
 registered, so it offers no sampling, elicitation or roots to them
 ([`UpstreamRegistry.ConnectOneAsync`](../src/McpGuardrails.Core/Upstream/UpstreamRegistry.cs)).
 Resources and prompts are not proxied at all.
+
+### Containers narrow a server, they do not make it trusted
+
+Isolation limits what a server's *process* can reach. It does not limit what
+the server can say back through the proxy, so results still go through the
+scanners like anyone else's. Every `rw` mount is fully writable by the server
+and every `ro` mount fully readable. `network: bridge` reaches everything the
+host can, local network included, until a per-host allowlist exists. The
+container shares the host kernel, and an escape through the kernel or the
+runtime is out of scope. Rootful Docker's daemon runs as root, so a rootless
+runtime is the better host. An image pinned by digest is the same code on every
+start, not reviewed code.
 
 ### The audit log is evidence, not proof
 
@@ -598,7 +638,8 @@ loader **rejects** it rather than accepting a setting that does nothing.
 | Slack approval (`approval.mode: slack`) | Not a recognised mode, so rejected at load; `in_band` elicitation or a signed webhook |
 | Tasks / MRTR approval (`input_required` instead of holding the request) | Not implemented; see [protocol compatibility](protocol-compatibility.md) |
 | Environment isolation by default | Opt-in with `env_isolation: true`; a startup warning names what each server would lose |
-| OAuth to remote upstream servers | Static headers only |
 | Policy or servers reload without restart | Both read once at startup |
+| Container network allowlist (`isolation.network: allowlist`) | Rejected at load; `none` (default) or `bridge` |
+| Isolation without a container runtime (bubblewrap, `sandbox-exec`) | A runtime (Docker or Podman) is required; a missing one is a startup error |
 
 When one of these lands, this page should change in the same pull request.

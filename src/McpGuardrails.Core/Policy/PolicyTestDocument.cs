@@ -20,6 +20,8 @@ namespace McpGuardrails.Core.Policy;
 ///     expect: require_approval
 ///     rule: gh-approve-writes   # optional: which rule should decide it
 ///     argument_hits: []          # optional: which argument detectors should fire
+///     principal: alice           # optional: the caller, for access.oauth policies
+///     groups: [engineering]      # optional: the caller's groups
 /// </code>
 ///
 /// Unknown keys are refused at every level. In a test file a misspelt
@@ -82,6 +84,15 @@ public sealed record PolicyTestCase
     /// <summary>The call's arguments.</summary>
     [JsonPropertyName("args")]
     public IReadOnlyDictionary<string, JsonElement>? Arguments { get; init; }
+
+    /// <summary>The caller's principal, as an access token would give it.</summary>
+    /// <remarks>Absent means no caller, as over stdio: <c>principal:</c> and <c>groups:</c> rules do not match.</remarks>
+    [JsonPropertyName("principal")]
+    public string? Principal { get; init; }
+
+    /// <summary>The caller's groups, as an access token would give them.</summary>
+    [JsonPropertyName("groups")]
+    public IReadOnlyList<string>? Groups { get; init; }
 
     /// <summary>The expected verdict.</summary>
     [JsonPropertyName("expect")]

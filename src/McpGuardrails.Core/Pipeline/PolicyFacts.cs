@@ -1,3 +1,4 @@
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Policy;
 using ModelContextProtocol.Protocol;
 
@@ -27,12 +28,14 @@ public static class PolicyFacts
     /// would disagree with the policy about what happened.
     /// </param>
     /// <param name="server">The owning downstream server, when the name resolved to one.</param>
+    /// <param name="caller">Who made the call, when an access token said so.</param>
     public static ToolCallFacts ForCall(
         string toolName,
         CallToolRequestParams? request,
         Tool? tool,
-        string? server = null) =>
-        new(toolName, request?.Arguments?.AsReadOnly(), Annotations(tool), server);
+        string? server = null,
+        CallerIdentity? caller = null) =>
+        new(toolName, request?.Arguments?.AsReadOnly(), Annotations(tool), server, caller?.Principal, caller?.Groups);
 
     /// <summary>Copies a tool's hints into the policy engine's own shape.</summary>
     /// <remarks>

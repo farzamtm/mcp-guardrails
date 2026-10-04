@@ -61,7 +61,28 @@ What gets charged, and when:
 **`session` means this process.** An stdio proxy is spawned per client session,
 so the counters live in memory and start again with the next session. Over
 [Streamable HTTP](streamable-http.md) there is no session to attach them to, so a
-`session:` cap there is a startup error — use `daily:`.
+`session:` cap there is a startup error — use `daily:`, or `principal:`.
+
+**`principal` means one caller, for the life of the process.** Under
+[OAuth](oauth.md) every HTTP call has a principal, and `budgets.principal` gives
+each one their own counters, so one agent stuck in a loop runs out on its own
+instead of spending everyone's budget:
+
+```yaml
+budgets:
+  principal:
+    max_calls: 500
+  daily:
+    max_calls: 5000
+```
+
+- Counters live in memory, like `session:`, and reset when the proxy restarts.
+- With `daily:` as well, a call has to fit both, and a call the day refuses is
+  not charged to the caller.
+- It needs `access.oauth`, and cannot be combined with `session:`: a session
+  exists only over stdio and a principal only over HTTP. Both are load errors.
+- The refusal says the caller's own budget is spent and that it resets when the
+  proxy restarts, rather than suggesting a new session.
 
 **`daily` means one UTC day, across every session.** A daily cap that reset
 whenever the client reconnected would be a limit an agent defeats by being

@@ -25,6 +25,9 @@ public sealed class BudgetGate
     /// <summary>The scope name for the per-UTC-day budget.</summary>
     public const string DailyScope = "daily";
 
+    /// <summary>The scope name for the per-caller budget.</summary>
+    public const string PrincipalScope = "principal";
+
     private readonly IBudgetStore _store;
     private readonly string _scope;
 
@@ -32,6 +35,10 @@ public sealed class BudgetGate
     // has to be the concrete in-memory store rather than any IBudgetStore.
     private readonly InMemoryBudgetStore? _session;
     private readonly IBudgetStore? _daily;
+
+    // Set only for per-principal budgets, which pick their in-memory store per
+    // call and otherwise follow the session's rules, including with a daily cap.
+    private readonly PrincipalBudgetStore? _principals;
 
     // A plain object rather than System.Threading.Lock because ApplyBoth needs
     // Monitor.Wait/PulseAll, which Lock does not offer. Guards _pending only;
@@ -67,6 +74,18 @@ public sealed class BudgetGate
         _daily = daily;
     }
 
+    /// <summary>A gate enforcing a budget per caller, and a daily budget if given.</summary>
+    /// <param name="principals">The per-principal counters.</param>
+    /// <param name="daily">The per-day counters, or null for no daily cap.</param>
+    public BudgetGate(PrincipalBudgetStore principals, IBudgetStore? daily = null)
+        : this(daily ?? new InMemoryBudgetStore(), daily is null ? PrincipalScope : DailyScope)
+    {
+        ArgumentNullException.ThrowIfNull(principals);
+
+        _principals = principals;
+        _daily = daily;
+    }
+
     /// <summary>Builds the gate a policy file's <c>budgets:</c> section asks for.</summary>
     /// <param name="budgets">The validated budget section.</param>
     /// <param name="openDaily">
@@ -81,6 +100,15 @@ public sealed class BudgetGate
     {
         ArgumentNullException.ThrowIfNull(budgets);
         ArgumentNullException.ThrowIfNull(openDaily);
+
+        // Principal and session never come together: BudgetPolicy.Validate
+        // refuses the pair, because no transport could enforce both.
+        if (budgets.Principal is { } principal)
+        {
+            return new BudgetGate(
+                new PrincipalBudgetStore(principal),
+                budgets.Daily is { } perDay ? openDaily(perDay) : null);
+        }
 
         return (budgets.Session, budgets.Daily) switch
         {
@@ -101,7 +129,10 @@ public sealed class BudgetGate
     public static BudgetGate Unlimited { get; } = new(new InMemoryBudgetStore());
 
     /// <summary>The totals so far, for logging and tests.</summary>
-    /// <remarks>The session store when both scopes are configured.</remarks>
+    /// <remarks>
+    /// The session store when both scopes are configured; with per-principal
+    /// budgets, the daily store, or an unlimited one when there is none.
+    /// </remarks>
     public IBudgetStore Store => _store;
 
     /// <summary>The daily store when both scopes are configured, otherwise null.</summary>
@@ -117,12 +148,15 @@ public sealed class BudgetGate
     /// anything, so the call is not charged. Defaults to true, so a caller that
     /// does not say is charged - the safe direction for a bound.
     /// </param>
+    /// <param name="principal">
+    /// Who made the call, for per-principal budgets. Ignored otherwise.
+    /// </param>
     /// <returns>
     /// The original decision when the call fits the budget (or was already
     /// blocked, or names no known tool), otherwise a denial explaining which cap
     /// ran out.
     /// </returns>
-    public Decision Apply(Decision decision, bool toolResolved = true)
+    public Decision Apply(Decision decision, bool toolResolved = true, string? principal = null)
     {
         ArgumentNullException.ThrowIfNull(decision);
 
@@ -148,17 +182,53 @@ public sealed class BudgetGate
             return decision;
         }
 
+        if (_principals is not null)
+        {
+            return ApplyPrincipal(decision, _principals, principal);
+        }
+
         if (_session is not null && _daily is not null)
         {
-            return ApplyBoth(decision, _session, _daily);
+            return ApplyBoth(decision, _session, SessionScope, _daily);
         }
 
-        if (TryCharge(_store, decision.Cost, out var charge) is { } failure)
+        return ApplyOne(decision, _store, _scope);
+    }
+
+    private static Decision ApplyOne(Decision decision, IBudgetStore store, string scope)
+    {
+        if (TryCharge(store, decision.Cost, out var charge) is { } failure)
         {
-            return Unavailable(decision, _scope, failure);
+            return Unavailable(decision, scope, failure);
         }
 
-        return charge.Allowed ? decision : Refuse(charge, decision, _scope);
+        return charge.Allowed ? decision : Refuse(charge, decision, scope);
+    }
+
+    /// <remarks>
+    /// A call with no principal under a per-principal budget is refused rather
+    /// than waved through: it cannot happen through the HTTP listener, which
+    /// rejects a request without a valid token, so reaching it means the gate is
+    /// wired wrong - and an uncharged call is a cap that does not hold.
+    /// </remarks>
+    private Decision ApplyPrincipal(Decision decision, PrincipalBudgetStore principals, string? principal)
+    {
+        if (principal is null)
+        {
+            return decision.RefusedBy(
+                DecisionSource.Budget,
+                $"{PrincipalScope}.unidentified",
+                "the call carries no authenticated principal, so the per-principal budget cannot be " +
+                "charged and the call is refused. Stop calling tools and tell the user the guardrails " +
+                "proxy is misconfigured.",
+                $"budget '{PrincipalScope}': no principal -> deny");
+        }
+
+        var own = principals.For(principal);
+
+        return _daily is not null
+            ? ApplyBoth(decision, own, PrincipalScope, _daily)
+            : ApplyOne(decision, own, PrincipalScope);
     }
 
     /// <remarks>
@@ -184,7 +254,7 @@ public sealed class BudgetGate
     /// store's own check-and-charge is atomic, and a refund only returns a charge
     /// this call made.
     /// </remarks>
-    private Decision ApplyBoth(Decision decision, InMemoryBudgetStore session, IBudgetStore daily)
+    private Decision ApplyBoth(Decision decision, InMemoryBudgetStore session, string sessionScope, IBudgetStore daily)
     {
         lock (_pair)
         {
@@ -200,7 +270,7 @@ public sealed class BudgetGate
 
                 if (_pending == 0)
                 {
-                    return Refuse(sessionCharge, decision, SessionScope);
+                    return Refuse(sessionCharge, decision, sessionScope);
                 }
 
                 Monitor.Wait(_pair);
@@ -304,6 +374,16 @@ public sealed class BudgetGate
     /// </remarks>
     private static string Explain(BudgetCharge charge, string scope) => (scope, charge.Exceeded) switch
     {
+        (PrincipalScope, BudgetDimension.Cost) =>
+            $"this call costs {Number(charge.Requested)} and the identity you call as has already " +
+            $"spent {Number(charge.Used)} of its {Number(charge.Cap)} budget. Stop calling tools and " +
+            "tell the user the budget is exhausted; only they can raise " +
+            $"'budgets.{PrincipalScope}.max_cost', otherwise it resets when the proxy restarts.",
+        (PrincipalScope, _) =>
+            $"the identity you call as has made {Number(charge.Used)} tool calls, which is its limit " +
+            $"of {Number(charge.Cap)}. Stop calling tools and tell the user the budget is exhausted; " +
+            $"only they can raise 'budgets.{PrincipalScope}.max_calls', otherwise it resets when the " +
+            "proxy restarts.",
         (DailyScope, BudgetDimension.Cost) =>
             $"this call costs {Number(charge.Requested)} and {Number(charge.Used)} of today's " +
             $"{Number(charge.Cap)} budget is already spent (days are UTC). Stop calling tools " +

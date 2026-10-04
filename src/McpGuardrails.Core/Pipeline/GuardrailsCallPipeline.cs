@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Approval;
 using McpGuardrails.Core.Audit;
 using McpGuardrails.Core.Budget;
@@ -136,11 +137,16 @@ public sealed class GuardrailsCallPipeline
     /// The innermost step: in the host, the SDK's call handler, which is
     /// <see cref="ForwardAsync"/>.
     /// </param>
+    /// <param name="caller">
+    /// Who made the call, when an access token said so; null over stdio and
+    /// over HTTP without <c>access.oauth</c>.
+    /// </param>
     /// <param name="cancellationToken">The client's cancellation.</param>
     public ValueTask<CallToolResult> InvokeAsync(
         CallToolRequestParams? parameters,
         IApprovalChannel inBand,
         Func<CancellationToken, ValueTask<CallToolResult>> forward,
+        CallerIdentity? caller = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(inBand);
@@ -155,8 +161,10 @@ public sealed class GuardrailsCallPipeline
                     parameters,
                     scanning => ScanAsync(parameters, forward, scanning),
                     redacting),
-                gated),
-            cancellationToken);
+                gated,
+                caller),
+            cancellationToken,
+            caller);
     }
 
     /// <summary>
@@ -172,19 +180,36 @@ public sealed class GuardrailsCallPipeline
     {
         var requestedName = parameters?.Name;
 
+        if (requestedName is not null && _upstream.TryGetUnavailable(requestedName, out var unavailable))
+        {
+            return Error(
+                $"Tool '{requestedName}' belongs to server '{unavailable.Name}', which is not available in " +
+                $"this session. {unavailable.Reason} Tell the user; calling it again will not help.");
+        }
+
         if (requestedName is null ||
             !_upstream.TryResolve(requestedName, out var connection, out var downstreamName))
         {
             return Error($"Unknown tool '{requestedName}'.");
         }
 
-        return await connection.Client.CallToolAsync(
-            new CallToolRequestParams
-            {
-                Name = downstreamName,
-                Arguments = parameters?.Arguments,
-            },
-            cancellationToken);
+        try
+        {
+            return await connection.Client.CallToolAsync(
+                new CallToolRequestParams
+                {
+                    Name = downstreamName,
+                    Arguments = parameters?.Arguments,
+                },
+                cancellationToken);
+        }
+        catch (Exception ex) when (UpstreamNeedsOperatorException.Find(ex) is { } needed)
+        {
+            // E.g. a login that expired mid-session and could not be refreshed. A
+            // tool error rather than a protocol error, so the model reads it and
+            // stops, and the audit log records a failed call with this reason.
+            return Error($"Refused '{requestedName}': {needed.Message} Tell the user; calling it again will not help.");
+        }
     }
 
     private static string ToolName(CallToolRequestParams? parameters) =>
@@ -194,7 +219,8 @@ public sealed class GuardrailsCallPipeline
     internal async ValueTask<CallToolResult> AuditAsync(
         CallToolRequestParams? parameters,
         Func<CancellationToken, ValueTask<CallToolResult>> next,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CallerIdentity? caller = null)
     {
         // Opens the per-call scope that lets the inner layers report their
         // decisions back up to this one. See GuardrailsCallScope for why a
@@ -255,7 +281,7 @@ public sealed class GuardrailsCallPipeline
         {
             var elapsed = Stopwatch.GetElapsedTime(startedAt);
             var record = ToAuditRecord(
-                toolName, server, downstreamTool, arguments, scope, elapsed, result, thrown);
+                toolName, server, downstreamTool, caller, arguments, scope, elapsed, result, thrown);
 
             // Same duration and decision as the record, so a dashboard and the
             // log never disagree about the same call.
@@ -272,6 +298,7 @@ public sealed class GuardrailsCallPipeline
         string toolName,
         string? server,
         string? downstreamTool,
+        CallerIdentity? caller,
         ArgumentScan arguments,
         GuardrailsCallScope scope,
         TimeSpan elapsed,
@@ -289,6 +316,7 @@ public sealed class GuardrailsCallPipeline
             Tool = toolName,
             Server = server,
             DownstreamTool = downstreamTool,
+            Principal = caller?.Principal,
             Arguments = arguments.Redacted,
             Decision = decision?.Verdict.ToWireName(),
             Rule = decision?.RuleName,
@@ -330,7 +358,8 @@ public sealed class GuardrailsCallPipeline
         CallToolRequestParams? parameters,
         IApprovalChannel inBand,
         Func<CancellationToken, ValueTask<CallToolResult>> next,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CallerIdentity? caller = null)
     {
         var toolName = ToolName(parameters);
 
@@ -351,7 +380,7 @@ public sealed class GuardrailsCallPipeline
         var resolved = _upstream.TryResolve(toolName, out var owner, out _);
         var server = resolved ? owner.Name : null;
 
-        var facts = PolicyFacts.ForCall(toolName, parameters, tool, server);
+        var facts = PolicyFacts.ForCall(toolName, parameters, tool, server, caller);
 
         // Seven gates, in this order, and the order is the design.
         //
@@ -395,7 +424,7 @@ public sealed class GuardrailsCallPipeline
             new ApprovalChannelRouter(inBand, _webhook),
             cancellationToken);
 
-        decision = _budget.Apply(decision, resolved);
+        decision = _budget.Apply(decision, resolved, caller?.Principal);
 
         GuardrailsCallScope.RecordDecision(decision);
 

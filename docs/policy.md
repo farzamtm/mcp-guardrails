@@ -36,7 +36,7 @@ bottom, rather than by guessing at specificity scores. See
 
 ## What a rule can match on
 
-Four kinds of condition, combined with AND. An omitted condition is skipped, so
+Five kinds of condition, combined with AND. An omitted condition is skipped, so
 a `match:` with nothing in it is a catch-all.
 
 ```yaml
@@ -74,6 +74,23 @@ rules:
       server: github
       annotations: { readOnlyHint: false }
     decision: require_approval
+```
+
+**Who is calling**, under [OAuth](oauth.md): `principal:` is a glob over the
+access token's principal claim, and `groups:` matches when the caller is in any
+of the listed groups. A call with no principal — over stdio, or over HTTP
+without `access.oauth` — matches neither, so a policy using them without an
+`access.oauth` section is refused at load rather than carrying rules that can
+never fire.
+
+```yaml
+rules:
+  - name: admins-may-delete
+    match: { tool: "*__delete_*", groups: [mcp-admins] }
+    decision: allow
+  - name: nobody-else-deletes
+    match: { tool: "*__delete_*" }
+    decision: deny
 ```
 
 **Annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
@@ -181,6 +198,9 @@ A few rules keep a test from silently testing nothing:
   has no server and no hints, as in the proxy.
 - An entry under `tools:` with no hints (`fs__write_file: {}`) declares none,
   and the MCP defaults apply: not read-only, destructive.
+- A case with no `principal:` has no caller, as over stdio. For a policy that
+  uses [OAuth](oauth.md) identities, give the case `principal: alice` and, if
+  rules match on them, `groups: [ops]`.
 
 `policy:` may also name a pack file, with `server:` giving the name to fill in.
 That is how the shipped packs are tested.

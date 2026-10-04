@@ -13,11 +13,22 @@ Default location `~/.mcp-guardrails/audit.jsonl`, overridable with `GUARDRAILS_A
  "duration_ms":5.87,"is_error":false}
 ```
 
+Under [OAuth](oauth.md), every call record also carries `principal`: the value
+of the access token's principal claim, never the token itself. It is absent over
+stdio and with the static bearer token.
+
+```bash
+# Who called what?
+jq -r 'select(.event == "tool_call") | [.principal, .tool, .decision] | @tsv' audit.jsonl
+```
+
 Each downstream server is recorded once at startup, when serving begins, with
 what it was launched from. `identity` is the command line or URL as written in
 the [servers file](servers.md), with `${VAR}` references unexpanded and
-anything secret-shaped masked; `tool` is absent because the line is about a
-server:
+anything secret-shaped masked. For a server in a
+[container](isolation.md) it is the generated `docker run` (or `podman run`)
+command, built from the same templates. `tool` is absent because the line is
+about a server:
 
 ```json
 {"ts":"2026-10-04T10:00:00.120000+00:00","event":"upstream_connected","server":"github",

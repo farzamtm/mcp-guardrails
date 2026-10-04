@@ -1,6 +1,8 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using McpGuardrails.Core.Access;
 
 namespace McpGuardrails.Core.Hosting;
 
@@ -15,7 +17,22 @@ public enum HttpAccessVerdict
 
     /// <summary>403: a browser page from somewhere other than this machine.</summary>
     ForbiddenOrigin,
+
+    /// <summary>403: a valid access token that does not grant the required scopes.</summary>
+    InsufficientScope,
+
+    /// <summary>503: the authorization server's keys are too old to trust, so nothing can be checked.</summary>
+    Unavailable,
 }
+
+/// <summary>A verdict, with who the caller is and what to tell a refused one.</summary>
+/// <param name="Verdict">What to do with the request.</param>
+/// <param name="Caller">The validated caller, when the request carried an access token.</param>
+/// <param name="Challenge">The <c>WWW-Authenticate</c> value for a 401 or 403, if any.</param>
+public sealed record HttpAccessResult(
+    HttpAccessVerdict Verdict,
+    CallerIdentity? Caller = null,
+    string? Challenge = null);
 
 /// <summary>
 /// Decides, from two headers, whether an HTTP request may reach the MCP endpoint.
@@ -63,27 +80,42 @@ public sealed class HttpAccessGuard
             return HttpAccessVerdict.Allowed;
         }
 
-        const string scheme = "Bearer ";
-
-        // The scheme name is case-insensitive (RFC 9110 section 11.1); the token is not.
-        if (authorization is null ||
-            !authorization.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
+        if (!TryReadBearer(authorization, out var token))
         {
             return HttpAccessVerdict.Unauthorized;
         }
 
-        var presented = Digest(authorization[scheme.Length..].Trim());
+        var presented = Digest(token);
 
         return CryptographicOperations.FixedTimeEquals(presented, _tokenDigest)
             ? HttpAccessVerdict.Allowed
             : HttpAccessVerdict.Unauthorized;
     }
 
+    /// <summary>Reads the token out of an <c>Authorization: Bearer</c> header.</summary>
+    /// <remarks>
+    /// The scheme name is case-insensitive (RFC 9110 section 11.1); the token is not.
+    /// </remarks>
+    internal static bool TryReadBearer(string? authorization, [NotNullWhen(true)] out string? token)
+    {
+        const string scheme = "Bearer ";
+
+        if (authorization is null ||
+            !authorization.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
+        {
+            token = null;
+            return false;
+        }
+
+        token = authorization[scheme.Length..].Trim();
+        return true;
+    }
+
     /// <remarks>
     /// <c>Origin: null</c> (sandboxed frames, <c>file://</c> pages) fails to parse
     /// and is refused: it is a browser telling us it will not say where it is.
     /// </remarks>
-    private static bool IsLoopbackOrigin(string origin)
+    internal static bool IsLoopbackOrigin(string origin)
     {
         if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri))
         {

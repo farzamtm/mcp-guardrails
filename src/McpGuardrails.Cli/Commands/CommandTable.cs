@@ -39,6 +39,8 @@ internal static class CommandTable
         ("pins", () => new PinsCommand()),
         ("init", () => new InitCommand()),
         ("policy", () => new PolicyCommand()),
+        ("scan", () => new ScanCommand()),
+        ("auth", () => new AuthCommand()),
     ];
 
     /// <summary>Runs the named subcommand, or serves when none is named.</summary>

@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using McpGuardrails.Core.Access;
 using McpGuardrails.Core.Budget;
 
 namespace McpGuardrails.Core.Hosting;
@@ -30,12 +31,17 @@ public sealed class ServeOptionsException(string message) : Exception(message);
 /// <param name="Transport">Which transport serves the client.</param>
 /// <param name="BindAddress">The interface the HTTP listener binds to.</param>
 /// <param name="Port">The HTTP port; 0 asks the OS for a free one.</param>
-/// <param name="BearerToken">The token HTTP clients must present, if any.</param>
+/// <param name="BearerToken">The static token HTTP clients must present, if any.</param>
+/// <param name="OAuth">
+/// The policy's <c>access.oauth</c> block, when HTTP clients authenticate with
+/// access tokens instead.
+/// </param>
 public sealed record ServeOptions(
     Transport Transport,
     IPAddress BindAddress,
     int Port,
-    string? BearerToken)
+    string? BearerToken,
+    OAuthSettings? OAuth = null)
 {
     /// <summary>The HTTP port when <c>--port</c> is not given.</summary>
     public const int DefaultPort = 7300;
@@ -60,6 +66,11 @@ public sealed record ServeOptions(
     /// <summary>Whether a client must present <see cref="BearerToken"/>.</summary>
     public bool RequiresToken => BearerToken is not null;
 
+    /// <summary>How HTTP clients authenticate, for the startup log line.</summary>
+    public string AuthenticationName => OAuth is not null
+        ? "OAuth access tokens"
+        : RequiresToken ? "bearer token" : "none (loopback only)";
+
     /// <summary>
     /// Reads <c>--transport</c>, <c>--port</c> and <c>--bind</c> out of the
     /// arguments and ignores everything else.
@@ -71,8 +82,9 @@ public sealed record ServeOptions(
     /// </remarks>
     /// <param name="args">The process arguments.</param>
     /// <param name="bearerToken">The value of <see cref="TokenVariable"/>, or null.</param>
+    /// <param name="oauth">The policy's <c>access.oauth</c> block, or null.</param>
     /// <exception cref="ServeOptionsException">The combination is invalid or unsafe.</exception>
-    public static ServeOptions Parse(IReadOnlyList<string> args, string? bearerToken)
+    public static ServeOptions Parse(IReadOnlyList<string> args, string? bearerToken, OAuthSettings? oauth = null)
     {
         ArgumentNullException.ThrowIfNull(args);
 
@@ -115,6 +127,17 @@ public sealed record ServeOptions(
                     "--port and --bind only apply to '--transport http'.");
             }
 
+            // Unlike the token below, an access.oauth block over stdio is refused:
+            // rules and budgets keyed on the principal would silently never
+            // apply, and a deny rule that never matches fails open.
+            if (oauth is not null)
+            {
+                throw new ServeOptionsException(
+                    "The policy configures 'access.oauth', which only applies to '--transport http': over " +
+                    "stdio no call has a principal, so rules and budgets keyed on one would never apply. " +
+                    "Serve over HTTP, or remove the 'access' section.");
+            }
+
             // The token is ignored rather than rejected: the variable may well be
             // set for the whole shell, and stdio has no network to protect.
             return Default;
@@ -122,11 +145,21 @@ public sealed record ServeOptions(
 
         var address = ParseAddress(bind);
 
+        // Two ways in at once is two policies about who may call, and whichever
+        // one the operator forgot about is the one an attacker uses.
+        if (oauth is not null && bearerToken is not null)
+        {
+            throw new ServeOptionsException(
+                $"Both {TokenVariable} and the policy's 'access.oauth' are set. Choose one: a static token " +
+                "for a simple setup, or OAuth access tokens. Unset the variable or remove the 'access' section.");
+        }
+
         return new ServeOptions(
             Transport.Http,
             address,
             ParsePort(port),
-            ParseToken(bearerToken, address));
+            ParseToken(bearerToken, address, oauth is not null),
+            oauth);
     }
 
     /// <summary>
@@ -155,7 +188,9 @@ public sealed record ServeOptions(
                 $"'budgets.{BudgetGate.SessionScope}' cannot be enforced over '--transport http': " +
                 "stateless HTTP has no session, so the cap would be one pool shared by every " +
                 $"client for the life of the process. Use 'budgets.{BudgetGate.DailyScope}' " +
-                "(persisted, and process-wide by design), or serve over stdio.");
+                "(persisted, and process-wide by design), " +
+                $"'budgets.{BudgetGate.PrincipalScope}' with 'access.oauth' (one cap per caller), " +
+                "or serve over stdio.");
         }
     }
 
@@ -212,7 +247,7 @@ public sealed record ServeOptions(
         return value;
     }
 
-    private static string? ParseToken(string? token, IPAddress address)
+    private static string? ParseToken(string? token, IPAddress address, bool oauth)
     {
         if (token is not null && token.Trim().Length < MinimumTokenLength)
         {
@@ -223,15 +258,15 @@ public sealed record ServeOptions(
                 "(try: openssl rand -hex 32).");
         }
 
-        // There is no other authentication. Anything that can reach a
-        // non-loopback listener can drive every downstream tool, so exposing one
-        // without a token is not an option offered at all.
-        if (token is null && !IPAddress.IsLoopback(address))
+        // Anything that can reach a non-loopback listener can drive every
+        // downstream tool, so exposing one without authentication - a token, or
+        // OAuth - is not an option offered at all.
+        if (token is null && !oauth && !IPAddress.IsLoopback(address))
         {
             throw new ServeOptionsException(
                 $"Refusing to bind {address} without authentication: anyone who can reach " +
-                $"it could call every downstream tool. Set {TokenVariable}, or bind to " +
-                "127.0.0.1.");
+                $"it could call every downstream tool. Set {TokenVariable}, configure " +
+                "'access.oauth' in the policy, or bind to 127.0.0.1.");
         }
 
         return token?.Trim();

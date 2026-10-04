@@ -196,7 +196,7 @@ public static class PolicyTestRunner
         {
             // What the proxy sees for a name no server advertises: no server
             // and no hints, so server: conditions never match.
-            return new ToolCallFacts(call, testCase.Arguments);
+            return new ToolCallFacts(call, testCase.Arguments, Principal: testCase.Principal, Groups: testCase.Groups);
         }
 
         if (!advertised)
@@ -220,6 +220,8 @@ public static class PolicyTestRunner
             call,
             testCase.Arguments,
             new ToolAnnotationFacts(hints.ReadOnlyHint, hints.DestructiveHint, hints.IdempotentHint, hints.OpenWorldHint),
-            call[..separator]);
+            call[..separator],
+            testCase.Principal,
+            testCase.Groups);
     }
 }

@@ -34,6 +34,8 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
+from oauth_fixture import FixtureIssuer
+
 BIN = (
     sys.argv[1]
     if len(sys.argv) > 1
@@ -275,6 +277,24 @@ FS_PACKAGE = "@modelcontextprotocol/server-filesystem@2026.8.31"
 # Set in the proxy's environment, and must never reach an isolated child.
 PROXY_SECRET_ENV = "GUARDRAILS_SMOKE_PROXY_SECRET"
 UPSTREAM_TOKEN = "smoke-upstream-token-0123456789"
+
+# The container isolation phase. A fixture server with a probe tool runs inside
+# a container from a pinned image, with the fixture's directory mounted read-only
+# and one work directory read-write, and reports what it could reach. Skipped
+# with a visible SKIP where Docker is absent - unless SMOKE_REQUIRE_DOCKER is set,
+# as on the Linux CI runner, where an absent Docker is a failure.
+ISOLATION_IMAGE = (
+    "python:3.13-alpine"
+    "@sha256:2d9aefe2fef018a7eb2c13064c89c71929800fd2e5dccdbf52ea5da5bb8d929a"
+)
+ISOLATION_DIR = f"{SANDBOX}/isolation-phase"
+ISOLATION_WORK = f"{ISOLATION_DIR}/work"
+ISOLATION_OUTSIDE = f"{ISOLATION_DIR}/outside-the-mounts.txt"
+ISOLATION_SERVERS = f"{ISOLATION_DIR}/servers.yaml"
+ISOLATION_AUDIT = f"{SANDBOX}/audit-isolation.jsonl"
+ISOLATION_EMPTY_PATH = f"{ISOLATION_DIR}/empty-path"
+ISOLATION_SECRET = "boxed-secret-value-0123456789"
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # A Claude Desktop config for the wrap phase. The token is assembled at runtime
 # for the same reason as AWS_KEY above; it was never valid.
@@ -1407,6 +1427,33 @@ def main() -> int:
     arguments_failures, arguments_stderr = run_arguments_phase()
     failures += arguments_failures
     http_stderr += arguments_stderr
+
+    # Phase 15: the offline scan command, over a clean and a hostile fixture.
+    print("\n--- scan command ---")
+    failures += run_scan_command_phase()
+
+    # Phase 16: OAuth access tokens over HTTP, from a fixture authorization
+    # server - discovery, the 401 challenge, scopes, principals in policy,
+    # budgets and the audit log, and the startup refusals.
+    print("\n--- oauth ---")
+    oauth_failures, oauth_stderr = run_oauth_phase()
+    failures += oauth_failures
+    http_stderr += oauth_stderr
+
+    # Phase 17: OAuth to a remote upstream - auth login through a fixture
+    # authorization server, the stored tokens used and refreshed when serving,
+    # a revoked login turned into a refusal, and auth logout.
+    print("\n--- oauth upstream ---")
+    upstream_failures, upstream_stderr = run_oauth_upstream_phase()
+    failures += upstream_failures
+    http_stderr += upstream_stderr
+
+    # Phase 18: a server inside a container - no host files beyond its mounts,
+    # no network, a read-only root, a non-root user, and secrets passed by name.
+    print("\n--- container isolation ---")
+    isolation_failures, isolation_stderr = run_isolation_phase()
+    failures += isolation_failures
+    http_stderr += isolation_stderr
 
     # A denied call must never reach the filesystem server.
     escaped = os.path.exists(ESCAPE)
@@ -3139,6 +3186,842 @@ def run_arguments_phase() -> tuple[int, list[str]]:
         "arguments: hits are detector names, never argument values",
     )
     return check.failures, stderr
+
+
+SCAN_DIR = f"{SANDBOX}/scan"
+
+
+def run_scan_command_phase() -> int:
+    """scan finds each kind of problem, quotes none of it and writes no state."""
+    os.makedirs(SCAN_DIR, exist_ok=True)
+    audit = f"{SCAN_DIR}/audit.jsonl"
+    pins = f"{SCAN_DIR}/pins.json"
+    for path in (audit, pins):
+        if os.path.exists(path):
+            os.remove(path)
+    # Pointed at files that must still not exist afterwards: scan is a look at
+    # a server, and looking must not leave state behind.
+    env = {"GUARDRAILS_AUDIT": audit, "GUARDRAILS_PINS": pins}
+    check = Checker()
+
+    clean = run_cli(["scan", "--command", sys.executable, FIXTURE], env)
+    check.expect(
+        clean.returncode == 0 and "Clean: 2 tools scanned" in clean.stdout,
+        f"scan: a clean server exits 0 (got {clean.returncode})",
+    )
+
+    hostile = run_cli(
+        ["scan", "--json", "--command", sys.executable, FIXTURE, "--hostile"], env
+    )
+    try:
+        report = json.loads(hostile.stdout)
+    except json.JSONDecodeError:
+        report = {}
+    found = {
+        (tool["name"], finding["check"])
+        for server in report.get("servers", [])
+        for tool in server["tools"]
+        for finding in tool["findings"]
+    }
+    check.expect(
+        hostile.returncode == 1 and report.get("clean") is False,
+        f"scan: findings exit 1 (got {hostile.returncode})",
+    )
+    check.expect(
+        ("lookup", "injection") in found,
+        "scan: an injection in a description is found",
+    )
+    check.expect(
+        ("fetch_page", "schema-suggestion") in found,
+        "scan: a metadata URL suggested by a schema default is found",
+    )
+    check.expect(
+        ("delete_record", "read-only-mismatch") in found,
+        "scan: a 'read-only' tool named like a delete is found",
+    )
+    check.expect(
+        all(
+            tool["hash"].startswith("sha256:")
+            for server in report.get("servers", [])
+            for tool in server["tools"]
+        ),
+        "scan: every tool carries its pinning hash",
+    )
+    check.expect(
+        "id_rsa" not in hostile.stdout and "169.254" not in hostile.stdout,
+        "scan: the report never quotes the definitions it flags",
+    )
+
+    servers_file = f"{SCAN_DIR}/servers.yaml"
+    with open(servers_file, "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  fixture:\n"
+            f"    command: {json.dumps(sys.executable)}\n"
+            f"    args: [{json.dumps(FIXTURE)}, '--hostile']\n"
+            "    env_isolation: true\n"
+        )
+    from_file = run_cli(["scan", "--servers", servers_file], env)
+    check.expect(
+        from_file.returncode == 1
+        and "  ! delete_record: declares readOnlyHint: true" in from_file.stdout
+        and from_file.stdout.rstrip().endswith("4 findings in 3 tools."),
+        f"scan: a servers file is scanned as text (got {from_file.returncode})",
+    )
+
+    unreachable = run_cli(["scan", "--url", "http://127.0.0.1:1/mcp"], env)
+    check.expect(
+        unreachable.returncode == 1 and "Nothing was scanned" in unreachable.stderr,
+        f"scan: an unreachable server is a failure, not a clean report "
+        f"(got {unreachable.returncode})",
+    )
+
+    usage = run_cli(
+        ["scan", "--url", "https://example.com/mcp", "--command", "npx"], env
+    )
+    check.expect(
+        usage.returncode == 2,
+        f"scan: a contradictory command line exits 2 (got {usage.returncode})",
+    )
+
+    check.expect(
+        not os.path.exists(audit) and not os.path.exists(pins),
+        "scan: no audit log and no pins file were written",
+    )
+    return check.failures
+
+
+OAUTH_DIR = f"{SANDBOX}/oauth"
+OAUTH_AUDIENCE = "api://smoke-guardrails"
+
+
+def oauth_policy(issuer: str) -> str:
+    return f"""access:
+  oauth:
+    issuer: {issuer}
+    audience: {OAUTH_AUDIENCE}
+    required_scopes: [mcp.tools]
+    allow_insecure_localhost: true
+rules:
+  - name: alice-echoes
+    match: {{ tool: fixture__echo, principal: alice }}
+    decision: allow
+  - name: ops-echo
+    match: {{ tool: fixture__echo, groups: [ops] }}
+    decision: allow
+  - name: nobody-else-echoes
+    match: {{ tool: fixture__echo }}
+    decision: deny
+budgets:
+  principal: {{ max_calls: 2 }}
+"""
+
+
+def http_exchange(
+    url: str,
+    message: dict | None,
+    *,
+    token: str | None = None,
+    origin: str | None = None,
+) -> tuple[int, dict[str, str], str]:
+    """One HTTP request; the status, the headers and the raw body.
+
+    A GET when there is no message. Unlike http_post this keeps the headers,
+    because the 401 challenge is the point of half the OAuth checks.
+    """
+    headers = {"Accept": "application/json, text/event-stream"}
+    data = None
+    if message is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(message).encode("utf-8")
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if origin is not None:
+        headers["Origin"] = origin
+
+    req = urllib.request.Request(
+        url, data=data, headers=headers, method="POST" if data else "GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return (
+                response.status,
+                dict(response.headers),
+                response.read().decode("utf-8"),
+            )
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers), exc.read().decode("utf-8")
+
+
+def start_oauth_proxy(
+    env: dict[str, str],
+) -> tuple[subprocess.Popen, str | None, list[str]]:
+    """Start the proxy over HTTP; return it, its endpoint and its stderr lines."""
+    proc = subprocess.Popen(
+        [BIN, "--transport", "http", "--port", "0"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={**os.environ, **env},
+    )
+    stderr = proc.stderr
+    if stderr is None:
+        raise RuntimeError("failed to open the proxy's stderr")
+
+    lines: list[str] = []
+    found = threading.Event()
+    endpoint: list[str] = []
+
+    def drain() -> None:
+        pattern = re.compile(r"at (http://\S+/mcp)")
+        for line in stderr:
+            lines.append(line)
+            match = pattern.search(line)
+            if match and not endpoint:
+                endpoint.append(match.group(1))
+                found.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+    return proc, endpoint[0] if found.wait(timeout=60) else None, lines
+
+
+def run_oauth_phase() -> tuple[int, list[str]]:
+    """The proxy as an OAuth protected resource, end to end."""
+    os.makedirs(OAUTH_DIR, exist_ok=True)
+    audit = f"{OAUTH_DIR}/audit.jsonl"
+    policy = f"{OAUTH_DIR}/policy.yaml"
+    servers = f"{OAUTH_DIR}/servers.yaml"
+    if os.path.exists(audit):
+        os.remove(audit)
+
+    issuer = FixtureIssuer()
+    with open(policy, "w", encoding="utf-8") as handle:
+        handle.write(oauth_policy(issuer.url))
+    with open(servers, "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  fixture:\n"
+            f"    command: {json.dumps(sys.executable)}\n"
+            f"    args: [{json.dumps(FIXTURE)}]\n"
+        )
+
+    env = {
+        "GUARDRAILS_POLICY": policy,
+        "GUARDRAILS_SERVERS": servers,
+        "GUARDRAILS_AUDIT": audit,
+    }
+    check = Checker()
+    proc, url, stderr = start_oauth_proxy(env)
+
+    def token(subject: str, **kwargs: object) -> str:
+        kwargs.setdefault("audience", OAUTH_AUDIENCE)
+        kwargs.setdefault("scope", "mcp.tools")
+        return issuer.token(subject, **kwargs)  # type: ignore[arg-type]
+
+    try:
+        if url is None:
+            print("FAIL  oauth: the proxy never reported a listening address")
+            return 1, stderr
+
+        check.expect(
+            any("auth: OAuth access tokens" in line for line in stderr),
+            "oauth: the startup line says clients authenticate with access tokens",
+        )
+
+        metadata_url = url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp")
+        status, _, body = http_exchange(metadata_url, None)
+        metadata = json.loads(body) if status == 200 else {}
+        check.expect(
+            metadata.get("resource") == url
+            and metadata.get("authorization_servers") == [issuer.url]
+            and metadata.get("scopes_supported") == ["mcp.tools"],
+            "oauth: the protected resource metadata names this proxy and the issuer",
+        )
+
+        status, headers, _ = http_exchange(url, request(1, "tools/list"))
+        challenge = headers.get("WWW-Authenticate", "")
+        check.expect(
+            status == 401 and f'resource_metadata="{metadata_url}"' in challenge,
+            f"oauth: no token -> 401 pointing at the metadata (got {status})",
+        )
+
+        status, headers, _ = http_exchange(
+            url, request(2, "tools/list"), token=token("alice", audience="api://other")
+        )
+        check.expect(
+            status == 401
+            and 'error="invalid_token"' in headers.get("WWW-Authenticate", ""),
+            f"oauth: a token for another audience -> 401 invalid_token (got {status})",
+        )
+
+        status, headers, _ = http_exchange(
+            url, request(3, "tools/list"), token=token("alice", expires_in=-600)
+        )
+        check.expect(status == 401, f"oauth: an expired token -> 401 (got {status})")
+
+        status, headers, _ = http_exchange(
+            url, request(4, "tools/list"), token=token("alice", scope="openid")
+        )
+        challenge = headers.get("WWW-Authenticate", "")
+        check.expect(
+            status == 403
+            and 'error="insufficient_scope"' in challenge
+            and 'scope="mcp.tools"' in challenge,
+            f"oauth: a token without the scope -> 403 naming it (got {status})",
+        )
+
+        alice = token("alice")
+        status, _, _ = http_exchange(
+            url, request(5, "tools/list"), token=alice, origin="https://evil.example"
+        )
+        check.expect(
+            status == 403,
+            f"oauth: a foreign Origin -> 403 even with a token ({status})",
+        )
+
+        status, msg = http_post(url, request(6, "tools/list"), token=alice)
+        names = tool_names(msg["result"]) if status == 200 and msg else set()
+        check.expect("fixture__echo" in names, "oauth: a valid token lists the tools")
+
+        def echo(rid: int, bearer: str) -> dict:
+            status, msg = http_post(
+                url, call(rid, "fixture__echo", {"message": "hi"}), token=bearer
+            )
+            return msg.get("result", {}) if status == 200 and msg else {}
+
+        first = echo(7, alice)
+        check.expect(
+            not first.get("isError") and "echo: hi" in result_text(first),
+            "oauth: alice's call is allowed by her principal rule",
+        )
+        bob = echo(8, token("bob"))
+        check.expect(
+            denied_with(bob, "nobody-else-echoes"),
+            "oauth: bob's call falls through to the deny rule",
+        )
+        ops = echo(9, token("carol", groups=["ops"]))
+        check.expect(
+            not ops.get("isError"), "oauth: a caller in the ops group is allowed"
+        )
+        echo(10, alice)
+        third = echo(11, alice)
+        check.expect(
+            denied_with(third, "principal.max_calls"),
+            "oauth: alice's third call exhausts her own budget",
+        )
+        carol = echo(12, token("carol", groups=["ops"]))
+        check.expect(
+            not carol.get("isError"),
+            "oauth: ...while carol still has hers",
+        )
+
+        wait_for_lines(audit, 6, timeout=10)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    entries = read_audit(audit, "oauth audit log")
+    if entries is None:
+        check.failures += 1
+    else:
+        calls = [e for e in entries if e.get("event") == "tool_call"]
+        check.expect(
+            [e.get("principal") for e in calls]
+            == ["alice", "bob", "carol", "alice", "alice", "carol"],
+            "oauth: every call in the audit log names its principal",
+        )
+        with open(audit, encoding="utf-8") as handle:
+            text = handle.read()
+        check.expect(
+            alice.split(".")[2] not in text and "Bearer" not in text,
+            "oauth: no token reaches the audit log",
+        )
+
+    # The refusals at startup, each before anything listens.
+    both = run_cli(
+        ["--transport", "http", "--port", "0"],
+        {**env, "GUARDRAILS_HTTP_TOKEN": "0123456789abcdef0123"},
+    )
+    check.expect(
+        both.returncode == 2 and "Choose one" in both.stderr,
+        f"oauth: a static token as well is refused (exit {both.returncode})",
+    )
+
+    stdio = run_cli([], env)
+    check.expect(
+        stdio.returncode == 2 and "only applies to '--transport http'" in stdio.stderr,
+        f"oauth: access.oauth over stdio is refused (exit {stdio.returncode})",
+    )
+
+    issuer.close()
+    unreachable = run_cli(["--transport", "http", "--port", "0"], env)
+    check.expect(
+        unreachable.returncode == 1
+        and "Cannot fetch the signing keys" in unreachable.stderr,
+        f"oauth: an unreachable issuer stops the proxy (exit {unreachable.returncode})",
+    )
+
+    return check.failures, stderr
+
+
+OAUTH_UPSTREAM_DIR = f"{SANDBOX}/oauth-upstream"
+UPSTREAM_AUDIENCE = "api://smoke-upstream"
+
+
+def auth_login(env: dict[str, str]) -> tuple[int, str]:
+    """Run auth login --no-browser, playing the browser; return exit code and output.
+
+    The command prints the authorization URL and waits on its loopback port.
+    Fetching the URL is what a browser would do: the fixture approves at once
+    and redirects to the loopback callback, which urllib follows.
+    """
+    proc = subprocess.Popen(
+        [BIN, "auth", "login", "remote", "--no-browser"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env={**os.environ, **env},
+    )
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("failed to open auth login's stdout")
+
+    lines: list[str] = []
+    for line in stdout:
+        lines.append(line)
+        url = line.strip()
+        if url.startswith("http://") and "/authorize?" in url:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                response.read()
+            break
+
+    lines.extend(stdout)
+    try:
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    return proc.returncode, "".join(lines)
+
+
+def run_oauth_upstream_phase() -> tuple[int, list[str]]:
+    """The proxy as an OAuth client of a remote server, end to end.
+
+    The remote server is another proxy, serving HTTP behind access.oauth with
+    the same fixture issuer: it refuses anything without a token the issuer
+    signed for its audience, which is what a real OAuth-protected MCP server
+    does.
+    """
+    shutil.rmtree(OAUTH_UPSTREAM_DIR, ignore_errors=True)
+    os.makedirs(OAUTH_UPSTREAM_DIR)
+    d = OAUTH_UPSTREAM_DIR
+    issuer = FixtureIssuer(audience=UPSTREAM_AUDIENCE, access_token_lifetime=2)
+
+    with open(f"{d}/upstream-policy.yaml", "w", encoding="utf-8") as handle:
+        handle.write(
+            f"access:\n  oauth:\n    issuer: {issuer.url}\n"
+            f"    audience: {UPSTREAM_AUDIENCE}\n    allow_insecure_localhost: true\n"
+        )
+    with open(f"{d}/upstream-servers.yaml", "w", encoding="utf-8") as handle:
+        handle.write(
+            "version: 1\nservers:\n  fixture:\n"
+            f"    command: {json.dumps(sys.executable)}\n"
+            f"    args: [{json.dumps(FIXTURE)}]\n"
+        )
+
+    check = Checker()
+    upstream, url, stderr = start_oauth_proxy(
+        {
+            "GUARDRAILS_POLICY": f"{d}/upstream-policy.yaml",
+            "GUARDRAILS_SERVERS": f"{d}/upstream-servers.yaml",
+            "GUARDRAILS_AUDIT": f"{d}/upstream-audit.jsonl",
+            "GUARDRAILS_PINS": f"{d}/upstream-pins.json",
+        }
+    )
+
+    servers = f"{d}/servers.yaml"
+    tokens = f"{d}/tokens"
+    env = {
+        "GUARDRAILS_SERVERS": servers,
+        "GUARDRAILS_POLICY": f"{d}/no-policy.yaml",
+        "GUARDRAILS_AUDIT": f"{d}/audit.jsonl",
+        "GUARDRAILS_PINS": f"{d}/pins.json",
+        "GUARDRAILS_TOKEN_STORE": "file",
+        "GUARDRAILS_TOKENS": tokens,
+    }
+
+    def echo(rid: int) -> dict:
+        return call(rid, "remote__fixture__echo", {"message": "hi"})
+
+    try:
+        if url is None:
+            print("FAIL  oauth upstream: the remote proxy never reported an address")
+            return 1, stderr
+
+        with open(servers, "w", encoding="utf-8") as handle:
+            handle.write(
+                "version: 1\nservers:\n  remote:\n    type: http\n"
+                f"    url: {url}\n    x-guardrails:\n      oauth: {{}}\n"
+            )
+
+        status = run_cli(["auth", "status"], env)
+        check.expect(
+            status.returncode == 0 and "remote: not logged in" in status.stdout,
+            "oauth upstream: auth status before login says not logged in",
+        )
+
+        failures, session_stderr = run_session(
+            [
+                (
+                    echo(1),
+                    "oauth upstream: before login, the remote's tools are refused "
+                    "with the command to run",
+                    lambda r: (
+                        r.get("isError") and "auth login remote" in result_text(r)
+                    ),
+                ),
+            ],
+            env,
+            handshake=True,
+        )
+        check.failures += failures
+        stderr += session_stderr
+        check.expect(
+            issuer.clients == {},
+            "oauth upstream: serving without a login registers no client",
+        )
+
+        code, output = auth_login(env)
+        check.expect(
+            code == 0 and "Logged in to 'remote' (" in output,
+            f"oauth upstream: auth login completes through the browser (exit {code})",
+        )
+        if code != 0:
+            print(output[-1500:])
+        check.expect(
+            issuer.token_requests["authorization_code"] == 1
+            and len(issuer.clients) == 1,
+            "oauth upstream: login registered a client and exchanged one code (PKCE)",
+        )
+
+        status = run_cli(["auth", "status"], env)
+        check.expect(
+            "remote: logged in" in status.stdout
+            and "refreshed automatically" in status.stdout,
+            "oauth upstream: auth status reports the login",
+        )
+        with open(servers, encoding="utf-8") as handle:
+            servers_text = handle.read()
+        stored = os.listdir(tokens) if os.path.isdir(tokens) else []
+        check.expect(
+            stored == ["remote.json"] and "access_token" not in servers_text,
+            "oauth upstream: tokens are in the token store, not the servers file",
+        )
+        if os.name != "nt":
+            mode = os.stat(f"{tokens}/remote.json").st_mode & 0o777
+            check.expect(
+                mode == 0o600, f"oauth upstream: the token file is 0600 ({mode:o})"
+            )
+
+        def then_expire(result: dict) -> bool:
+            # Outlive the 2-second access token before the next call.
+            time.sleep(3)
+            return not result.get("isError") and "echo: hi" in result_text(result)
+
+        def then_revoke(result: dict) -> bool:
+            issuer.revoke_refresh_tokens()
+            time.sleep(3)
+            return not result.get("isError")
+
+        # The first refresh answers without a new refresh_token, as servers
+        # that do not rotate them do: the stored one must survive it, or the
+        # second refresh below would have nothing to send.
+        issuer.rotate_refresh_tokens = False
+        failures, session_stderr = run_session(
+            [
+                (
+                    echo(1),
+                    "oauth upstream: after login, a call goes through",
+                    then_expire,
+                ),
+                (
+                    echo(2),
+                    "oauth upstream: an expired access token is refreshed silently",
+                    then_expire,
+                ),
+                (
+                    echo(3),
+                    "oauth upstream: a refresh with no new refresh_token keeps the old",
+                    then_revoke,
+                ),
+                (
+                    echo(4),
+                    "oauth upstream: a login that cannot be refreshed mid-session "
+                    "is refused, naming auth login",
+                    lambda r: (
+                        r.get("isError")
+                        and "needs a new login" in result_text(r)
+                        and "auth login remote" in result_text(r)
+                    ),
+                ),
+            ],
+            env,
+            handshake=True,
+        )
+        check.failures += failures
+        stderr += session_stderr
+        check.expect(
+            issuer.token_requests["refresh_token"] >= 2,
+            "oauth upstream: the token endpoint saw two refreshes",
+        )
+
+        wait_for_lines(f"{d}/upstream-audit.jsonl", 2, timeout=10)
+        entries = read_audit(f"{d}/upstream-audit.jsonl", "remote audit log") or []
+        principals = {
+            e.get("principal") for e in entries if e.get("event") == "tool_call"
+        }
+        check.expect(
+            principals == {FixtureIssuer.LOGIN_SUBJECT},
+            "oauth upstream: the remote attributes the calls to the logged-in user",
+        )
+
+        logout = run_cli(["auth", "logout", "remote"], env)
+        status = run_cli(["auth", "status"], env)
+        check.expect(
+            logout.returncode == 0
+            and "Logged out of 'remote'" in logout.stdout
+            and "remote: not logged in" in status.stdout
+            and not os.path.exists(f"{tokens}/remote.json"),
+            "oauth upstream: auth logout deletes the tokens",
+        )
+    finally:
+        upstream.terminate()
+        try:
+            upstream.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            upstream.kill()
+        issuer.close()
+
+    return check.failures, stderr
+
+
+def isolation_servers_yaml(runtime: str = "docker") -> str:
+    return (
+        "version: 1\n"
+        "servers:\n"
+        "  boxed:\n"
+        "    command: python\n"
+        "    args: ['/fixture/fixture_server.py', '--probe']\n"
+        "    env:\n"
+        "      BOXED_TOKEN: ${SMOKE_BOXED_TOKEN}\n"
+        "    x-guardrails:\n"
+        "      isolation:\n"
+        f"        runtime: {runtime}\n"
+        f"        image: {ISOLATION_IMAGE}\n"
+        "        mounts:\n"
+        f"          - {{ host: '{SCRIPTS_DIR}', container: /fixture }}\n"
+        f"          - {{ host: '{ISOLATION_WORK}', container: /workspace, mode: rw }}\n"
+    )
+
+
+def probe_report(result: dict) -> dict:
+    """The probe's JSON report, from the first text item of a tool result."""
+    texts = [c.get("text", "") for c in result.get("content", []) if "text" in c]
+    try:
+        report = json.loads(texts[0]) if texts else {}
+    except json.JSONDecodeError:
+        return {}
+    return report if isinstance(report, dict) else {}
+
+
+def docker_unavailable() -> str | None:
+    """Why Docker cannot run the phase, or None when it can."""
+    if shutil.which("docker") is None:
+        return "docker is not on PATH"
+    try:
+        info = subprocess.run(
+            ["docker", "info"], capture_output=True, text=True, timeout=60, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return "docker info timed out"
+    return None if info.returncode == 0 else "the Docker daemon is not running"
+
+
+def visible_command_lines() -> str:
+    """Every process's command line, as any local user could read it with ps."""
+    return subprocess.run(
+        ["ps", "-A", "-ww", "-o", "args="],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    ).stdout
+
+
+def run_isolation_phase() -> tuple[int, list[str]]:
+    """A server in a container reaches only what the servers file grants."""
+    os.makedirs(ISOLATION_WORK, exist_ok=True)
+    os.makedirs(ISOLATION_EMPTY_PATH, exist_ok=True)
+    for stale in (ISOLATION_AUDIT, f"{ISOLATION_WORK}/written.txt"):
+        if os.path.exists(stale):
+            os.remove(stale)
+    with open(f"{ISOLATION_WORK}/inside.txt", "w", encoding="utf-8") as handle:
+        handle.write("mounted on purpose")
+    with open(ISOLATION_OUTSIDE, "w", encoding="utf-8") as handle:
+        handle.write("the container must never read this")
+
+    check = Checker()
+
+    # Needs no Docker at all: a missing runtime must stop the proxy rather than
+    # start the server uncontained.
+    with open(ISOLATION_SERVERS, "w", encoding="utf-8") as handle:
+        handle.write(isolation_servers_yaml())
+    refused = run_cli(
+        ["list-upstream", "--servers", ISOLATION_SERVERS],
+        {"PATH": ISOLATION_EMPTY_PATH, "SMOKE_BOXED_TOKEN": ISOLATION_SECRET},
+    )
+    check.expect(
+        refused.returncode != 0
+        and "never runs an isolated server outside its container" in refused.stderr,
+        f"isolation: no container runtime stops the proxy (exit {refused.returncode})",
+    )
+
+    reason = docker_unavailable()
+    if reason is not None:
+        if os.environ.get("SMOKE_REQUIRE_DOCKER"):
+            check.expect(False, f"isolation: Docker is required here, but {reason}")
+        else:
+            print(f"SKIP  isolation: {reason}, so the container checks did not run")
+        return check.failures, []
+
+    pulled = subprocess.run(
+        ["docker", "pull", "--quiet", ISOLATION_IMAGE],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if pulled.returncode != 0:
+        check.expect(False, f"isolation: pull the pinned image: {pulled.stderr[-300:]}")
+        return check.failures, []
+
+    validated = run_cli(
+        ["validate", "--servers", ISOLATION_SERVERS],
+        {
+            "GUARDRAILS_POLICY": f"{ISOLATION_DIR}/no-such-policy.yaml",
+            "SMOKE_BOXED_TOKEN": ISOLATION_SECRET,
+        },
+    )
+    check.expect(
+        validated.returncode == 0
+        and "can reach: docker container from python:3.13-alpine@sha256:"
+        in validated.stdout
+        and "network none" in validated.stdout,
+        "isolation: validate says what the server can reach "
+        f"(exit {validated.returncode})",
+    )
+
+    checks: list[Check] = [
+        (
+            request(1, "tools/list"),
+            "isolation: the contained server's tools are advertised",
+            lambda r: "boxed__probe" in tool_names(r),
+        ),
+        (
+            call(2, "boxed__probe", {"read": ISOLATION_OUTSIDE}),
+            "isolation: a host file outside the mounts does not exist in the container",
+            lambda r: probe_report(r).get("read", "").startswith("error:"),
+        ),
+        (
+            call(3, "boxed__probe", {"read": "/workspace/inside.txt"}),
+            "isolation: ...while the mounted folder is readable",
+            lambda r: probe_report(r).get("read") == "ok: mounted on purpose",
+        ),
+        (
+            call(4, "boxed__probe", {"write": "/workspace/written.txt"}),
+            "isolation: a read-write mount can be written",
+            lambda r: probe_report(r).get("write") == "ok: written",
+        ),
+        (
+            call(5, "boxed__probe", {"write": "/fixture/planted.py"}),
+            "isolation: a read-only mount cannot",
+            lambda r: probe_report(r).get("write", "").startswith("error:"),
+        ),
+        (
+            call(6, "boxed__probe", {"write": "/usr/local/bin/planted"}),
+            "isolation: the image's root filesystem is read-only",
+            lambda r: probe_report(r).get("write", "").startswith("error:"),
+        ),
+        (
+            call(7, "boxed__probe", {"connect": "1.1.1.1:53"}),
+            "isolation: the network is unreachable",
+            lambda r: probe_report(r).get("connect", "").startswith("error:"),
+        ),
+        (
+            call(8, "boxed__probe", {}),
+            "isolation: the server does not run as root",
+            lambda r: probe_report(r).get("uid") not in (None, 0),
+        ),
+        (
+            call(9, "boxed__probe", {"env": "BOXED_TOKEN"}),
+            "isolation: a declared variable reaches the container",
+            lambda r: probe_report(r).get("env") == ISOLATION_SECRET,
+        ),
+        (
+            call(10, "boxed__env_names", {}),
+            "isolation: ...and nothing of the proxy's own environment does",
+            lambda r: (
+                PROXY_SECRET_ENV not in env_names(r)
+                and "SMOKE_BOXED_TOKEN" not in env_names(r)
+            ),
+        ),
+        (
+            call(11, "boxed__echo", {"message": "ps"}),
+            "isolation: ps shows the variable's name, never its value",
+            lambda _r: (
+                "-e BOXED_TOKEN" in (lines := visible_command_lines())
+                and ISOLATION_SECRET not in lines
+            ),
+        ),
+    ]
+
+    failures, stderr_lines = run_session(
+        checks,
+        {
+            "GUARDRAILS_SERVERS": ISOLATION_SERVERS,
+            "GUARDRAILS_POLICY": f"{ISOLATION_DIR}/no-such-policy.yaml",
+            "GUARDRAILS_AUDIT": ISOLATION_AUDIT,
+            "SMOKE_BOXED_TOKEN": ISOLATION_SECRET,
+            PROXY_SECRET_ENV: "the-proxy-keeps-this",
+        },
+    )
+    check.failures += failures
+
+    written = f"{ISOLATION_WORK}/written.txt"
+    check.expect(
+        os.path.exists(written) and os.stat(written).st_uid == os.getuid(),
+        "isolation: a file it writes belongs to the user who started the proxy",
+    )
+
+    audit = read_audit_text(ISOLATION_AUDIT, "isolation audit log")
+    if audit is None:
+        return check.failures + 1, stderr_lines
+    raw, lines = audit
+    connected = [line for line in lines if line["event"] == "upstream_connected"]
+    identity = connected[0].get("identity", "") if connected else ""
+    check.expect(
+        identity.startswith("docker run ") and "--network none" in identity,
+        "isolation: the audit records the generated container command",
+    )
+    check.expect(
+        ISOLATION_SECRET not in raw,
+        "isolation: no secret value reaches the audit log",
+    )
+    return check.failures, stderr_lines
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ internal sealed class PinsCommand : ICliCommand
 
     public async Task<int> RunAsync(string[] args)
     {
-        var operands = Operands(args);
+        var operands = CliArgs.Operands(args, "pins", "--servers", "--path");
         if (operands.Count == 0)
         {
             throw new CommandFailedException(2, _usage);
@@ -225,23 +225,4 @@ internal sealed class PinsCommand : ICliCommand
             string.Join(", ", startup.Upstream.Connections.Select(c => c.Name)) + ".");
 
     /// <summary>The words after <c>pins</c>, without flags or the values of flags that take one.</summary>
-    private static List<string> Operands(string[] args)
-    {
-        var operands = new List<string>();
-        var start = Array.IndexOf(args, "pins") + 1;
-
-        for (var i = start; i < args.Length; i++)
-        {
-            if (args[i] is "--servers" or "--path")
-            {
-                i++;
-            }
-            else if (!args[i].StartsWith("--", StringComparison.Ordinal))
-            {
-                operands.Add(args[i]);
-            }
-        }
-
-        return operands;
-    }
 }
