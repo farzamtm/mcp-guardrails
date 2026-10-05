@@ -12,51 +12,42 @@ scripts/apply-branch-protection.sh --show     # print what is live today
 scripts/apply-branch-protection.sh --dry-run  # print what would be sent
 ```
 
-## It cannot be applied yet
-
-The repository is **private on the GitHub free plan**, where the rulesets and
-branch-protection APIs are unavailable:
-
-```text
-403 Upgrade to GitHub Pro or make this repository public
-```
-
-So the file is a declaration of intent with a one-command path to reality the
-moment either of these is true:
-
-- the repository becomes public, or
-- the account moves to GitHub Pro (or the repo moves into an org on Team).
-
-Until then the local hooks in [`../../.githooks`](../../.githooks) approximate
-it: no commits on `main`, no pushes to `main`, and the full pipeline runs
-before any push. They are bypassable with `--no-verify`; the ruleset is not.
-That gap is the reason this file exists.
+The repository is public, so the rulesets API is available. The local hooks in
+[`../../.githooks`](../../.githooks) stay as an early warning - they catch a
+commit on `main` before it is made - but they are bypassable with
+`--no-verify`; the ruleset is not.
 
 ## What it enforces
 
 | Rule | Effect |
 | --- | --- |
-| `pull_request` | `main` moves only through a PR with **one approving review**. Stale reviews are dismissed on push, the last pusher cannot self-approve, review threads must be resolved. |
+| `pull_request` | `main` moves only through a PR with **one approving review**. Stale reviews are dismissed on push, the last pusher cannot self-approve, review threads must be resolved. Merge commits and squash merges are allowed. |
 | `required_status_checks` | `lint`, `build & test` on all three OSes, `coverage gate` and `end-to-end smoke` must pass, and the branch must be up to date with `main` first (`strict`). |
 | `non_fast_forward` | No force-pushes. |
 | `deletion` | `main` cannot be deleted. |
-| `required_linear_history` | No merge commits with a tangled ancestry landing on `main`. |
-| `bypass_actors: []` | Nobody bypasses, admins included. |
+| `bypass_actors` | Repository admins - the maintainer - may bypass, **only by merging a pull request** (`bypass_mode: pull_request`). Nobody can push to `main` directly. |
 
-### Two things to know before you apply it
+### Why the maintainer can bypass the review
 
-- **`required_approving_review_count: 1` needs a second human.** GitHub does not
-  let you approve your own pull request, so while this repository has a single
-  maintainer, applying the ruleset as written makes `main` unmergeable: your PR
-  will sit waiting for an approval that cannot arrive. That is the intended
-  strictness — nobody merges their own work unreviewed — but it means the
-  ruleset and a solo workflow are mutually exclusive. Pick one, deliberately:
-  add a reviewer, or drop the count to `0` (the PR, the checks and the resolved
-  threads are still enforced there).
-- **`required_linear_history` vs `--no-ff` merges.** CONTRIBUTING.md asks for
-  `--no-ff` merges into `main`. That stays legal: linear history forbids a
-  merge whose *branch* has merge commits in it, not the merge commit itself.
-  Rebase your branch on `main` before merging.
+GitHub does not let anyone approve their own pull request, and this repository
+has one maintainer, whose account also opens the PRs its agents prepare. With a
+required review and no bypass, every one of those PRs would wait forever for an
+approval that cannot arrive.
+
+So the review requirement stands for everyone else - a contributor's PR needs
+the maintainer's approval - and the maintainer's own PRs are merged with
+"Merge without waiting for requirements to be met", which GitHub records as a
+bypass by that account. The maintainer's merge *is* the approval. Because the
+bypass works only through a pull request, the PR, its diff and its CI run still
+exist for every change; what it skips is the approval step, not the review
+trail. Add a second maintainer and the bypass can go.
+
+### Why there is no linear-history rule
+
+GitHub's "require linear history" blocks merge commits on `main` outright - the
+"Create a merge commit" button disappears - and this repository merges with
+merge commits (see [CONTRIBUTING.md](../../CONTRIBUTING.md)). The rule would
+contradict the workflow, so it is not part of the ruleset.
 
 ### Status check names
 

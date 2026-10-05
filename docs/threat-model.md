@@ -632,10 +632,12 @@ start, not reviewed code.
 ### Hooks and branch protection are not a security boundary
 
 For the repository rather than the runtime: the `.githooks/` checks are local
-and `--no-verify` skips them, and GitHub branch protection is unavailable while
-the repository is private on a free plan (see [AGENTS.md](../AGENTS.md)). A
-change to this code is reviewed because people choose to review it, not because
-anything enforces it.
+and `--no-verify` skips them. GitHub branch protection
+([`.github/rulesets/main.json`](../.github/rulesets/main.json)) does enforce a
+pull request and passing CI for every change to `main`, and an approving review
+for contributors' changes. The single maintainer's own changes are merged
+through a pull-request-only bypass, because GitHub forbids approving your own
+PR, so for those the second pair of eyes is CI, not a person.
 
 ## Not yet (planned)
 
