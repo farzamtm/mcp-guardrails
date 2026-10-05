@@ -2,12 +2,10 @@
 #
 # main is not a workspace.
 #
-# GitHub's own branch protection is unavailable on this repository (private
-# repo, free plan - the API answers 403 "Upgrade to GitHub Pro or make this
-# repository public"), so the rule lives here instead. It is weaker than a
-# server-side ruleset because it is local and bypassable, and it still catches
-# the thing that actually happens: starting work, forgetting to branch, and
-# noticing three commits later.
+# GitHub's branch protection (.github/rulesets/main.json) refuses direct pushes
+# to main on the server. This catches the same mistake earlier, on your
+# machine: starting work, forgetting to branch, and noticing three commits
+# later - before there is anything to untangle.
 #
 # Enable with:  git config core.hooksPath .githooks
 set -euo pipefail

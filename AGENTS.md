@@ -20,17 +20,17 @@ your first commit in a fresh clone:
 git config --get core.hooksPath   # must print: .githooks
 ```
 
-Why hooks and not GitHub branch protection: the repository is private on a free
-plan, so the branch-protection and ruleset APIs answer
-`403 Upgrade to GitHub Pro or make this repository public`. The hooks are the
-available approximation. They are local and bypassable — treat them as a
-reminder system, not as a security boundary.
+The hooks catch mistakes early, on your machine. They are local and
+bypassable — treat them as a reminder system, not as a security boundary.
 
-The real thing is written down and waiting:
+The boundary is server-side: the ruleset in
 [`.github/rulesets/main.json`](.github/rulesets/main.json), applied with
-`scripts/apply-branch-protection.sh` the moment the repository goes public or
-the account is on a paid plan. Do not apply it, change it, or change the
-repository's visibility without being asked.
+`scripts/apply-branch-protection.sh`. `main` moves only through a pull request
+with passing CI; only the maintainer can merge without an approving review
+(GitHub forbids approving your own PR — see
+[`.github/rulesets/README.md`](.github/rulesets/README.md)). Do not apply the
+ruleset, change it, or change the repository's visibility or settings without
+being asked.
 
 ## The four rules
 

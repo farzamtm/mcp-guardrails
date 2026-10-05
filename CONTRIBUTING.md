@@ -33,16 +33,15 @@ example-policy check — so a green run locally means CI has nothing new to say.
 This is enforced as far as it can be: [`.githooks/`](.githooks) holds a
 `pre-commit` that refuses commits on `main` and a `pre-push` that refuses
 pushes to `main` and runs `scripts/preflight.sh` first. Hooks are not installed
-by cloning, hence the `core.hooksPath` line above. GitHub's own branch
-protection is unavailable while the repository is private on a free plan (the
-API answers `403 Upgrade to GitHub Pro or make this repository public`), so the
-hooks are a reminder, not a boundary — `--no-verify` still works, and using it
-is a decision you own.
+by cloning, hence the `core.hooksPath` line above. The hooks are a reminder,
+not a boundary — `--no-verify` still works, and using it is a decision you own.
 
-The server-side rule is committed anyway, in
-[`.github/rulesets/main.json`](.github/rulesets/main.json): required PR,
-required CI checks, no force-push, no deletion, no bypass. One command applies
-it (`scripts/apply-branch-protection.sh`) once the plan allows it. See
+The boundary is GitHub's branch protection, committed in
+[`.github/rulesets/main.json`](.github/rulesets/main.json) and applied with
+`scripts/apply-branch-protection.sh`: required PR with one approving review,
+required CI checks, branch up to date, no force-push, no deletion. Your PR
+needs the maintainer's approval; the maintainer merges their own PRs through a
+pull-request-only bypass, because GitHub forbids self-approval. See
 [`.github/rulesets/README.md`](.github/rulesets/README.md).
 
 Agents working in this repository follow [AGENTS.md](AGENTS.md), which encodes
